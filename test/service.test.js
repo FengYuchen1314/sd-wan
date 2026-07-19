@@ -141,7 +141,8 @@ test('选择边缘父节点时强制携带新设备可达的中继地址', () =>
     assert.throws(() => service.createJoinToken(network.id, { parentId: edge.id }), /尚未配置.*中继地址/);
     service.updateNode(edge.id, { controlEndpoint: 'http://192.168.8.20:8790', dataEndpoint: '192.168.8.20:51820' });
     const second = service.createJoinToken(network.id, { parentId: edge.id });
-    assert.match(second.command, /192\.168\.8\.20%3A8790/);
+    assert.match(second.command, /curl -fsSL 'http:\/\/192\.168\.8\.20:8790\/install\.sh'/);
+    assert.match(second.command, /--source 'http:\/\/192\.168\.8\.20:8790'/);
     assert.match(second.command, /--upstream 'http:\/\/192\.168\.8\.20:8790'/);
   } finally { database.close(); }
 });
@@ -361,6 +362,8 @@ test('选择父节点自动采用已保存的控制地址和端口，并允许�
       parentPort: 18090,
     });
     assert.equal(override.sourceUrl, 'http://192.168.8.10:18090');
+    assert.match(override.command, /curl -fsSL 'http:\/\/192\.168\.8\.10:18090\/install\.sh'/);
+    assert.match(override.command, /--source 'http:\/\/192\.168\.8\.10:18090'/);
     assert.match(override.command, /--upstream 'http:\/\/192\.168\.8\.10:18090'/);
   } finally { database.close(); }
 });

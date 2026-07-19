@@ -16,13 +16,15 @@ curl -fsSL "https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main/scripts
 
 ## 已安装节点原地更新
 
-仓库推送到 GitHub `main` 分支后，在需要更新的节点执行：
+仓库推送到 GitHub `main` 分支后，在需要更新的节点执行本机命令：
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main/scripts/install.sh?cache=$(date +%s)" | sudo bash -s -- --source https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main --update
+sudo pathweaver-update
 ```
 
-更新模式不会再次询问端口或密码，也不会重新初始化节点。它会替换 `/opt/pathweaver/current` 指向的程序版本、修补或补齐 PathWeaver 私有 WireGuard 运行时并重启已有服务，保留数据库、节点密钥、面板端口、WireGuard 端口与当前网络配置；如果新版服务不能保持运行，会自动恢复到更新前的程序版本。父节点更新完成后，其 `/install.sh` 和安装包接口会自动向后续节点分发新版。
+更新器不依赖在线下载安装脚本：它先尝试 GitHub；GitHub 不可达时，会读取本机保存的初始上游、已验证控制邻接以及中心数据库中的可中继节点，逐个探测并从第一台能提供完整制品的节点拉取。也可用 `sudo pathweaver-update --source http://节点IP:控制端口` 指定首选来源。更新模式不会再次询问端口或密码，也不会重新初始化节点。它会替换 `/opt/pathweaver/current` 指向的程序版本、修补或补齐 PathWeaver 私有 WireGuard 运行时并重启已有服务，保留数据库、节点密钥、面板端口、WireGuard 端口与当前网络配置；如果新版服务不能保持运行，会自动恢复到更新前的程序版本。父节点更新完成后，其 `/install.sh` 和安装包接口会自动向后续节点分发新版。
+
+从不含 `pathweaver-update` 的旧版本首次升级时，需要先执行一次原有 GitHub 更新命令；若该设备无法访问 GitHub，也可把一台已经更新的可达节点作为来源：`curl -fsSL 'http://节点IP:控制端口/install.sh' | sudo bash -s -- --source 'http://节点IP:控制端口' --update`。完成这一次迁移后，后续只需运行本机的 `sudo pathweaver-update`。
 
 ## 本机离线卸载
 

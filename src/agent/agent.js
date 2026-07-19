@@ -1213,7 +1213,8 @@ const relayServer = createServer(async (req, res) => {
         reachedAt: new Date().toISOString(),
       }));
     }
-    if (req.url.startsWith('/agent/v1/') || req.url === '/install.sh' || req.url.startsWith('/artifacts/')) {
+    const proxyPathname = new URL(req.url, 'http://pathweaver.local').pathname;
+    if (proxyPathname.startsWith('/agent/v1/') || proxyPathname === '/install.sh' || proxyPathname.startsWith('/artifacts/')) {
       return await proxy(req, res);
     }
     res.writeHead(404, { 'Content-Type': 'application/json' });

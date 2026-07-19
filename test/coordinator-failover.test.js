@@ -114,6 +114,14 @@ test('三节点在初始协调节点失联后由最新副本多数派自动接�
       return result.configurations[0]?.status === 'active';
     }, '双节点配置激活');
 
+    const edgeBUrl = `http://127.0.0.1:${edgeBPort}`;
+    const relayedInstallerResponse = await fetch(
+      `${edgeBUrl}/install.sh?source=${encodeURIComponent(edgeBUrl)}`,
+    );
+    assert.equal(relayedInstallerResponse.status, 200);
+    const relayedInstaller = await relayedInstallerResponse.text();
+    assert.ok(relayedInstaller.includes(`SOURCE="${edgeBUrl}"`));
+
     const tokenC = await waitFor(() => requestJson(`${centerUrl}/api/v1/networks/${networkId}/join-tokens`, {
       method: 'POST', body: JSON.stringify({ parentId: nodeB.id }),
     }), '第三节点加入令牌');

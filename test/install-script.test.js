@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const installer = readFileSync(new URL('../scripts/install.sh', import.meta.url), 'utf8');
+const updater = readFileSync(new URL('../scripts/update.sh', import.meta.url), 'utf8');
 const uninstaller = readFileSync(new URL('../scripts/uninstall.sh', import.meta.url), 'utf8');
 const bundleSource = readFileSync(new URL('../src/center/center-bundle.js', import.meta.url), 'utf8');
 const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
@@ -54,7 +55,9 @@ test('初始节点一键命令使用固定 GitHub 源，安装器自动补齐 No
 
 test('安装时写入完全离线的本机卸载器，并区分保留数据与永久清除', () => {
   assert.match(installer, /install -m 0755 \/opt\/pathweaver\/current\/scripts\/uninstall\.sh \/usr\/local\/sbin\/pathweaver-uninstall/);
+  assert.match(installer, /install -m 0755 \/opt\/pathweaver\/current\/scripts\/update\.sh \/usr\/local\/sbin\/pathweaver-update/);
   assert.match(bundleSource, /scripts\/uninstall\.sh/);
+  assert.match(bundleSource, /scripts\/update\.sh/);
   assert.match(installer, /sysctl\.previous/);
   assert.match(uninstaller, /systemctl disable --now pathweaver-agent\.service pathweaver-node\.service/);
   assert.match(uninstaller, /\/etc\/wireguard\/pw-data\.conf/);
@@ -77,7 +80,16 @@ test('已安装节点支持无交互原地更新，并在服务异常时自动�
   assert.match(installer, /PATHWEAVER_WG_QUICK_NO_AUTO_SU/);
   assert.match(installer, /\^\[\[:space:\]\]\*auto_su\[\[:space:\]\]\*\$/);
   assert.match(installer, /s\/auto_su\/\[\[ "\$\{PATHWEAVER_WG_QUICK_NO_AUTO_SU:-0\}" == "1" \]\] \|\| auto_su/);
-  assert.match(readme, /--source https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main --update/);
+  assert.match(updater, /GITHUB_SOURCE=.*https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main/);
+  assert.match(updater, /state\.controlForwarders/);
+  assert.match(updater, /FROM nodes/);
+  assert.match(updater, /\/artifacts\/center\/pathweaver-center\.tar\.gz/);
+  assert.match(updater, /bash "\$installer" --source "\$source" --update/);
+  assert.match(updater, /尝试下一台节点/);
+  assert.match(installer, /\/usr\/local\/sbin\/pathweaver-update/);
+  assert.match(uninstaller, /rm -f -- \/usr\/local\/sbin\/pathweaver-update/);
+  assert.match(readme, /sudo pathweaver-update/);
+  assert.match(readme, /GitHub 不可达时/);
   assert.match(readme, /数据库、节点密钥、面板端口、WireGuard 端口与当前网络配置/);
 });
 

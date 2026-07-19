@@ -1144,8 +1144,8 @@ export class ControlService {
       );
       sourceUrl = `${parentProtocol}://${parentHost}:${parentPort}`;
       parentConnection = { protocol: parentProtocol, host: parentHost, port: parentPort, url: sourceUrl };
-      const installerUrl = `${sourceUrl}/install.sh?source=${encodeURIComponent(sourceUrl)}`;
-      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --join-token '${token}' --upstream '${sourceUrl}'`;
+      const installerUrl = `${sourceUrl}/install.sh`;
+      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${sourceUrl}' --join-token '${token}' --upstream '${sourceUrl}'`;
     }
     this.db.run(
       `INSERT INTO join_tokens(id, token_hash, network_id, parent_id, mode, expires_at, max_uses, used_count, created_at)

@@ -384,12 +384,14 @@ update_node() {
   install_node_bundle
   new_release="$(readlink -f /opt/pathweaver/current 2>/dev/null || true)"
   if [[ -z "$new_release" || ! -f "$new_release/package.json" ||
-        ! -f "$new_release/scripts/install.sh" || ! -f "$new_release/src/center/server.js" ]]; then
+        ! -f "$new_release/scripts/install.sh" || ! -f "$new_release/scripts/update.sh" ||
+        ! -f "$new_release/src/center/server.js" ]]; then
     ln -sfn "$previous_release" /opt/pathweaver/current
     echo "下载的版本不完整，已恢复旧版本，服务没有重启。" >&2
     exit 1
   fi
   install -m 0755 "$new_release/scripts/uninstall.sh" /usr/local/sbin/pathweaver-uninstall
+  install -m 0755 "$new_release/scripts/update.sh" /usr/local/sbin/pathweaver-update
   if [[ -x "$WIREGUARD_RUNTIME_LINK/bin/wg-quick" ]]; then
     if ! patch_private_wireguard_runtime; then
       ln -sfn "$previous_release" /opt/pathweaver/current
@@ -441,6 +443,7 @@ install_node() {
   install_private_wireguard_runtime
   install_node_bundle
   install -m 0755 /opt/pathweaver/current/scripts/uninstall.sh /usr/local/sbin/pathweaver-uninstall
+  install -m 0755 /opt/pathweaver/current/scripts/update.sh /usr/local/sbin/pathweaver-update
   if ! id pathweaver >/dev/null 2>&1; then useradd --system --home /var/lib/pathweaver --shell /usr/sbin/nologin pathweaver; fi
   install -d -o pathweaver -g pathweaver -m 0750 /var/lib/pathweaver
   install -d -m 0700 /var/lib/pathweaver-agent

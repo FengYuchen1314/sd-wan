@@ -77,6 +77,7 @@ fi
 rm -f -- /etc/pathweaver/node.env /etc/pathweaver/sysctl.previous
 rmdir /etc/pathweaver >/dev/null 2>&1 || true
 rm -rf -- /opt/pathweaver /opt/pathweaver-agent
+rm -f -- /usr/local/sbin/pathweaver-update
 
 if [[ "$PURGE" -eq 1 ]]; then
   rm -rf -- /var/lib/pathweaver /var/lib/pathweaver-agent
