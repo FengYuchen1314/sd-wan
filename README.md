@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main/scripts/
 curl -fsSL https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main/scripts/install.sh | sudo bash -s -- --source https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main --update
 ```
 
-更新模式不会再次询问端口或密码，也不会重新初始化节点。它只替换 `/opt/pathweaver/current` 指向的程序版本并重启已有服务，保留数据库、节点密钥、面板端口、WireGuard 端口与当前网络配置；如果新版服务不能保持运行，会自动恢复到更新前的版本。父节点更新完成后，其 `/install.sh` 和安装包接口会自动向后续节点分发新版。
+更新模式不会再次询问端口或密码，也不会重新初始化节点。它会替换 `/opt/pathweaver/current` 指向的程序版本、修补或补齐 PathWeaver 私有 WireGuard 运行时并重启已有服务，保留数据库、节点密钥、面板端口、WireGuard 端口与当前网络配置；如果新版服务不能保持运行，会自动恢复到更新前的程序版本。父节点更新完成后，其 `/install.sh` 和安装包接口会自动向后续节点分发新版。
 
 ## 本机离线卸载
 

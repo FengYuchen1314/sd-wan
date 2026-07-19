@@ -72,6 +72,14 @@ test('已安装节点支持无交互原地更新，并在服务异常时自动�
   assert.match(installer, /systemctl restart "\$\{services\[@\]\}"/);
   assert.match(installer, /ln -sfn "\$previous_release" \/opt\/pathweaver\/current/);
   assert.match(installer, /services_healthy/);
+  assert.match(installer, /patch_private_wireguard_runtime/);
+  assert.match(installer, /PATHWEAVER_WG_QUICK_NO_AUTO_SU/);
   assert.match(readme, /--source https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main --update/);
   assert.match(readme, /数据库、节点密钥、面板端口、WireGuard 端口与当前网络配置/);
+});
+
+test('被认领节点安装结束时分别输出可复制的地址和控制端口', () => {
+  assert.match(installer, /待认领节点 IP 或域名：\$REACHABLE_HOST/);
+  assert.match(installer, /待认领节点控制端口：\$RELAY_PORT/);
+  assert.doesNotMatch(installer, /填写待认领地址：http:\/\/\$endpoint_host:\$RELAY_PORT/);
 });

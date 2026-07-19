@@ -93,11 +93,26 @@ export class CenterManagedNodes {
       registered.node.id, manager.id, targetUrl, sessionToken, timestamp, timestamp,
     );
     const proxy = { nodeId: registered.node.id, targetUrl, sessionToken };
-    await this.request(proxy, '/agent/v1/adopt/complete', {
-      method: 'POST',
-      body: JSON.stringify({ node: registered.node }),
-    });
-    return { ok: true, node: registered.node, manager, versionId: registered.versionId };
+    let targetConfirmationPending = false;
+    let warning = null;
+    try {
+      await this.request(proxy, '/agent/v1/adopt/complete', {
+        method: 'POST',
+        body: JSON.stringify({ node: registered.node }),
+      });
+    } catch (error) {
+      targetConfirmationPending = true;
+      warning = `节点已登记，目标确认将在后台重试：${error.message}`;
+      console.warn(warning);
+    }
+    return {
+      ok: true,
+      node: registered.node,
+      manager,
+      versionId: registered.versionId,
+      targetConfirmationPending,
+      ...(warning ? { warning } : {}),
+    };
   }
 
   proxies() {

@@ -645,10 +645,17 @@ async function finishLocalAdoption(context, registered, credential = null) {
   };
   state.managedChildren[registered.node.id] = child;
   atomicJson(stateFile, state);
-  await requestManagedTarget(child, '/agent/v1/adopt/complete', {
-    method: 'POST',
-    body: JSON.stringify({ node: registered.node }),
-  });
+  try {
+    await requestManagedTarget(child, '/agent/v1/adopt/complete', {
+      method: 'POST',
+      body: JSON.stringify({ node: registered.node }),
+    });
+  } catch (error) {
+    child.targetConfirmationPending = true;
+    child.targetConfirmationError = error.message;
+    atomicJson(stateFile, state);
+    console.warn(`节点 ${registered.node.id} 已登记，目标确认将在后台重试：${error.message}`);
+  }
   return child;
 }
 
@@ -667,8 +674,13 @@ async function adoptTarget(payload) {
       ...context.agent,
     }),
   });
-  await finishLocalAdoption(context, registered, registered.credential);
-  return { ok: true, nodeId: registered.node.id, node: registered.node };
+  const child = await finishLocalAdoption(context, registered, registered.credential);
+  return {
+    ok: true,
+    nodeId: registered.node.id,
+    node: registered.node,
+    targetConfirmationPending: Boolean(child.targetConfirmationPending),
+  };
 }
 
 async function runCommand(command) {

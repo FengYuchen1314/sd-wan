@@ -254,6 +254,7 @@ install_private_wireguard_runtime() {
   install -d -m 0755 "$release_dir/bin"
   install -m 0755 "$source_dir/src/wg" "$release_dir/bin/wg"
   install -m 0755 "$source_dir/src/wg-quick/linux.bash" "$release_dir/bin/wg-quick"
+  patch_private_wireguard_runtime "$release_dir/bin/wg-quick"
   cat >"$release_dir/runtime.json" <<EOF
 {"schemaVersion":1,"toolsVersion":"$WIREGUARD_TOOLS_VERSION","installedAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","managedBy":"pathweaver"}
 EOF
@@ -261,6 +262,22 @@ EOF
   ln -sfn "$release_dir" "$WIREGUARD_RUNTIME_LINK"
   trap - RETURN
   rm -rf -- "$build_dir"
+}
+
+patch_private_wireguard_runtime() {
+  local quick="${1:-$WIREGUARD_RUNTIME_LINK/bin/wg-quick}"
+  if [[ ! -f "$quick" ]]; then
+    echo "PathWeaver 私有 wg-quick 不存在：$quick" >&2
+    exit 1
+  fi
+  if ! grep -q 'PATHWEAVER_WG_QUICK_NO_AUTO_SU' "$quick"; then
+    if ! grep -q '^auto_su$' "$quick"; then
+      echo "无法识别 PathWeaver 私有 wg-quick 的提权入口，拒绝修改。" >&2
+      exit 1
+    fi
+    sed -i 's/^auto_su$/if [[ "${PATHWEAVER_WG_QUICK_NO_AUTO_SU:-0}" != "1" ]]; then auto_su; fi/' "$quick"
+  fi
+  chmod 0755 "$quick"
 }
 
 download_agent_source() {
@@ -364,6 +381,12 @@ update_node() {
     exit 1
   fi
   install -m 0755 "$new_release/scripts/uninstall.sh" /usr/local/sbin/pathweaver-uninstall
+  if [[ -x "$WIREGUARD_RUNTIME_LINK/bin/wg-quick" ]]; then
+    patch_private_wireguard_runtime
+  else
+    echo "私有 WireGuard 运行时缺失，正在重新安装……"
+    install_private_wireguard_runtime
+  fi
 
   systemctl daemon-reload
   if ! systemctl restart "${services[@]}"; then
@@ -536,7 +559,11 @@ EOF
 
   echo "PathWeaver 节点已启动：面板 http://$endpoint_host:$PANEL_PORT，WireGuard UDP $DATA_PORT。"
   echo "每台设备都使用自己的安装密码登录面板，配置通过现有无环控制路径实时保持一致。"
-  if [[ -n "$CLAIM_TOKEN" ]]; then echo "请在任意已入网面板填写待认领地址：http://$endpoint_host:$RELAY_PORT"; fi
+  if [[ -n "$CLAIM_TOKEN" ]]; then
+    echo "待认领节点 IP 或域名：$REACHABLE_HOST"
+    echo "待认领节点控制端口：$RELAY_PORT"
+    echo "请把上面两项分别复制到已入网面板的认领表单。"
+  fi
 }
 
 if [[ "$SOURCE" == "__PATHWEAVER_SOURCE__" ]]; then

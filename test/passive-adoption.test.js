@@ -106,6 +106,53 @@ async function startAgentApi(service) {
   return { server, url: `http://127.0.0.1:${server.address().port}` };
 }
 
+test('认领登记成功后即使目标确认暂时失败也返回成功并保留后台代理', async () => {
+  const database = new Database(':memory:');
+  let targetServer;
+  try {
+    const service = new ControlService(database, { publicUrl: 'http://center.example:8787' });
+    const network = service.createNetwork({
+      name: '认领确认恢复测试', dataCidr: '10.122.0.0/24', controlCidr: '10.123.0.0/24', listenPort: 19801, mtu: 1380,
+    });
+    const center = service.listNodes(network.id)[0];
+    const token = service.createJoinToken(network.id, { parentId: center.id, mode: 'passive' });
+    targetServer = createHttpServer(async (req, res) => {
+      if (req.method === 'POST' && req.url === '/agent/v1/adopt') {
+        await readJson(req);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          ok: true,
+          agent: {
+            name: '确认暂时失败的节点',
+            agentVersion: '0.1.0',
+            wgControlPublicKey: 'c'.repeat(44),
+            wgDataPublicKey: 'd'.repeat(44),
+            controlListenPort: 8790,
+            dataListenPort: 19801,
+          },
+        }));
+      }
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: '模拟目标确认响应丢失' }));
+    });
+    await new Promise((resolveListen, reject) => {
+      targetServer.once('error', reject);
+      targetServer.listen(0, '127.0.0.1', resolveListen);
+    });
+    const targetUrl = `http://127.0.0.1:${targetServer.address().port}`;
+    const manager = new CenterManagedNodes(service);
+    const result = await manager.adopt(center.id, { targetUrl, claimToken: token.token });
+    assert.equal(result.ok, true);
+    assert.equal(result.targetConfirmationPending, true);
+    assert.match(result.warning, /后台重试/);
+    assert.equal(service.listNodes(network.id).some((node) => node.id === result.node.id), true);
+    assert.equal(manager.proxies().some((proxy) => proxy.nodeId === result.node.id), true);
+  } finally {
+    if (targetServer) await new Promise((resolveClose) => targetServer.close(resolveClose));
+    database.close();
+  }
+});
+
 test('严格单向认领由中心主动连接目标并代理配置，目标不会反向设置上游', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'pathweaver-passive-'));
   const database = new Database(':memory:');

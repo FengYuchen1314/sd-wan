@@ -1,3 +1,5 @@
+import { copyText } from './clipboard.js';
+
 const state = {
   token: sessionStorage.getItem('pathweaver-token') || '',
   dashboard: null,
@@ -804,7 +806,12 @@ function bindViewEvents() {
     if (form.elements.parentProtocol) form.elements.parentProtocol.value = option?.dataset.protocol || 'http';
   });
   document.querySelector('#copy-command')?.addEventListener('click', async () => {
-    await navigator.clipboard.writeText(state.joinResult.command); toast('安装命令已复制');
+    try {
+      await copyText(state.joinResult.command);
+      toast('安装命令已复制到剪贴板');
+    } catch (error) {
+      toast(error.message, 'error');
+    }
   });
 }
 
@@ -948,7 +955,7 @@ async function enqueueAdoption(event) {
     const targetUrl = `http://${targetHost.includes(':') && !targetHost.startsWith('[') ? `[${targetHost}]` : targetHost}:${targetPort}`;
     const parsed = new URL(targetUrl);
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('目标地址只支持 HTTP 或 HTTPS');
-    await api(`/api/v1/nodes/${state.joinResult.parent.id}/commands`, {
+    const result = await api(`/api/v1/nodes/${state.joinResult.parent.id}/commands`, {
       method: 'POST',
       body: JSON.stringify({
         type: 'adopt-node',
@@ -958,7 +965,14 @@ async function enqueueAdoption(event) {
         },
       }),
     });
-    toast(`认领指令已发送给 ${state.joinResult.parent.name}`);
+    if (result.node) {
+      toast(result.targetConfirmationPending
+        ? `${result.node.name} 已登记；目标确认将在后台自动重试`
+        : `${result.node.name} 已认领并加入节点组`);
+      await load();
+    } else {
+      toast(`认领指令已发送给 ${state.joinResult.parent.name}`);
+    }
     event.currentTarget.querySelector('button').disabled = true;
   } catch (error) { toast(error.message, 'error'); }
 }

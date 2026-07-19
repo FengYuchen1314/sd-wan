@@ -61,6 +61,7 @@ test('Agent 只接受带 PathWeaver 清单的私有 WireGuard 运行时', () => 
     });
     assert.equal(manager.assertPrivateRuntime().toolsVersion, 'test-version');
     assert.equal(manager.wireguardDir, join(root, 'data', 'wireguard'));
+    assert.equal(manager.commandEnvironment.PATHWEAVER_WG_QUICK_NO_AUTO_SU, '1');
 
     writeFileSync(join(runtimeDir, 'runtime.json'), JSON.stringify({ managedBy: 'system' }));
     assert.throws(() => manager.assertPrivateRuntime(), /私有 WireGuard 运行时缺失或清单无效/);
@@ -128,7 +129,7 @@ test('Linux 激活器实际创建路径隧道并安装加权 nexthop', async () 
       }],
     });
     assert.equal(plan.tunnels.length, 2);
-    assert.ok(calls.some((call) => call.join(' ') === 'sysctl -w net.ipv4.ip_forward=1'));
+    assert.equal(calls.some((call) => call[0] === 'sysctl'), false);
     assert.equal(calls.filter((call) => call[0] === 'ip' && call[1] === 'tunnel' && call[2] === 'add').length, 2);
     const route = calls.find((call) => call[0] === 'ip' && call[1] === 'route' && call[2] === 'replace');
     assert.ok(route);

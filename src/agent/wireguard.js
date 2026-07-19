@@ -137,6 +137,7 @@ export class WireGuardManager {
     this.commandEnvironment = {
       ...process.env,
       PATH: `${join(this.runtimeDir, 'bin')}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
+      PATHWEAVER_WG_QUICK_NO_AUTO_SU: '1',
     };
     this.preparedInterfaces = new Map();
     this.preparedConfigs = new Map();
@@ -202,8 +203,6 @@ export class WireGuardManager {
   async applyMultipathPlan(config) {
     const plan = buildMultipathPlan(config);
     if (!this.applyNetwork) return plan;
-    await this.runSystem('sysctl', ['-w', 'net.ipv4.ip_forward=1']);
-    await this.runSystem('sysctl', ['-w', 'net.ipv4.conf.all.rp_filter=2']);
     for (const alias of plan.aliases) {
       await this.runIp(['address', 'replace', `${alias}/32`, 'dev', 'lo']);
     }
