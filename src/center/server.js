@@ -1,17 +1,25 @@
 import { createServer } from 'node:http';
+import { Readable } from 'node:stream';
 import { timingSafeEqual } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Database } from './database.js';
+import { createCenterBundle } from './center-bundle.js';
+import { CenterDataPlane } from './data-plane.js';
+import { CenterManagedNodes } from './managed-nodes.js';
 import { ControlService } from './service.js';
+import { WireGuardArtifactStore, wireGuardRuntimeManifest } from './wireguard-artifacts.js';
+import { verifyPanelPassword } from '../core/password.js';
 
 const rootDir = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const publicDir = join(rootDir, 'public');
 const dataDir = process.env.SDWAN_DATA_DIR || join(rootDir, 'data');
-const port = Number(process.env.SDWAN_PORT || 8787);
+const port = Number(process.env.SDWAN_PORT || 19773);
 const host = process.env.SDWAN_HOST || '0.0.0.0';
 const publicUrl = process.env.SDWAN_PUBLIC_URL || `http://127.0.0.1:${port}`;
+const defaultDataPort = Number(process.env.SDWAN_DEFAULT_DATA_PORT || 19801);
+const adminPasswordHash = process.env.SDWAN_PANEL_PASSWORD_HASH || '';
 const adminToken = process.env.SDWAN_ADMIN_TOKEN || (process.env.NODE_ENV === 'production' ? '' : 'dev-admin-token');
 const nodeOfflineAfterMs = Number(process.env.SDWAN_NODE_OFFLINE_AFTER_MS || 20_000);
 const configuredSweepIntervalMs = Number(process.env.SDWAN_RUNTIME_SWEEP_INTERVAL_MS || 5_000);
@@ -19,13 +27,36 @@ const runtimeSweepIntervalMs = Number.isFinite(configuredSweepIntervalMs) && con
   ? configuredSweepIntervalMs
   : 5_000;
 
-if (!adminToken) {
-  throw new Error('生产环境必须设置 SDWAN_ADMIN_TOKEN');
+if (!adminToken && !adminPasswordHash) {
+  throw new Error('生产环境必须设置面板密码哈希');
 }
 
 const database = new Database(join(dataDir, 'pathweaver.db'));
-const service = new ControlService(database, { publicUrl, nodeOfflineAfterMs });
+const service = new ControlService(database, {
+  publicUrl,
+  nodeOfflineAfterMs,
+  defaultDataPort,
+  manageLocalCenters: true,
+});
+const wireGuardArtifacts = new WireGuardArtifactStore(join(dataDir, 'artifacts', 'wireguard'));
 service.ensureDefaultNetwork();
+const centerDataPlane = new CenterDataPlane(service, {
+  dataDir,
+  applyNetwork: process.env.SDWAN_APPLY_NETWORK === '1' && process.platform === 'linux',
+  wireguardDir: process.env.SDWAN_WIREGUARD_DIR || (process.platform === 'linux' ? '/etc/wireguard' : undefined),
+  runtimeDir: process.env.SDWAN_WIREGUARD_RUNTIME_DIR,
+});
+void centerDataPlane.tick().catch((error) => console.error('center data plane reconciliation failed:', error));
+const centerDataPlaneSweep = setInterval(() => {
+  void centerDataPlane.tick().catch((error) => console.error('center data plane reconciliation failed:', error));
+}, Math.max(1_000, runtimeSweepIntervalMs));
+centerDataPlaneSweep.unref();
+const centerManagedNodes = new CenterManagedNodes(service, { panelProxy: dispatchPanelEnvelope });
+void centerManagedNodes.tick().catch((error) => console.error('center managed-node reconciliation failed:', error));
+const centerManagedNodesSweep = setInterval(() => {
+  void centerManagedNodes.tick().catch((error) => console.error('center managed-node reconciliation failed:', error));
+}, Math.max(1_000, runtimeSweepIntervalMs));
+centerManagedNodesSweep.unref();
 service.reconcileRuntimeState();
 const runtimeSweep = setInterval(() => {
   try {
@@ -92,8 +123,10 @@ function secretMatches(left, right) {
 }
 
 function requireAdmin(req) {
-  if (!secretMatches(bearer(req), adminToken)) {
-    const error = new Error('管理令牌无效');
+  const credential = bearer(req);
+  const tokenValid = adminToken && secretMatches(credential, adminToken);
+  if (!tokenValid && !verifyPanelPassword(credential, adminPasswordHash)) {
+    const error = new Error('面板密码无效');
     error.statusCode = 401;
     throw error;
   }
@@ -137,8 +170,16 @@ function serveStatic(pathname, res) {
   }
 }
 
-async function handleAdmin(req, res, pathname, url) {
-  requireAdmin(req);
+async function handleAdmin(req, res, pathname, url, authenticated = false) {
+  if (!authenticated) requireAdmin(req);
+  if (req.method === 'GET' && pathname === '/api/v1/panel-status') {
+    return send(res, 200, {
+      synchronized: true,
+      syncMode: 'live-control-state',
+      panelPort: port,
+      message: '所有节点面板通过无环控制路径读写同一份版本化配置',
+    });
+  }
   if (req.method === 'GET' && pathname === '/api/v1/dashboard') {
     return send(res, 200, service.dashboard());
   }
@@ -149,7 +190,10 @@ async function handleAdmin(req, res, pathname, url) {
     return send(res, 201, service.createNetwork(await readJson(req)));
   }
 
-  let params = match(pathname, '/api/v1/networks/:id/nodes');
+  let params = match(pathname, '/api/v1/networks/:id');
+  if (req.method === 'PATCH' && params) return send(res, 200, service.updateNetwork(params.id, await readJson(req)));
+
+  params = match(pathname, '/api/v1/networks/:id/nodes');
   if (req.method === 'GET' && params) return send(res, 200, { nodes: service.listNodes(params.id) });
 
   params = match(pathname, '/api/v1/networks/:id/topology');
@@ -195,10 +239,21 @@ async function handleAdmin(req, res, pathname, url) {
 
   params = match(pathname, '/api/v1/nodes/:id');
   if (req.method === 'PATCH' && params) return send(res, 200, service.updateNode(params.id, await readJson(req)));
+  if (req.method === 'DELETE' && params) return send(res, 200, service.deleteNode(params.id));
+
+  params = match(pathname, '/api/v1/nodes/:id/deletion-impact');
+  if (req.method === 'GET' && params) {
+    const { compiled, ...impact } = service.inspectNodeDeletion(params.id);
+    return send(res, 200, impact);
+  }
 
   params = match(pathname, '/api/v1/nodes/:id/commands');
   if (req.method === 'POST' && params) {
     const input = await readJson(req);
+    const node = service.getNode(params.id);
+    if (node.isCenter && input.type === 'adopt-node') {
+      return send(res, 201, await centerManagedNodes.adopt(node.id, input.payload || {}));
+    }
     return send(res, 201, service.enqueueCommand(params.id, input.type, input.payload));
   }
 
@@ -208,11 +263,46 @@ async function handleAdmin(req, res, pathname, url) {
   return send(res, 404, { error: '接口不存在' });
 }
 
+async function dispatchPanelEnvelope(input) {
+  const method = String(input.method || 'GET').toUpperCase();
+  const nestedUrl = new URL(String(input.path || ''), publicUrl);
+  if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method) || !nestedUrl.pathname.startsWith('/api/v1/')) {
+    throw new Error('面板代理请求方法或路径无效');
+  }
+  const body = Buffer.from(String(input.body || ''), 'base64');
+  if (body.length > 1_048_576) throw new Error('面板代理请求超过 1 MiB 限制');
+  const nestedReq = Readable.from(body.length ? [body] : []);
+  nestedReq.method = method;
+  nestedReq.headers = { 'content-type': String(input.contentType || 'application/json') };
+  const captured = await new Promise((resolve, reject) => {
+    let status = 200;
+    let headers = {};
+    const nestedRes = {
+      writeHead(nextStatus, nextHeaders = {}) {
+        status = Number(nextStatus);
+        headers = nextHeaders;
+      },
+      end(payload = '') {
+        resolve({ status, headers, payload: Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload)) });
+      },
+    };
+    Promise.resolve(handleAdmin(nestedReq, nestedRes, nestedUrl.pathname, nestedUrl, true)).catch(reject);
+  });
+  return {
+    status: captured.status,
+    contentType: captured.headers['Content-Type'] || captured.headers['content-type'] || 'application/json; charset=utf-8',
+    body: captured.payload.toString('base64'),
+  };
+}
+
 async function handleAgent(req, res, pathname, url) {
   if (req.method === 'POST' && pathname === '/agent/v1/register') {
     return send(res, 201, service.registerAgent(await readJson(req)));
   }
   const node = requireAgent(req);
+  if (req.method === 'POST' && pathname === '/agent/v1/panel-proxy') {
+    return send(res, 200, await dispatchPanelEnvelope(await readJson(req)));
+  }
   if (req.method === 'POST' && pathname === '/agent/v1/heartbeat') {
     return send(res, 200, service.heartbeat(node.id, await readJson(req)));
   }
@@ -240,7 +330,11 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url, publicUrl);
   const pathname = url.pathname;
   try {
-    if (pathname === '/healthz') return send(res, 200, { status: 'ok', time: new Date().toISOString() });
+    if (pathname === '/healthz') return send(res, 200, {
+      status: 'ok',
+      time: new Date().toISOString(),
+      centerDataPlane: centerDataPlane.runtimeInfo(),
+    });
     if (pathname === '/install.sh') {
       let source = url.searchParams.get('source') || `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}`;
       try {
@@ -254,6 +348,27 @@ const server = createServer(async (req, res) => {
       return send(res, 200, installer, {
         'Content-Type': 'text/x-shellscript; charset=utf-8',
         'Cache-Control': 'public, max-age=60',
+      });
+    }
+    if (req.method === 'GET' && pathname === '/artifacts/wireguard/manifest.json') {
+      return send(res, 200, wireGuardRuntimeManifest(), { 'Cache-Control': 'public, max-age=300' });
+    }
+    if (req.method === 'GET' && pathname === '/artifacts/center/pathweaver-center.tar.gz') {
+      const bundle = createCenterBundle(rootDir);
+      return send(res, 200, bundle, {
+        'Content-Type': 'application/gzip',
+        'Content-Length': bundle.length,
+        'Cache-Control': 'public, max-age=300',
+      });
+    }
+    const wireGuardArtifactMatch = pathname.match(/^\/artifacts\/wireguard\/([^/]+)$/);
+    if (req.method === 'GET' && wireGuardArtifactMatch) {
+      const artifact = await wireGuardArtifacts.load(decodeURIComponent(wireGuardArtifactMatch[1]));
+      return send(res, 200, artifact.content, {
+        'Content-Type': artifact.descriptor.contentType,
+        'Content-Length': artifact.content.length,
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'X-PathWeaver-Artifact-Cache': artifact.cached ? 'HIT' : 'MISS',
       });
     }
     if (pathname === '/artifacts/agent/agent.js') {
@@ -288,12 +403,14 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(port, host, () => {
-  console.log(`PathWeaver center listening at ${publicUrl}`);
+  console.log(`PathWeaver node panel listening at ${publicUrl}`);
   if (adminToken === 'dev-admin-token') console.log('Development admin token: dev-admin-token');
 });
 
 function shutdown() {
   clearInterval(runtimeSweep);
+  clearInterval(centerDataPlaneSweep);
+  clearInterval(centerManagedNodesSweep);
   server.close(() => {
     database.close();
     process.exit(0);

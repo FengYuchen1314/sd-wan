@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   control_ip TEXT NOT NULL,
   data_ip TEXT NOT NULL,
   control_endpoint TEXT,
+  control_listen_port INTEGER,
   data_endpoint TEXT,
   data_listen_port INTEGER,
   wg_control_public_key TEXT,
@@ -62,6 +63,8 @@ CREATE TABLE IF NOT EXISTS topology_links (
   validation_prepared_downstream INTEGER NOT NULL DEFAULT 0,
   validation_probed_upstream INTEGER NOT NULL DEFAULT 0,
   validation_probed_downstream INTEGER NOT NULL DEFAULT 0,
+  validation_probe_error_upstream TEXT,
+  validation_probe_error_downstream TEXT,
   validation_expires_at TEXT,
   validated_at TEXT,
   created_at TEXT NOT NULL
@@ -83,6 +86,17 @@ CREATE TABLE IF NOT EXISTS path_policies (
 );
 
 CREATE INDEX IF NOT EXISTS path_policies_network ON path_policies(network_id);
+
+CREATE TABLE IF NOT EXISTS link_health_reports (
+  node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  link_id TEXT NOT NULL REFERENCES topology_links(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  PRIMARY KEY(node_id, link_id)
+);
+
+CREATE INDEX IF NOT EXISTS link_health_reports_link
+  ON link_health_reports(link_id, status, observed_at);
 
 CREATE TABLE IF NOT EXISTS join_tokens (
   id TEXT PRIMARY KEY,
@@ -119,6 +133,21 @@ CREATE TABLE IF NOT EXISTS node_configs (
   PRIMARY KEY(version_id, node_id)
 );
 
+CREATE TABLE IF NOT EXISTS network_cidr_changes (
+  version_id TEXT PRIMARY KEY REFERENCES config_versions(id) ON DELETE CASCADE,
+  network_id TEXT NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
+  before_cidr TEXT NOT NULL,
+  after_cidr TEXT NOT NULL,
+  assignments_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  error TEXT,
+  created_at TEXT NOT NULL,
+  applied_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS network_cidr_changes_network
+  ON network_cidr_changes(network_id, status, created_at);
+
 CREATE TABLE IF NOT EXISTS commands (
   id TEXT PRIMARY KEY,
   node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
@@ -132,6 +161,20 @@ CREATE TABLE IF NOT EXISTS commands (
 );
 
 CREATE INDEX IF NOT EXISTS commands_pending ON commands(node_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS managed_node_proxies (
+  node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+  manager_node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  target_url TEXT NOT NULL,
+  session_token TEXT NOT NULL,
+  relay_path_json TEXT NOT NULL DEFAULT '[]',
+  current_version INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS managed_node_proxies_manager
+  ON managed_node_proxies(manager_node_id);
 
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,6 +208,8 @@ export class Database {
       ['validation_prepared_downstream', 'INTEGER NOT NULL DEFAULT 0'],
       ['validation_probed_upstream', 'INTEGER NOT NULL DEFAULT 0'],
       ['validation_probed_downstream', 'INTEGER NOT NULL DEFAULT 0'],
+      ['validation_probe_error_upstream', 'TEXT'],
+      ['validation_probe_error_downstream', 'TEXT'],
       ['validation_expires_at', 'TEXT'],
       ['validated_at', 'TEXT'],
     ];
@@ -173,9 +218,21 @@ export class Database {
     }
 
     const nodeColumns = new Set(this.handle.prepare('PRAGMA table_info(nodes)').all().map((column) => column.name));
+    if (!nodeColumns.has('control_listen_port')) {
+      this.handle.exec('ALTER TABLE nodes ADD COLUMN control_listen_port INTEGER');
+    }
     if (!nodeColumns.has('data_listen_port')) {
       this.handle.exec('ALTER TABLE nodes ADD COLUMN data_listen_port INTEGER');
     }
+    const proxyColumns = new Set(this.handle.prepare('PRAGMA table_info(managed_node_proxies)').all().map((column) => column.name));
+    if (!proxyColumns.has('relay_path_json')) {
+      this.handle.exec("ALTER TABLE managed_node_proxies ADD COLUMN relay_path_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    this.handle.exec(`
+      UPDATE nodes
+      SET control_listen_port = 8790
+      WHERE control_listen_port IS NULL AND is_center = 0
+    `);
     this.handle.exec(`
       UPDATE nodes
       SET data_listen_port = COALESCE(

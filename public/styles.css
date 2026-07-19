@@ -173,9 +173,13 @@ h3 { font-size: 14px; }
 .path-endpoints small { margin-top: 5px; color: var(--lime); font: 10px ui-monospace, monospace; }
 .path-endpoints > span:nth-child(2) { color: var(--subtle); font-size: 9px; text-transform: uppercase; letter-spacing: .1em; }
 .path-lanes { display: grid; gap: 9px; padding: 18px; background-image: radial-gradient(var(--line) .65px, transparent .65px); background-size: 20px 20px; }
+.path-mode-bar { margin: 14px 18px 0; }
 .path-lane { display: grid; grid-template-columns: 18px 38px minmax(0,1fr) 70px; align-items: center; gap: 10px; min-height: 82px; padding: 12px 14px; color: var(--muted); background: rgba(10,16,19,.9); border: 1px solid var(--line); border-radius: 11px; cursor: pointer; transition: border-color .16s ease, background .16s ease; }
 .path-lane:hover { border-color: var(--line-strong); }
 .path-lane.selected { color: var(--text); background: rgba(184,238,82,.045); border-color: rgba(184,238,82,.42); }
+.path-lane.unavailable { opacity: .68; background: rgba(255,118,111,.035); border-color: rgba(255,118,111,.34); }
+.path-lane.unavailable .path-segment { background: var(--red); opacity: .58; }
+.path-lane.unavailable .path-lane-meta strong { color: var(--red); }
 .path-option { width: 16px; height: 16px; margin: 0; padding: 0; accent-color: var(--lime); }
 .path-lane-index { color: var(--lime); font: 10px ui-monospace, monospace; }
 .path-chain { display: flex; align-items: center; min-width: 0; overflow-x: auto; padding: 3px 0; }
@@ -189,6 +193,8 @@ h3 { font-size: 14px; }
 .path-lane-meta strong, .path-lane-meta small { display: block; }
 .path-lane-meta strong { color: var(--text); font-size: 10px; }
 .path-lane-meta small { margin-top: 4px; color: var(--subtle); font-size: 8px; }
+.path-weight-row.unavailable { opacity: .7; }
+.path-weight-row.unavailable strong { color: var(--red); }
 .path-policy-editor { display: grid; grid-template-columns: minmax(170px,.65fr) minmax(260px,1.35fr) auto; align-items: center; gap: 20px; padding: 18px; border-top: 1px solid var(--line); }
 .path-policy-editor > div:first-child strong, .path-policy-editor > div:first-child small { display: block; }
 .path-policy-editor > div:first-child strong { font-size: 12px; }
@@ -242,6 +248,7 @@ h3 { font-size: 14px; }
 .toggle-line { grid-template-columns: 18px 1fr; align-items: center; font-weight: 500; }
 .toggle-line input { width: 16px; height: 16px; accent-color: var(--lime); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 22px; }
+.modal-action-spacer { flex: 1; }
 .form-error { min-height: 16px; margin: 10px 0 0; color: var(--red); font-size: 10px; }
 .modal .notice { margin-top: 18px; }
 

@@ -170,11 +170,17 @@ export function validateAndCompileTopology({ network, nodes, links }) {
       networkId: network.id,
       nodeId,
       data: {
-        interfaceName: 'pw-data',
+        interfaceName: node.isCenter ? `pw-${network.id.replace(/-/g, '').slice(0, 10)}` : 'pw-data',
+        networkCidr: network.dataCidr,
         address: `${node.dataIp}/32`,
         listenPort: node.dataListenPort ?? network.listenPort ?? 19801,
         mtu: network.mtu,
         peers,
+        links: (adjacency.get(nodeId) ?? []).map((edge) => ({
+          linkId: edge.link.id ?? null,
+          peerNodeId: edge.peerId,
+          peerPublicKey: nodeById.get(edge.peerId).wgDataPublicKey ?? '',
+        })).filter((link) => link.linkId),
       },
       routes: Object.entries(routes[nodeId]).map(([targetId, viaNodeId]) => ({
         destination: `${nodeById.get(targetId).dataIp}/32`,

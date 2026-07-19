@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>PathWeaver · SD-WAN 控制中心</title>
-  <meta name="description" content="基于 WireGuard 的路径可控 SD-WAN 管理中心">
-  <link rel="stylesheet" href="/styles.css?v=6">
+  <title>PathWeaver · SD-WAN 节点面板</title>
+  <meta name="description" content="基于 WireGuard 的全节点同步 SD-WAN 管理面板">
+  <link rel="stylesheet" href="/styles.css?v=8">
 </head>
 <body>
   <div class="shell">
@@ -33,7 +33,7 @@
       </nav>
 
       <div class="sidebar-foot">
-        <div class="control-state"><span class="pulse"></span><span><strong>控制平面正常</strong><small>配置沿接入树传递</small></span></div>
+        <div class="control-state"><span class="pulse"></span><span><strong>面板配置已同步</strong><small>每个节点均可管理</small></span></div>
         <button class="text-button" id="lock-console">锁定面板</button>
       </div>
     </aside>
@@ -61,9 +61,9 @@
     <form method="dialog" id="login-form">
       <div class="modal-badge">PW</div>
       <p class="eyebrow">CONTROL PLANE ACCESS</p>
-      <h2>进入控制中心</h2>
-      <p class="muted">输入部署时设置的管理令牌。令牌只保存在当前浏览器。</p>
-      <label>管理令牌<input id="admin-token" type="password" autocomplete="current-password" required placeholder="SDWAN_ADMIN_TOKEN"></label>
+      <h2>进入节点面板</h2>
+      <p class="muted">输入安装本节点时设置的面板密码。密码只用于本机验证。</p>
+      <label>面板密码<input id="admin-token" type="password" autocomplete="current-password" required placeholder="安装时输入的密码"></label>
       <p class="form-error" id="login-error"></p>
       <button class="button primary wide" value="default">验证并进入</button>
     </form>
@@ -74,9 +74,10 @@
       <div class="modal-head"><div><p class="eyebrow">NEW NETWORK</p><h2>创建节点组</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></div>
       <div class="form-grid">
         <label class="span-2">名称<input name="name" required value="生产网络"></label>
+        <label>常用私有网段<select id="network-data-preset"><option value="10.77.0.0/16">10.77.0.0/16</option><option value="10.0.0.0/16">10.0.0.0/16</option><option value="172.20.0.0/16">172.20.0.0/16</option><option value="192.168.240.0/20">192.168.240.0/20</option><option value="">自定义</option></select></label>
         <label>业务网段<input name="dataCidr" required value="10.77.0.0/16"></label>
         <label>控制网段<input name="controlCidr" required value="10.254.0.0/16"></label>
-        <label>WireGuard 端口<input name="listenPort" type="number" value="51820"></label>
+        <label>初始节点 WireGuard UDP 端口<input name="listenPort" type="number" value="19801"></label>
         <label>MTU<input name="mtu" type="number" value="1380"></label>
       </div>
       <p class="form-error" data-form-error></p>
@@ -91,13 +92,15 @@
       <div class="form-grid">
         <label class="span-2">节点名称<input name="name" required></label>
         <label class="span-2">业务内网 IP<input name="dataIp" required inputmode="decimal"></label>
-        <label class="span-2">接入中继地址<input name="controlEndpoint" placeholder="http://公网或内网IP:8790"></label>
-        <label class="span-2">WireGuard 数据端点<input name="dataEndpoint" placeholder="公网或内网IP:51820"></label>
+        <label>接入中继地址<input name="controlEndpoint" placeholder="http://公网或内网IP:8790"></label>
+        <label>控制中继 TCP 端口<input name="controlListenPort" type="number" min="1" max="65535" required></label>
+        <label>WireGuard 监听端口<input name="dataListenPort" type="number" min="1" max="65535" required></label>
+        <label>WireGuard 数据端点<input name="dataEndpoint" placeholder="公网或内网IP:19801"></label>
         <label class="toggle-line span-2"><input name="canRelay" type="checkbox"><span>允许作为下级节点的接入和控制中继</span></label>
       </div>
       <div class="notice warning"><strong>版本化变更</strong><span>保存后将生成全网配置版本。新 IP、下一跳和所有相关 AllowedIPs 会一起下发。</span></div>
       <p class="form-error" data-form-error></p>
-      <div class="modal-actions"><button class="button ghost" value="cancel">取消</button><button class="button primary" value="default">校验并发布</button></div>
+      <div class="modal-actions"><button class="button danger" type="button" id="delete-node">删除节点</button><span class="modal-action-spacer"></span><button class="button ghost" value="cancel">取消</button><button class="button primary" value="default">校验并发布</button></div>
     </form>
   </dialog>
 
@@ -108,17 +111,19 @@
       <div class="modal-head"><div><p class="eyebrow">NEW DATA PATH</p><h2>建立节点连接</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></div>
       <div class="connection-pair" id="connection-pair"></div>
       <div class="form-grid">
-        <label class="span-2"><span id="node-a-address-label">节点 A 的可达 IP 或域名</span><input name="nodeAAddress" required placeholder="例如 192.168.1.10"></label>
-        <label class="span-2"><span id="node-b-address-label">节点 B 的可达 IP 或域名</span><input name="nodeBAddress" required placeholder="例如 10.10.0.23"></label>
+        <label><span id="node-a-address-label">节点 A 的可达 IP 或域名</span><input name="nodeAAddress" required placeholder="例如 192.168.1.10"></label>
+        <label>节点 A WireGuard 端口<input name="nodeAPort" type="number" min="1" max="65535" required></label>
+        <label><span id="node-b-address-label">节点 B 的可达 IP 或域名</span><input name="nodeBAddress" required placeholder="例如 10.10.0.23"></label>
+        <label>节点 B WireGuard 端口<input name="nodeBPort" type="number" min="1" max="65535" required></label>
         <label class="span-2">路径优先级<input name="priority" type="number" min="0" value="10"><small>数字越小越优先；新直连通常会成为两节点之间的首选路径。</small></label>
       </div>
-      <div class="notice"><strong>双向验证</strong><span>中心先校验地址和路由，再命令两个 Agent 分别访问对方。双方都确认可达后，连接才转为实线并参与 WireGuard 路由。</span></div>
+      <div class="notice"><strong>双向探测，单向成功即可建链</strong><span>两个 WireGuard 端口自动采用节点数据库中保存的监听端口，也可手动覆盖；双方可达 IP 必须由你填写。系统会同时从两端探测，只要任一端能主动连接另一端，就会激活链路并保存实际可用方向。</span></div>
       <p class="form-error" data-form-error></p>
-      <div class="modal-actions"><button class="button ghost" value="cancel">取消</button><button class="button primary" value="default">开始双向验证</button></div>
+      <div class="modal-actions"><button class="button ghost" value="cancel">取消</button><button class="button primary" value="default">开始双向探测</button></div>
     </form>
   </dialog>
 
   <div id="toast-region" class="toast-region" aria-live="assertive"></div>
-  <script type="module" src="/app.js?v=6"></script>
+  <script type="module" src="/app.js?v=14"></script>
 </body>
 </html>

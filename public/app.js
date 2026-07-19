@@ -1,6 +1,7 @@
 const state = {
   token: sessionStorage.getItem('pathweaver-token') || '',
   dashboard: null,
+  panelStatus: null,
   networkId: localStorage.getItem('pathweaver-network') || '',
   topology: null,
   configurations: [],
@@ -10,6 +11,8 @@ const state = {
   pathDetail: null,
   selectedPathIds: [],
   pathWeights: {},
+  pathMode: 'failover',
+  defaultPathId: null,
   graph: {
     networkId: null,
     signature: '',
@@ -19,6 +22,9 @@ const state = {
     drag: null,
   },
   joinResult: null,
+  joinMode: 'active',
+  joinParentId: null,
+  cidrPreview: null,
   runtimeRefreshInFlight: false,
 };
 
@@ -73,7 +79,10 @@ function toast(message, type = 'success') {
 }
 
 async function load() {
-  state.dashboard = await api('/api/v1/dashboard');
+  [state.dashboard, state.panelStatus] = await Promise.all([
+    api('/api/v1/dashboard'),
+    api('/api/v1/panel-status'),
+  ]);
   const networks = state.dashboard.networks;
   if (!networks.some((network) => network.id === state.networkId)) state.networkId = networks[0]?.id || '';
   localStorage.setItem('pathweaver-network', state.networkId);
@@ -138,9 +147,9 @@ function renderOverview() {
         ${nodeTable(nodes.slice(0, 6), false)}
       </article>
       <article class="card">
-        <div class="card-head"><div><h2>控制面</h2><p>中心服务与发布队列</p></div><span class="status online">正常</span></div>
+        <div class="card-head"><div><h2>面板同步</h2><p>任意节点面板读写同一份版本化配置</p></div><span class="status online">已同步</span></div>
         <div class="card-body section-stack">
-          <div class="notice"><strong>双平面隔离</strong><span>数据拓扑变更通过首次接入控制树传递，不会因为业务 IP 切换失去管理连接。</span></div>
+          <div class="notice"><strong>全节点可管理</strong><span>${escapeHtml(state.panelStatus?.message || '面板配置沿现有无环控制路径实时同步；业务通路变化不会改变管理入口。')}</span></div>
           <div class="metric" style="min-height:108px"><label>待推进配置</label><strong>${totals.preparing}</strong><small>${totals.pendingCommands} 条节点命令等待完成</small></div>
         </div>
       </article>
@@ -152,7 +161,7 @@ function nodeTable(nodes, editable = true) {
   return `<div class="node-list">
     <div class="node-row header"><span>节点</span><span>业务 IP</span><span>控制 IP</span><span>状态</span><span></span></div>
     ${nodes.map((node) => `<div class="node-row">
-      <span class="node-identity"><span class="node-glyph">${node.isCenter ? '◆' : '◇'}</span><span><strong>${escapeHtml(node.name)}</strong><small>${escapeHtml(node.id.slice(0, 12))}</small></span></span>
+      <span class="node-identity"><span class="node-glyph">◇</span><span><strong>${escapeHtml(node.name)}</strong><small>${escapeHtml(node.id.slice(0, 12))}</small></span></span>
       <span class="mono">${escapeHtml(node.dataIp)}</span>
       <span class="mono">${escapeHtml(node.controlIp)}</span>
       <span class="status ${escapeHtml(node.status)}">${node.status === 'online' ? '在线' : escapeHtml(node.status)}</span>
@@ -163,8 +172,22 @@ function nodeTable(nodes, editable = true) {
 
 function renderNodes() {
   const network = currentNetwork();
+  const preview = state.cidrPreview;
+  const changedAssignments = preview?.assignments?.filter((assignment) => assignment.changed) || [];
   return `<div class="section-stack">
     <div class="notice"><strong>地址变更策略</strong><span>业务 IP 必须位于 ${escapeHtml(network?.dataCidr)}。保存前会检查冲突和全网路由；控制 IP 不随业务地址变化。</span></div>
+    <article class="card"><div class="card-head"><div><h2>业务网段</h2><p>选择私有地址范围或手动输入；先检测，再生成全网配置版本</p></div></div>
+      <form class="card-body form-stack" id="cidr-form">
+        <div class="form-grid">
+          <label>常用私有网段<select name="preset"><option value="">自定义</option><option value="10.77.0.0/16">10.77.0.0/16</option><option value="10.0.0.0/16">10.0.0.0/16</option><option value="172.20.0.0/16">172.20.0.0/16</option><option value="192.168.240.0/20">192.168.240.0/20</option></select></label>
+          <label>候选业务网段<input name="dataCidr" required value="${escapeHtml(preview?.after || network?.dataCidr || '')}" placeholder="例如 10.77.0.0/16"></label>
+        </div>
+        <button class="button primary" type="submit">检测地址占用</button>
+      </form>
+      ${preview ? `<div class="card-body section-stack"><div class="notice"><strong>静态检测通过</strong><span>${escapeHtml(preview.after)} 可容纳 ${preview.checks.capacity} 个地址；发布准备阶段还会由各 Agent 检查本机接口和路由。</span></div>
+        <div class="command-box"><code>${changedAssignments.length ? changedAssignments.map((assignment) => `${escapeHtml(assignment.name)}：${escapeHtml(assignment.before)} → ${escapeHtml(assignment.after)}`).join('<br>') : '现有节点地址均可保留'}</code></div>
+        <button class="button primary" id="apply-cidr" type="button">确认修改并发布</button></div>` : ''}
+    </article>
     <article class="card"><div class="card-head"><div><h2>全部节点</h2><p>${state.topology.nodes.length} 台设备 · 点击编辑手动指定业务内网 IP</p></div></div>${nodeTable(state.topology.nodes)}</article>
   </div>`;
 }
@@ -313,6 +336,7 @@ function linkStatusText(link) {
   if (link.validationStatus === 'preparing') return `等待 Agent ${link.validationProgress?.prepared || 0}/2`;
   if (link.validationStatus === 'probing') return `双向探测 ${link.validationProgress?.probed || 0}/2`;
   if (link.validationStatus === 'failed') return link.validationError?.includes('超时') ? '验证超时' : '验证失败';
+  if (link.validationProgress?.successful === 1 && link.validationProgress?.failed === 1) return '单向可用';
   return '';
 }
 
@@ -352,7 +376,7 @@ function renderTopology() {
   const probing = state.topology.links.filter((link) => link.validationStatus === 'probing').length;
   const validationText = [
     waiting ? `${waiting} 条等待 Agent` : '',
-    probing ? `${probing} 条正在双向探测` : '',
+    probing ? `${probing} 条正在双向探测（任一方向成功即可）` : '',
   ].filter(Boolean).join(' · ') || '可建立直连或查看端到端路径';
   const selectionText = selected.length === 0
     ? '点击画布中的两个节点'
@@ -366,7 +390,7 @@ function renderTopology() {
       <div class="graph-actions"><button class="button ghost" id="clear-node-selection" ${selected.length ? '' : 'disabled'}>取消选择</button><button class="button ghost" id="connect-selected" ${selected.length === 2 ? '' : 'disabled'}>建立连接</button><button class="button primary" id="detail-selected" ${selected.length === 2 ? '' : 'disabled'}>详细配置</button></div>
     </div>
     ${renderTopologyGraph()}
-    <div class="graph-legend"><span>已验证通路</span><span class="waiting">等待 Agent</span><span class="probing">正在双向探测</span><span class="failed">验证失败或超时</span><span style="margin-left:auto">点击节点进行选择</span></div>
+    <div class="graph-legend"><span>已验证通路</span><span class="waiting">等待 Agent</span><span class="probing">双向探测 · 单向成功可用</span><span class="failed">两个方向均失败</span><span style="margin-left:auto">点击节点进行选择</span></div>
   </article>`;
 }
 
@@ -382,7 +406,11 @@ async function loadPathDetail(sourceId, targetId, resetSelection = false) {
     `/api/v1/networks/${state.networkId}/path-options?sourceId=${encodeURIComponent(sourceId)}&targetId=${encodeURIComponent(targetId)}`,
   );
   if (resetSelection || pairChanged) {
-    state.selectedPathIds = (state.pathDetail.policy?.paths ?? []).map((path) => path.pathId);
+    state.pathMode = state.pathDetail.policy?.mode || 'failover';
+    state.defaultPathId = state.pathDetail.policy?.defaultPathId || state.pathDetail.effectiveDefaultPathId || null;
+    state.selectedPathIds = state.pathMode === 'weighted'
+      ? (state.pathDetail.policy?.paths ?? []).map((path) => path.pathId)
+      : (state.defaultPathId ? [state.defaultPathId] : []);
     state.pathWeights = Object.fromEntries(
       (state.pathDetail.policy?.paths ?? []).map((path) => [path.pathId, Number(path.weight)]),
     );
@@ -398,32 +426,45 @@ function openPathDetail() {
 function renderPathDetail() {
   const details = state.pathDetail;
   if (!details) return '<div class="loading-card"><span class="spinner"></span>正在计算无环路径…</div>';
+  const failoverMode = state.pathMode !== 'weighted';
   const selectedIds = new Set(state.selectedPathIds);
   const selectedPaths = details.paths.filter((path) => selectedIds.has(path.id));
-  const totalWeight = selectedPaths.reduce((total, path) => total + Number(state.pathWeights[path.id] || 1), 0);
+  const activeSelectedPaths = selectedPaths.filter((path) => path.available !== false);
+  const totalWeight = activeSelectedPaths.reduce((total, path) => total + Number(state.pathWeights[path.id] || 1), 0);
   const lanes = details.paths.length ? details.paths.map((path, index) => {
-    const selected = selectedIds.has(path.id);
+    const selected = failoverMode ? state.defaultPathId === path.id : selectedIds.has(path.id);
+    const unavailable = path.available === false;
+    const weight = Number(state.pathWeights[path.id] || 1);
+    const share = !failoverMode && selected && !unavailable && totalWeight
+      ? Math.round((weight / totalWeight) * 1000) / 10
+      : 0;
     const chain = path.nodes.map((node, nodeIndex) => `${nodeIndex ? '<span class="path-segment" aria-hidden="true"></span>' : ''}<span class="path-chain-node ${node.status === 'online' ? '' : 'offline'}"><strong>${escapeHtml(node.name)}</strong><small>${escapeHtml(node.dataIp)}</small></span>`).join('');
-    return `<label class="path-lane ${selected ? 'selected' : ''}">
-      <input class="path-option" type="checkbox" value="${path.id}" ${selected ? 'checked' : ''}>
+    const status = unavailable
+      ? '<strong>故障暂时剔除</strong><small>每 20 秒复检 · 保留原权重</small>'
+      : !failoverMode && selected
+        ? `<strong>运行中 · ${share}%</strong><small>链路恢复后会自动加入</small>`
+        : `<strong>${selected && failoverMode ? '默认线路' : `${path.hops} 跳`}</strong><small>${failoverMode && !selected ? `故障候选 · 成本 ${path.totalCost}` : `成本 ${path.totalCost}`}</small>`;
+    return `<label class="path-lane ${selected ? 'selected' : ''} ${unavailable ? 'unavailable' : ''}">
+      <input class="path-option" type="${failoverMode ? 'radio' : 'checkbox'}" ${failoverMode ? 'name="defaultPath"' : ''} value="${path.id}" ${selected ? 'checked' : ''}>
       <span class="path-lane-index">P${String(index + 1).padStart(2, '0')}</span>
       <span class="path-chain">${chain}</span>
-      <span class="path-lane-meta"><strong>${path.hops} 跳</strong><small>成本 ${path.totalCost}</small></span>
+      <span class="path-lane-meta">${status}</span>
     </label>`;
   }).join('') : '<div class="empty"><strong>没有可用路径</strong>当前两个节点之间不存在由已验证连接组成的无环路径。</div>';
   const weights = selectedPaths.map((path, index) => {
     const weight = Number(state.pathWeights[path.id] || 1);
-    const share = totalWeight ? Math.round((weight / totalWeight) * 1000) / 10 : 0;
-    return `<label class="path-weight-row"><span>P${String(details.paths.indexOf(path) + 1).padStart(2, '0')}</span><input class="path-weight" data-path-id="${path.id}" type="number" min="1" max="1000" value="${weight}"><strong data-weight-share="${path.id}">${share}%</strong></label>`;
+    const share = path.available !== false && totalWeight ? Math.round((weight / totalWeight) * 1000) / 10 : 0;
+    return `<label class="path-weight-row ${path.available === false ? 'unavailable' : ''}"><span>P${String(details.paths.indexOf(path) + 1).padStart(2, '0')}</span><input class="path-weight" data-path-id="${path.id}" type="number" min="1" max="1000" value="${weight}"><strong data-weight-share="${path.id}">${path.available === false ? '暂时剔除' : `${share}%`}</strong></label>`;
   }).join('');
   return `<article class="card path-detail-card">
-    <div class="card-head"><div><p class="eyebrow">END-TO-END PATHS</p><h2>${escapeHtml(details.source.name)} ↔ ${escapeHtml(details.target.name)}</h2><p>${details.paths.length} 条无环路径${details.truncated ? ' · 仅显示优先级最高的一部分' : ''}；同一节点可在不同路径中重复出现</p></div><a class="button ghost" href="#topology">返回主拓扑</a></div>
+    <div class="card-head"><div><p class="eyebrow">END-TO-END PATHS</p><h2>${escapeHtml(details.source.name)} ↔ ${escapeHtml(details.target.name)}</h2><p>${details.paths.length} 条无环路径${details.truncated ? ' · 已按安全上限截断' : ''}；每条路径内部不会重复节点</p></div><a class="button ghost" href="#topology">返回主拓扑</a></div>
     <div class="path-endpoints"><span><strong>${escapeHtml(details.source.name)}</strong><small>${escapeHtml(details.source.dataIp)}</small></span><span>${details.paths.length} 条路径</span><span><strong>${escapeHtml(details.target.name)}</strong><small>${escapeHtml(details.target.dataIp)}</small></span></div>
+    <div class="path-mode-bar segmented"><label><input class="path-mode" type="radio" name="pathMode" value="failover" ${failoverMode ? 'checked' : ''}><span>默认线路与故障切换</span></label><label><input class="path-mode" type="radio" name="pathMode" value="weighted" ${failoverMode ? '' : 'checked'}><span>负载均衡</span></label></div>
     <div class="path-lanes">${lanes}</div>
     <div class="path-policy-editor">
-      <div><strong>负载均衡</strong><small>选择至少两条路径；权重越大，分配到该路径的连接越多。</small></div>
-      <div class="path-weight-list">${weights || '<span class="muted">尚未选择路径</span>'}</div>
-      <div class="path-policy-actions"><button class="button ghost" id="equalize-paths" ${selectedPaths.length ? '' : 'disabled'}>设为等权</button>${details.policy ? '<button class="button danger" id="disable-path-policy">关闭负载均衡</button>' : ''}<button class="button primary" id="save-path-policy" ${selectedPaths.length >= 2 ? '' : 'disabled'}>保存负载均衡</button></div>
+      <div><strong>${failoverMode ? '主备线路' : '负载均衡'}</strong><small>${failoverMode ? '流量优先走所选默认线路；不可达时按成本依次尝试其他无环路径。' : '故障路径保留原权重但暂时不参与分流；每 20 秒复检，恢复后自动按原权重加入。'}</small></div>
+      <div class="path-weight-list">${failoverMode ? `<span class="muted">已选择 ${state.defaultPathId ? `P${String(details.paths.findIndex((path) => path.id === state.defaultPathId) + 1).padStart(2, '0')}` : '—'} 为默认线路</span>` : (weights || '<span class="muted">尚未选择路径</span>')}</div>
+      <div class="path-policy-actions">${failoverMode ? '' : `<button class="button ghost" id="equalize-paths" ${selectedPaths.length ? '' : 'disabled'}>设为等权</button>`}${details.policy ? '<button class="button danger" id="disable-path-policy">恢复系统自动选择</button>' : ''}<button class="button primary" id="save-path-policy" ${(failoverMode ? state.defaultPathId : selectedPaths.length >= 2) ? '' : 'disabled'}>${failoverMode ? '保存默认线路' : '保存负载均衡'}</button></div>
     </div>
   </article>`;
 }
@@ -562,21 +603,29 @@ function bindGraphInteractions() {
 }
 
 async function savePathPolicy() {
-  if (!state.pathDetail || state.selectedPathIds.length < 2) return;
+  if (!state.pathDetail) return;
+  if (state.pathMode === 'weighted' && state.selectedPathIds.length < 2) return;
+  if (state.pathMode !== 'weighted' && !state.defaultPathId) return;
   try {
     const result = await api(`/api/v1/networks/${state.networkId}/path-policies`, {
       method: 'PUT',
       body: JSON.stringify({
         sourceId: state.pathDetail.source.id,
         targetId: state.pathDetail.target.id,
+        mode: state.pathMode,
+        defaultPathId: state.defaultPathId,
         paths: state.selectedPathIds.map((pathId) => ({ pathId, weight: Number(state.pathWeights[pathId] || 1) })),
       }),
     });
     state.pathDetail = result.details;
-    state.selectedPathIds = result.details.policy.paths.map((path) => path.pathId);
+    state.pathMode = result.details.policy.mode;
+    state.defaultPathId = result.details.policy.defaultPathId || result.details.effectiveDefaultPathId;
+    state.selectedPathIds = state.pathMode === 'weighted'
+      ? result.details.policy.paths.map((path) => path.pathId)
+      : [state.defaultPathId];
     state.pathWeights = Object.fromEntries(result.details.policy.paths.map((path) => [path.pathId, path.weight]));
     render();
-    toast('负载均衡策略已保存并生成新的配置版本');
+    toast(state.pathMode === 'weighted' ? '负载均衡策略已保存并生成新的配置版本' : '默认线路与故障切换顺序已保存');
   } catch (error) { toast(error.message, 'error'); }
 }
 
@@ -588,38 +637,66 @@ async function disablePathPolicy() {
       { method: 'DELETE' },
     );
     state.pathDetail = result.details;
-    state.selectedPathIds = [];
+    state.pathMode = 'failover';
+    state.defaultPathId = result.details.effectiveDefaultPathId || null;
+    state.selectedPathIds = state.defaultPathId ? [state.defaultPathId] : [];
     state.pathWeights = {};
     render();
-    toast('负载均衡策略已关闭');
+    toast('已恢复系统按路径成本自动选择');
   } catch (error) { toast(error.message, 'error'); }
 }
 
 function renderJoin() {
   const nodes = state.topology.nodes.filter((node) => node.canRelay);
   const result = state.joinResult;
+  const mode = state.joinMode || result?.mode || 'active';
+  const selectedParent = nodes.find((node) => node.id === (state.joinParentId || result?.parent?.id)) || nodes[0];
+  const parentConnection = controlConnection(selectedParent);
   return `<div class="join-layout">
-    <article class="card"><div class="card-head"><div><h2>生成安装命令</h2><p>选择新设备实际能够访问的接入节点</p></div></div>
+    <article class="card"><div class="card-head"><div><h2>生成安装命令</h2><p>${mode === 'passive' ? '选择负责主动连接待认领设备的已入网节点' : '选择新设备实际能够访问的接入节点'}</p></div></div>
       <form class="card-body form-stack" id="join-form">
-        <div class="segmented"><label><input type="radio" name="mode" value="active" ${!result || result.mode === 'active' ? 'checked' : ''}><span>设备主动加入</span></label><label><input type="radio" name="mode" value="passive" ${result?.mode === 'passive' ? 'checked' : ''}><span>已有节点主动认领</span></label></div>
-        <label>控制父节点<select name="parentId">${nodes.map((node) => `<option value="${node.id}" data-endpoint="${escapeHtml(node.controlEndpoint || '')}">${escapeHtml(node.name)} · ${escapeHtml(node.controlIp)}</option>`).join('')}</select></label>
-        <label>安装包与接入地址<input name="sourceUrl" placeholder="https://中心域名 或 http://边缘IP:8790"></label>
+        <div class="segmented"><label><input type="radio" name="mode" value="active" ${mode === 'active' ? 'checked' : ''}><span>设备主动加入</span></label><label><input type="radio" name="mode" value="passive" ${mode === 'passive' ? 'checked' : ''}><span>已入网节点主动认领</span></label></div>
+        <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '这里只配置接入节点入口'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。' : '所有设备安装同一套节点服务和完整面板；面板端口、登录密码、控制中继端口与 WireGuard 端口均在新设备本机交互设置。'}</span></div>
+        <label>${mode === 'passive' ? '执行认领的已入网节点' : '控制父节点'}<select name="parentId">${nodes.map((node) => {
+          const connection = controlConnection(node);
+          return `<option value="${node.id}" data-host="${escapeHtml(connection.host)}" data-port="${connection.port}" data-protocol="${connection.protocol}" ${node.id === selectedParent?.id ? 'selected' : ''}>${escapeHtml(node.name)} · ${escapeHtml(node.controlIp)}</option>`;
+        }).join('')}</select></label>
+        ${mode === 'active' ? `<div class="form-grid">
+          <label>接入协议<select name="parentProtocol"><option value="http" ${parentConnection.protocol === 'http' ? 'selected' : ''}>HTTP</option><option value="https" ${parentConnection.protocol === 'https' ? 'selected' : ''}>HTTPS</option></select></label>
+          <label>父节点控制端口<input name="parentPort" type="number" min="1" max="65535" required value="${parentConnection.port || ''}"></label>
+          <label class="span-2">新设备能访问的父节点 IP 或域名<input name="parentHost" required value="${escapeHtml(parentConnection.host)}" placeholder="选择父节点后自动填充，也可覆盖"></label>
+        </div>` : '<div class="notice"><strong>固定 GitHub 安装源</strong><span><a href="https://github.com/FengYuchen1314/sd-wan" target="_blank" rel="noreferrer">FengYuchen1314/sd-wan</a> · main。仓库上传完成后，目标设备从 raw.githubusercontent.com 下载统一脚本和基础 Agent。</span></div>'}
         <label>令牌有效时间（分钟）<input name="ttlMinutes" type="number" min="5" max="1440" value="30"></label>
-        <button class="button primary" type="submit">生成一次性命令</button>
+        <button class="button primary" type="submit">${mode === 'passive' ? '生成 GitHub 基础安装命令' : '生成一次性命令'}</button>
       </form>
     </article>
     <article class="card"><div class="card-head"><div><h2>可复制命令</h2><p>令牌仅显示一次，默认使用后立即失效</p></div>${result ? '<button class="button ghost small" id="copy-command">复制命令</button>' : ''}</div>
       <div class="card-body section-stack">
         <div class="command-box">${result ? `<code>${escapeHtml(result.command)}</code><div class="command-meta"><span>入口：${escapeHtml(result.parent.name)}</span><span>有效至 ${formatDate(result.expiresAt)}</span></div>` : '<div class="empty"><strong>等待生成</strong>命令将绑定节点组、父节点和短时效认证令牌。</div>'}</div>
-        <div class="notice"><strong>${result?.mode === 'passive' ? '被动认领' : '传递式安装'}</strong><span>${result?.mode === 'passive' ? '目标 Agent 只监听认领请求；随后在面板命令指定的已入网节点主动连接它。' : '边缘入口可以缓存并转发同一份中心签名制品，新节点注册身份仍由中心验证。'}</span></div>
+        <div class="notice"><strong>${mode === 'passive' ? '单向被动认领' : '传递式安装'}</strong><span>${mode === 'passive' ? '目标节点不需要反向访问接入节点；认领方会持续代理控制通信，目标本机仍提供完整面板。' : '任意已入网节点都能传递同一份安装包；新设备加入后立即拥有本机面板，所有操作实时写入全网版本化配置。'}</span></div>
         ${result?.mode === 'passive' ? `<form id="adopt-form" class="form-stack">
-          <label>待认领 Agent 地址<input name="targetUrl" required placeholder="http://目标服务器IP:8790"></label>
+          <div class="form-grid"><label>待认领节点 IP 或域名<input name="targetHost" required placeholder="安装脚本最后显示的地址"></label><label>待认领节点控制端口<input name="targetPort" type="number" min="1" max="65535" required placeholder="由目标节点安装时选择"></label></div>
           <button class="button primary" type="submit">命令 ${escapeHtml(result.parent.name)} 主动连接</button>
           <p class="muted" style="margin:0">认领指令会沿控制树送到 ${escapeHtml(result.parent.name)}，由它连接目标并成为控制父节点。</p>
         </form>` : ''}
       </div>
     </article>
   </div>`;
+}
+
+function controlConnection(node) {
+  let protocol = 'http';
+  let host = '';
+  let port = Number(node?.controlListenPort || 8790);
+  if (node?.controlEndpoint) {
+    try {
+      const parsed = new URL(node.controlEndpoint);
+      protocol = parsed.protocol.replace(':', '');
+      host = parsed.hostname;
+      port = Number(parsed.port || (protocol === 'https' ? 443 : port));
+    } catch {}
+  }
+  return { protocol, host, port };
 }
 
 function renderRollouts() {
@@ -634,7 +711,21 @@ function bindViewEvents() {
   document.querySelector('#clear-node-selection')?.addEventListener('click', () => { state.selectedNodeIds = []; render(); });
   document.querySelector('#connect-selected')?.addEventListener('click', openConnectionDialog);
   document.querySelector('#detail-selected')?.addEventListener('click', openPathDetail);
+  document.querySelectorAll('.path-mode').forEach((radio) => radio.addEventListener('change', () => {
+    state.pathMode = radio.value;
+    if (state.pathMode === 'failover') {
+      state.defaultPathId ||= state.pathDetail?.effectiveDefaultPathId || state.pathDetail?.paths?.[0]?.id || null;
+      state.selectedPathIds = state.defaultPathId ? [state.defaultPathId] : [];
+    }
+    render();
+  }));
   document.querySelectorAll('.path-option').forEach((checkbox) => checkbox.addEventListener('change', () => {
+    if (state.pathMode === 'failover') {
+      state.defaultPathId = checkbox.value;
+      state.selectedPathIds = [checkbox.value];
+      render();
+      return;
+    }
     if (checkbox.checked) {
       state.selectedPathIds = [...new Set([...state.selectedPathIds, checkbox.value])];
       state.pathWeights[checkbox.value] = Number(state.pathWeights[checkbox.value] || 1);
@@ -659,45 +750,84 @@ function bindViewEvents() {
   document.querySelector('#save-path-policy')?.addEventListener('click', savePathPolicy);
   document.querySelector('#disable-path-policy')?.addEventListener('click', disablePathPolicy);
   document.querySelector('#join-form')?.addEventListener('submit', createJoinToken);
+  document.querySelectorAll('#join-form input[name="mode"]').forEach((radio) => radio.addEventListener('change', () => {
+    state.joinMode = radio.value;
+    state.joinResult = null;
+    render();
+  }));
+  document.querySelector('#cidr-form')?.addEventListener('submit', previewDataCidr);
+  document.querySelector('#cidr-form select[name="preset"]')?.addEventListener('change', (event) => {
+    if (event.target.value) document.querySelector('#cidr-form input[name="dataCidr"]').value = event.target.value;
+  });
+  document.querySelector('#apply-cidr')?.addEventListener('click', applyDataCidr);
   document.querySelector('#adopt-form')?.addEventListener('submit', enqueueAdoption);
   const parentSelect = document.querySelector('#join-form select[name="parentId"]');
   parentSelect?.addEventListener('change', () => {
-    const sourceInput = document.querySelector('#join-form input[name="sourceUrl"]');
-    sourceInput.value = parentSelect.selectedOptions[0]?.dataset.endpoint || '';
-    sourceInput.placeholder = sourceInput.value ? sourceInput.placeholder : '必填：新设备可访问的边缘 IP 或域名';
+    const option = parentSelect.selectedOptions[0];
+    state.joinParentId = parentSelect.value;
+    const form = document.querySelector('#join-form');
+    if (form.elements.parentHost) form.elements.parentHost.value = option?.dataset.host || '';
+    if (form.elements.parentPort) form.elements.parentPort.value = option?.dataset.port || '';
+    if (form.elements.parentProtocol) form.elements.parentProtocol.value = option?.dataset.protocol || 'http';
   });
   document.querySelector('#copy-command')?.addEventListener('click', async () => {
     await navigator.clipboard.writeText(state.joinResult.command); toast('安装命令已复制');
   });
 }
 
-function reachableHost(node) {
-  if (node.dataEndpoint) {
-    if (node.dataEndpoint.startsWith('[')) return node.dataEndpoint.slice(0, node.dataEndpoint.indexOf(']') + 1);
-    return node.dataEndpoint.slice(0, node.dataEndpoint.lastIndexOf(':'));
-  }
-  if (node.controlEndpoint) {
-    try { return new URL(node.controlEndpoint).hostname; } catch {}
-  }
-  return '';
+async function previewDataCidr(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  try {
+    state.cidrPreview = await api(`/api/v1/networks/${state.networkId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ dataCidr: form.get('dataCidr'), dryRun: true }),
+    });
+    render();
+    toast('静态冲突与容量检测通过');
+  } catch (error) { toast(error.message, 'error'); }
+}
+
+async function applyDataCidr() {
+  if (!state.cidrPreview) return;
+  try {
+    await api(`/api/v1/networks/${state.networkId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ dataCidr: state.cidrPreview.after }),
+    });
+    state.cidrPreview = null;
+    await load();
+    toast('业务网段已进入全网准备与本机路由冲突检测阶段');
+  } catch (error) { toast(error.message, 'error'); }
+}
+
+function reachablePort(node) {
+  if (Number.isInteger(Number(node.dataListenPort))) return Number(node.dataListenPort);
+  const endpointMatch = String(node.dataEndpoint || '').match(/:(\d+)$/);
+  if (endpointMatch) return Number(endpointMatch[1]);
+  return Number(currentNetwork()?.listenPort || 19801);
 }
 
 function openConnectionDialog() {
   if (state.selectedNodeIds.length !== 2) return;
   const [nodeA, nodeB] = state.selectedNodeIds.map((id) => state.topology.nodes.find((node) => node.id === id));
   const existing = state.topology.links.some((link) =>
-    (link.upstreamId === nodeA.id && link.downstreamId === nodeB.id) ||
-    (link.upstreamId === nodeB.id && link.downstreamId === nodeA.id));
+    link.validationStatus !== 'failed' && (
+      (link.upstreamId === nodeA.id && link.downstreamId === nodeB.id) ||
+      (link.upstreamId === nodeB.id && link.downstreamId === nodeA.id)
+    ));
   if (existing) return toast('这两个节点之间已经存在连接或正在验证', 'error');
   const form = document.querySelector('#connection-form');
   form.elements.nodeAId.value = nodeA.id;
   form.elements.nodeBId.value = nodeB.id;
-  form.elements.nodeAAddress.value = reachableHost(nodeA);
-  form.elements.nodeBAddress.value = reachableHost(nodeB);
+  form.elements.nodeAAddress.value = '';
+  form.elements.nodeBAddress.value = '';
+  form.elements.nodeAPort.value = reachablePort(nodeA);
+  form.elements.nodeBPort.value = reachablePort(nodeB);
   form.elements.priority.value = 10;
   document.querySelector('#connection-pair').innerHTML = `<strong>${escapeHtml(nodeA.name)}</strong><span>↔</span><strong>${escapeHtml(nodeB.name)}</strong>`;
-  document.querySelector('#node-a-address-label').textContent = `${nodeA.name} 可被 ${nodeB.name} 访问的 IP 或域名`;
-  document.querySelector('#node-b-address-label').textContent = `${nodeB.name} 可被 ${nodeA.name} 访问的 IP 或域名`;
+  document.querySelector('#node-a-address-label').textContent = `手动填写 ${nodeA.name} 可被 ${nodeB.name} 访问的 IP 或域名`;
+  document.querySelector('#node-b-address-label').textContent = `手动填写 ${nodeB.name} 可被 ${nodeA.name} 访问的 IP 或域名`;
   form.querySelector('[data-form-error]').textContent = '';
   document.querySelector('#connection-dialog').showModal();
 }
@@ -709,10 +839,39 @@ function openNode(id) {
   form.elements.name.value = node.name;
   form.elements.dataIp.value = node.dataIp;
   form.elements.controlEndpoint.value = node.controlEndpoint || '';
+  form.elements.controlListenPort.value = node.controlListenPort || 8790;
   form.elements.dataEndpoint.value = node.dataEndpoint || '';
+  form.elements.dataListenPort.value = reachablePort(node);
   form.elements.canRelay.checked = node.canRelay;
+  const deleteButton = document.querySelector('#delete-node');
+  deleteButton.disabled = node.isCenter;
+  deleteButton.textContent = node.isCenter ? '协调节点需先迁移' : '删除节点';
   form.querySelector('[data-form-error]').textContent = '';
   document.querySelector('#node-dialog').showModal();
+}
+
+async function deleteSelectedNode() {
+  const form = document.querySelector('#node-form');
+  const nodeId = form.elements.nodeId.value;
+  const error = form.querySelector('[data-form-error]');
+  error.textContent = '';
+  try {
+    const impact = await api(`/api/v1/nodes/${encodeURIComponent(nodeId)}/deletion-impact`);
+    if (!impact.canDelete) {
+      window.alert(impact.reason);
+      error.textContent = impact.reason;
+      return;
+    }
+    if (!window.confirm(`${impact.warning}\n\n确认继续删除吗？`)) return;
+    await api(`/api/v1/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' });
+    document.querySelector('#node-dialog').close();
+    state.selectedNodeIds = state.selectedNodeIds.filter((id) => id !== nodeId);
+    await load();
+    toast('节点已删除，替代拓扑配置正在下发');
+  } catch (reason) {
+    error.textContent = reason.message;
+    window.alert(reason.message);
+  }
 }
 
 async function saveTopology() {
@@ -729,13 +888,16 @@ async function createJoinToken(event) {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
   try {
-    const parent = state.topology.nodes.find((node) => node.id === form.get('parentId'));
-    const sourceUrl = String(form.get('sourceUrl') || parent?.controlEndpoint || '').trim();
-    if (!sourceUrl) throw new Error('请选择或填写新设备能够访问的父节点中继地址');
+    state.joinMode = form.get('mode');
+    state.joinParentId = form.get('parentId');
     state.joinResult = await api(`/api/v1/networks/${state.networkId}/join-tokens`, {
       method: 'POST',
       body: JSON.stringify({
-        mode: form.get('mode'), parentId: form.get('parentId'), sourceUrl, ttlMinutes: Number(form.get('ttlMinutes')),
+        mode: form.get('mode'), parentId: form.get('parentId'),
+        parentProtocol: form.get('parentProtocol') || undefined,
+        parentHost: form.get('parentHost') || undefined,
+        parentPort: form.get('parentPort') ? Number(form.get('parentPort')) : undefined,
+        ttlMinutes: Number(form.get('ttlMinutes')),
       }),
     });
     render(); toast('一次性接入命令已生成');
@@ -746,7 +908,9 @@ async function enqueueAdoption(event) {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
   try {
-    const targetUrl = String(form.get('targetUrl') || '').trim();
+    const targetHost = String(form.get('targetHost') || '').trim();
+    const targetPort = Number(form.get('targetPort'));
+    const targetUrl = `http://${targetHost.includes(':') && !targetHost.startsWith('[') ? `[${targetHost}]` : targetHost}:${targetPort}`;
     const parsed = new URL(targetUrl);
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('目标地址只支持 HTTP 或 HTTPS');
     await api(`/api/v1/nodes/${state.joinResult.parent.id}/commands`, {
@@ -756,7 +920,6 @@ async function enqueueAdoption(event) {
         payload: {
           targetUrl: parsed.href.replace(/\/$/, ''),
           claimToken: state.joinResult.token,
-          upstream: state.joinResult.sourceUrl,
         },
       }),
     });
@@ -794,13 +957,25 @@ document.querySelector('#lock-console').addEventListener('click', () => {
 networkSelect.addEventListener('change', () => {
   state.networkId = networkSelect.value;
   state.joinResult = null;
+  state.joinMode = 'active';
+  state.joinParentId = null;
+  state.cidrPreview = null;
   state.pathDetail = null;
+  state.pathMode = 'failover';
+  state.defaultPathId = null;
   state.selectedNodeIds = [];
   state.graph.networkId = null;
   if (state.view === 'path-detail') location.hash = 'topology';
   load().catch((error) => toast(error.message, 'error'));
 });
 document.querySelector('#new-network').addEventListener('click', () => document.querySelector('#network-dialog').showModal());
+document.querySelectorAll('dialog button[value="cancel"]').forEach((button) => button.addEventListener('click', (event) => {
+  event.preventDefault();
+  button.closest('dialog')?.close();
+}));
+document.querySelector('#network-data-preset').addEventListener('change', (event) => {
+  if (event.target.value) document.querySelector('#network-form input[name="dataCidr"]').value = event.target.value;
+});
 
 document.querySelector('#login-form').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -830,12 +1005,15 @@ document.querySelector('#node-form').addEventListener('submit', async (event) =>
       method: 'PATCH',
       body: JSON.stringify({
         name: form.get('name'), dataIp: form.get('dataIp'), controlEndpoint: form.get('controlEndpoint'),
-        dataEndpoint: form.get('dataEndpoint'), canRelay: form.get('canRelay') === 'on',
+        controlListenPort: Number(form.get('controlListenPort')),
+        dataEndpoint: form.get('dataEndpoint'), dataListenPort: Number(form.get('dataListenPort')),
+        canRelay: form.get('canRelay') === 'on',
       }),
     });
     document.querySelector('#node-dialog').close(); await load(); toast('节点地址已校验并生成新配置版本');
   } catch (reason) { error.textContent = reason.message; }
 });
+document.querySelector('#delete-node').addEventListener('click', deleteSelectedNode);
 
 document.querySelector('#connection-form').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -851,13 +1029,15 @@ document.querySelector('#connection-form').addEventListener('submit', async (eve
         nodeBId: form.get('nodeBId'),
         nodeAAddress: form.get('nodeAAddress'),
         nodeBAddress: form.get('nodeBAddress'),
+        nodeAPort: Number(form.get('nodeAPort')),
+        nodeBPort: Number(form.get('nodeBPort')),
         priority: Number(form.get('priority')),
       }),
     });
     document.querySelector('#connection-dialog').close();
     state.selectedNodeIds = [];
     await load();
-    toast('逻辑校验通过，正在等待两个 Agent 完成双向探测');
+    toast('端口已按节点数据库记录提交；正在执行双向探测，任一方向成功即可建链');
   } catch (reason) { error.textContent = reason.message; }
 });
 
@@ -866,10 +1046,19 @@ setInterval(() => {
 }, 1000);
 
 setInterval(async () => {
-  if (!state.token || state.view !== 'topology' || state.runtimeRefreshInFlight) return;
-  if (state.selectedNodeIds.length || state.graph.drag || document.querySelector('dialog[open]')) return;
+  if (!state.token || !['topology', 'path-detail'].includes(state.view) || state.runtimeRefreshInFlight) return;
+  if ((state.view === 'topology' && (state.selectedNodeIds.length || state.graph.drag)) || document.querySelector('dialog[open]')) return;
+  if (state.view === 'path-detail' && document.activeElement?.matches('.path-weight')) return;
   state.runtimeRefreshInFlight = true;
-  try { await load(); } catch {}
+  try {
+    if (state.view === 'path-detail') {
+      const route = pathDetailRoute();
+      if (route.sourceId && route.targetId) {
+        await loadPathDetail(route.sourceId, route.targetId);
+        render();
+      }
+    } else await load();
+  } catch {}
   finally { state.runtimeRefreshInFlight = false; }
 }, 5000);
 

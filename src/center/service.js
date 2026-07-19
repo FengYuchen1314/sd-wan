@@ -1,5 +1,5 @@
 import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
-import { parseCIDR, parseIPv4, usableHost } from '../core/ipv4.js';
+import { containsIPv4, parseCIDR, parseIPv4, usableHost } from '../core/ipv4.js';
 import { enumerateSimplePaths } from '../core/paths.js';
 import { validateAndCompileTopology } from '../core/topology.js';
 
@@ -7,6 +7,21 @@ const now = () => new Date().toISOString();
 const hashSecret = (value) => createHash('sha256').update(String(value)).digest('hex');
 const json = (value) => JSON.stringify(value ?? {});
 const DEFAULT_DATA_PORT = 19801;
+const PASSIVE_GITHUB_SOURCE = 'https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main';
+const PRIVATE_RANGES = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'].map(parseCIDR);
+
+function rangesOverlap(rangeA, rangeB) {
+  return !(rangeA.broadcast < rangeB.network || rangeB.broadcast < rangeA.network);
+}
+
+function assertPrivateCidr(value) {
+  const candidate = parseCIDR(value);
+  if (!PRIVATE_RANGES.some((range) => candidate.network >= range.network && candidate.broadcast <= range.broadcast)) {
+    throw new Error('业务网段必须完整位于 10.0.0.0/8、172.16.0.0/12 或 192.168.0.0/16 私有地址范围内');
+  }
+  if (candidate.prefix > 30) throw new Error('业务网段至少需要两个可用主机地址');
+  return candidate;
+}
 
 function normalizePort(value, label = 'WireGuard 端口', fallback = undefined) {
   if (value === undefined || value === null || value === '') {
@@ -21,6 +36,20 @@ function normalizePort(value, label = 'WireGuard 端口', fallback = undefined) 
 function endpointPort(endpoint) {
   const match = String(endpoint ?? '').trim().match(/:(\d+)$/);
   return match ? normalizePort(match[1]) : null;
+}
+
+function endpointDetails(endpoint) {
+  if (!endpoint) return null;
+  try {
+    const parsed = new URL(endpoint);
+    return {
+      protocol: parsed.protocol.replace(':', ''),
+      host: parsed.hostname.includes(':') ? `[${parsed.hostname}]` : parsed.hostname,
+      port: Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80)),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function normalizeReachableHost(value, label) {
@@ -43,6 +72,31 @@ function normalizeReachableHost(value, label) {
 function endpointHost(endpoint) {
   if (endpoint.startsWith('[')) return endpoint.slice(0, endpoint.indexOf(']') + 1);
   return endpoint.slice(0, endpoint.lastIndexOf(':'));
+}
+
+function hostFromEndpoint(endpoint) {
+  if (!endpoint) return null;
+  const value = String(endpoint).trim();
+  const url = endpointDetails(value);
+  if (url?.host) return url.host;
+  const port = endpointPort(value);
+  return port ? endpointHost(value) : value;
+}
+
+function controlHopUrl(node, link, nodeId) {
+  const linkEndpoint = link.upstreamId === nodeId ? link.upstreamEndpoint : link.downstreamEndpoint;
+  const linkedHost = hostFromEndpoint(linkEndpoint) || hostFromEndpoint(node.dataEndpoint);
+  if (linkedHost) return `http://${linkedHost}:${node.controlListenPort || 8790}`;
+  const details = endpointDetails(node.controlEndpoint);
+  const host = details?.host;
+  if (!host) return null;
+  return `${details.protocol}://${host}:${details.port || node.controlListenPort || 8790}`;
+}
+
+function probeUrl(node, reachableEndpoint) {
+  const host = hostFromEndpoint(reachableEndpoint);
+  if (!host) throw new Error(`节点 ${node.name} 缺少可探测地址`);
+  return `http://${host}:${node.controlListenPort || 8790}`;
 }
 
 function wireGuardKeyPair() {
@@ -81,6 +135,7 @@ function nodeFromRow(row) {
     controlIp: row.control_ip,
     dataIp: row.data_ip,
     controlEndpoint: row.control_endpoint,
+    controlListenPort: Number(row.control_listen_port || endpointDetails(row.control_endpoint)?.port || (row.is_center ? 19773 : 8790)),
     dataEndpoint: row.data_endpoint,
     dataListenPort: Number(row.data_listen_port || DEFAULT_DATA_PORT),
     wgControlPublicKey: row.wg_control_public_key,
@@ -98,10 +153,104 @@ function canonicalNodePair(nodeAId, nodeBId) {
     : [nodeBId, nodeAId];
 }
 
+function linkForPair(links, nodeAId, nodeBId) {
+  return links.find((link) =>
+    (link.upstreamId === nodeAId && link.downstreamId === nodeBId) ||
+    (link.upstreamId === nodeBId && link.downstreamId === nodeAId));
+}
+
+function compileControlPlans(nodes, links) {
+  const center = nodes.find((node) => node.isCenter);
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const plans = {};
+  if (!center) return plans;
+
+  for (const source of nodes) {
+    const forwarders = {};
+    for (const link of links) {
+      let peerId = null;
+      if (link.upstreamId === source.id) peerId = link.downstreamId;
+      else if (link.downstreamId === source.id) peerId = link.upstreamId;
+      if (!peerId) continue;
+      const peer = nodeById.get(peerId);
+      const url = peer ? controlHopUrl(peer, link, peerId) : null;
+      if (url) forwarders[peerId] = url;
+    }
+
+    if (source.id === center.id) {
+      plans[source.id] = { maxHops: 16, forwarders, routes: [], truncated: false };
+      continue;
+    }
+    const enumerated = enumerateSimplePaths({
+      nodes,
+      links,
+      sourceId: source.id,
+      targetId: center.id,
+      maxPaths: 64,
+      searchLimit: 4096,
+    });
+    const routes = enumerated.paths
+      .filter((path) => path.linkIds.length <= 16)
+      .map((path) => {
+        const hops = path.nodeIds.slice(1).map((nodeId, index) => {
+          const previousNodeId = path.nodeIds[index];
+          const link = linkForPair(links, previousNodeId, nodeId);
+          const node = nodeById.get(nodeId);
+          const url = link && node ? controlHopUrl(node, link, nodeId) : null;
+          return url ? { nodeId, url } : null;
+        });
+        if (hops.some((hop) => !hop)) return null;
+        return { id: path.id, nodeIds: path.nodeIds, hops };
+      })
+      .filter(Boolean);
+    plans[source.id] = { maxHops: 16, forwarders, routes, truncated: enumerated.truncated };
+  }
+  return plans;
+}
+
+function applyPreferredPath(compiled, state, pathNodeIds) {
+  const nodeById = new Map(state.nodes.map((node) => [node.id, node]));
+  const destinationId = pathNodeIds.at(-1);
+  const destination = nodeById.get(destinationId);
+  if (!destination) return;
+  const destinationCidr = `${destination.dataIp}/32`;
+  for (let index = 0; index < pathNodeIds.length - 1; index += 1) {
+    const sourceId = pathNodeIds[index];
+    const nextHopId = pathNodeIds[index + 1];
+    const config = compiled.configs[sourceId];
+    const nextHop = nodeById.get(nextHopId);
+    const link = linkForPair(state.links, sourceId, nextHopId);
+    if (!config || !nextHop || !link) continue;
+    for (const peer of config.data.peers) {
+      peer.allowedIps = peer.allowedIps.filter((cidr) => cidr !== destinationCidr);
+    }
+    let peer = config.data.peers.find((item) => item.nodeId === nextHopId);
+    if (!peer) {
+      const endpoint = link.upstreamId === sourceId ? link.downstreamEndpoint : link.upstreamEndpoint;
+      peer = {
+        nodeId: nextHopId,
+        name: nextHop.name,
+        publicKey: nextHop.wgDataPublicKey ?? '',
+        endpoint: endpoint || nextHop.dataEndpoint || null,
+        allowedIps: [],
+        persistentKeepalive: 25,
+      };
+      config.data.peers.push(peer);
+    }
+    if (!peer.allowedIps.includes(destinationCidr)) peer.allowedIps.push(destinationCidr);
+    peer.allowedIps.sort();
+    config.data.peers.sort((left, right) => String(left.nodeId).localeCompare(String(right.nodeId)));
+    const route = config.routes.find((item) => item.targetNodeId === destinationId);
+    if (route) route.viaNodeId = nextHopId;
+  }
+}
+
 export class ControlService {
   constructor(database, options = {}) {
     this.db = database;
-    this.publicUrl = String(options.publicUrl ?? 'http://127.0.0.1:8787').replace(/\/$/, '');
+    this.publicUrl = String(options.publicUrl ?? 'http://127.0.0.1:19773').replace(/\/$/, '');
+    this.defaultDataPort = normalizePort(options.defaultDataPort, '默认 WireGuard 端口', DEFAULT_DATA_PORT);
+    this.manageLocalCenters = Boolean(options.manageLocalCenters);
     const offlineAfterMs = Number(options.nodeOfflineAfterMs ?? 20_000);
     this.nodeOfflineAfterMs = Number.isFinite(offlineAfterMs) && offlineAfterMs > 0 ? offlineAfterMs : 20_000;
   }
@@ -117,7 +266,7 @@ export class ControlService {
       offlineBefore,
     );
     const expiredLinks = this.db.all(
-      `SELECT id, validation_status FROM topology_links
+      `SELECT id, network_id, validation_status, validation_probed_upstream, validation_probed_downstream FROM topology_links
        WHERE validation_status IN ('preparing', 'probing')
          AND validation_expires_at IS NOT NULL AND validation_expires_at <= ?`,
       timestamp,
@@ -134,6 +283,18 @@ export class ControlService {
       }
 
       for (const link of expiredLinks) {
+        const probeSucceeded = link.validation_status === 'probing' &&
+          (Number(link.validation_probed_upstream) > 0 || Number(link.validation_probed_downstream) > 0);
+        if (probeSucceeded) {
+          this.db.run(
+            `UPDATE topology_links SET validation_status = 'active', validation_error = NULL,
+             validation_token = NULL, validated_at = ? WHERE id = ?`,
+            timestamp, link.id,
+          );
+          const versionId = this.createVersionInTransaction(link.network_id, '单向探测成功，激活数据通路');
+          this.audit('topology-link.active-on-timeout', 'topology-link', link.id, { versionId });
+          continue;
+        }
         const error = link.validation_status === 'preparing'
           ? '验证超时：Agent 未在有效期内完成准备'
           : '验证超时：节点未在有效期内完成双向探测';
@@ -181,7 +342,7 @@ export class ControlService {
       name: '默认网络',
       dataCidr: '10.77.0.0/16',
       controlCidr: '10.254.0.0/16',
-      listenPort: DEFAULT_DATA_PORT,
+      listenPort: this.defaultDataPort,
       mtu: 1380,
     }).id;
   }
@@ -193,6 +354,14 @@ export class ControlService {
       WHERE n.is_center = 1
     `);
     for (const center of centers) {
+      const centerPort = endpointDetails(this.publicUrl)?.port || 19773;
+      if (center.control_endpoint !== this.publicUrl || Number(center.control_listen_port) !== centerPort || center.name === '中心节点') {
+        this.db.run(
+          `UPDATE nodes SET name = CASE WHEN name = '中心节点' THEN '初始节点' ELSE name END,
+           control_endpoint = ?, control_listen_port = ?, updated_at = ? WHERE id = ?`,
+          this.publicUrl, centerPort, now(), center.id,
+        );
+      }
       if (center.has_local_keys && center.wg_control_public_key && center.wg_data_public_key) continue;
       const controlKeys = wireGuardKeyPair();
       const dataKeys = wireGuardKeyPair();
@@ -215,10 +384,15 @@ export class ControlService {
   createNetwork(input) {
     const name = String(input.name ?? '').trim();
     if (!name) throw new Error('节点组名称不能为空');
-    const data = parseCIDR(input.dataCidr ?? '10.77.0.0/16');
+    const data = assertPrivateCidr(input.dataCidr ?? '10.77.0.0/16');
     const control = parseCIDR(input.controlCidr ?? '10.254.0.0/16');
     if (!(data.broadcast < control.network || control.broadcast < data.network)) {
       throw new Error('业务网段与控制网段不能重叠');
+    }
+    for (const existing of this.db.all('SELECT name, data_cidr, control_cidr FROM networks')) {
+      if (rangesOverlap(data, parseCIDR(existing.data_cidr)) || rangesOverlap(data, parseCIDR(existing.control_cidr))) {
+        throw new Error(`业务网段与已有节点组 ${existing.name} 的地址范围重叠`);
+      }
     }
     const listenPort = Number(input.listenPort ?? DEFAULT_DATA_PORT);
     const mtu = Number(input.mtu ?? 1380);
@@ -241,11 +415,12 @@ export class ControlService {
       );
       this.db.run(
         `INSERT INTO nodes(id, network_id, name, status, is_center, can_relay, parent_id, control_ip, data_ip,
-          control_endpoint, data_endpoint, data_listen_port, wg_control_public_key, wg_data_public_key,
+          control_endpoint, control_listen_port, data_endpoint, data_listen_port, wg_control_public_key, wg_data_public_key,
           created_at, updated_at, last_seen)
-         VALUES (?, ?, ?, 'online', 1, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        centerId, id, '中心节点', usableHost(control, 1), usableHost(data, 1), this.publicUrl, centerDataEndpoint,
-        listenPort, centerControlKeys.publicKey, centerDataKeys.publicKey, timestamp, timestamp, timestamp,
+         VALUES (?, ?, ?, 'online', 1, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        centerId, id, '初始节点', usableHost(control, 1), usableHost(data, 1), this.publicUrl,
+        endpointDetails(this.publicUrl)?.port || 19773, centerDataEndpoint, listenPort,
+        centerControlKeys.publicKey, centerDataKeys.publicKey, timestamp, timestamp, timestamp,
       );
       this.db.run(
         'INSERT INTO local_node_keys(node_id, control_private_key, data_private_key, created_at) VALUES (?, ?, ?, ?)',
@@ -278,6 +453,129 @@ export class ControlService {
     return networkFromRow(row);
   }
 
+  planDataCidrChange(networkId, input = {}) {
+    const network = this.getNetwork(networkId);
+    const candidate = assertPrivateCidr(input.dataCidr);
+    const control = parseCIDR(network.controlCidr);
+    if (rangesOverlap(candidate, control)) throw new Error('新业务网段与当前控制网段重叠');
+    const otherNetworks = this.db.all('SELECT id, name, data_cidr, control_cidr FROM networks WHERE id != ?', networkId);
+    for (const other of otherNetworks) {
+      for (const [kind, cidr] of [['业务网段', other.data_cidr], ['控制网段', other.control_cidr]]) {
+        if (rangesOverlap(candidate, parseCIDR(cidr))) throw new Error(`新业务网段与节点组 ${other.name} 的${kind} ${cidr} 重叠`);
+      }
+    }
+
+    const nodes = this.listNodes(networkId);
+    const capacity = candidate.broadcast - candidate.network - 1;
+    if (capacity < nodes.length) throw new Error(`网段 ${candidate.cidr} 只有 ${capacity} 个可用地址，无法容纳 ${nodes.length} 个节点`);
+    const preserved = new Set(nodes
+      .map((node) => node.dataIp)
+      .filter((address) => containsIPv4(candidate, address) && parseIPv4(address) !== candidate.network && parseIPv4(address) !== candidate.broadcast));
+    const used = new Set(preserved);
+    const assignments = [];
+    for (const node of nodes) {
+      let nextIp = containsIPv4(candidate, node.dataIp) && parseIPv4(node.dataIp) !== candidate.network && parseIPv4(node.dataIp) !== candidate.broadcast
+        ? node.dataIp
+        : null;
+      if (!nextIp) {
+        for (let offset = 1; offset <= capacity; offset += 1) {
+          const available = usableHost(candidate, offset);
+          if (!used.has(available)) { nextIp = available; break; }
+        }
+      }
+      if (!preserved.has(nextIp)) used.add(nextIp);
+      assignments.push({ nodeId: node.id, name: node.name, before: node.dataIp, after: nextIp, changed: node.dataIp !== nextIp });
+    }
+    return {
+      networkId,
+      before: network.dataCidr,
+      after: candidate.cidr,
+      changed: network.dataCidr !== candidate.cidr,
+      assignments,
+      checks: {
+        privateRange: true,
+        databaseOverlap: false,
+        capacity,
+        runtimeRouteProbe: '将在所有 Agent 准备配置时检查本机接口和路由冲突',
+      },
+    };
+  }
+
+  updateNetwork(networkId, input = {}) {
+    const plan = this.planDataCidrChange(networkId, input);
+    if (input.dryRun) return { preview: true, ...plan };
+    if (!plan.changed && !plan.assignments.some((assignment) => assignment.changed)) {
+      return { preview: false, ...plan, network: this.getNetwork(networkId), version: null };
+    }
+    const network = this.getNetwork(networkId);
+    const assignments = new Map(plan.assignments.map((assignment) => [assignment.nodeId, assignment.after]));
+    const candidateNetwork = { ...network, dataCidr: plan.after };
+    const candidateNodes = this.listNodes(networkId).map((node) => ({
+      ...node,
+      dataIp: assignments.get(node.id) ?? node.dataIp,
+    }));
+    const compiled = validateAndCompileTopology({
+      network: candidateNetwork,
+      nodes: candidateNodes,
+      links: this.listLinks(networkId, true),
+    });
+    let versionId;
+    this.db.transaction(() => {
+      this.db.run(
+        "UPDATE network_cidr_changes SET status = 'superseded' WHERE network_id = ? AND status = 'pending'",
+        networkId,
+      );
+      versionId = this.createVersionInTransaction(networkId, `业务网段调整为 ${plan.after}`, compiled);
+      this.db.run(
+        `INSERT INTO network_cidr_changes(
+          version_id, network_id, before_cidr, after_cidr, assignments_json, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+        versionId, networkId, plan.before, plan.after, json(plan.assignments), now(),
+      );
+      const version = this.db.get('SELECT status FROM config_versions WHERE id = ?', versionId);
+      if (version?.status === 'active') this.applyNetworkCidrChangeInTransaction(versionId, now());
+      this.audit('network.data-cidr.stage', 'network', networkId, {
+        before: plan.before,
+        after: plan.after,
+        assignments: plan.assignments,
+        versionId,
+      });
+    });
+    return {
+      preview: false,
+      ...plan,
+      network: this.getNetwork(networkId),
+      pendingNetwork: candidateNetwork,
+      version: this.getConfiguration(versionId),
+    };
+  }
+
+  applyNetworkCidrChangeInTransaction(versionId, timestamp = now()) {
+    const change = this.db.get(
+      "SELECT * FROM network_cidr_changes WHERE version_id = ? AND status = 'pending'",
+      versionId,
+    );
+    if (!change) return false;
+    const assignments = JSON.parse(change.assignments_json);
+    this.db.run('UPDATE networks SET data_cidr = ? WHERE id = ?', change.after_cidr, change.network_id);
+    for (const assignment of assignments) {
+      this.db.run(
+        'UPDATE nodes SET data_ip = ?, updated_at = ? WHERE id = ? AND network_id = ?',
+        assignment.after, timestamp, assignment.nodeId, change.network_id,
+      );
+    }
+    this.db.run(
+      "UPDATE network_cidr_changes SET status = 'active', error = NULL, applied_at = ? WHERE version_id = ?",
+      timestamp, versionId,
+    );
+    this.audit('network.data-cidr.activate', 'network', change.network_id, {
+      before: change.before_cidr,
+      after: change.after_cidr,
+      versionId,
+    });
+    return true;
+  }
+
   listNodes(networkId) {
     return this.db.all('SELECT * FROM nodes WHERE network_id = ? ORDER BY is_center DESC, created_at', networkId).map(nodeFromRow);
   }
@@ -291,7 +589,11 @@ export class ControlService {
   listLinks(networkId, activeOnly = false) {
     const condition = activeOnly ? " AND validation_status = 'active'" : '';
     return this.db.all(`SELECT * FROM topology_links WHERE network_id = ?${condition} ORDER BY priority, created_at`, networkId)
-      .map((row) => ({
+      .map((row) => {
+        const upstreamProbe = Number(row.validation_probed_upstream ?? 0);
+        const downstreamProbe = Number(row.validation_probed_downstream ?? 0);
+        const directionStatus = (value) => value > 0 ? 'reachable' : value < 0 ? 'unreachable' : 'unknown';
+        return ({
         id: row.id,
         upstreamId: row.upstream_id,
         downstreamId: row.downstream_id,
@@ -302,11 +604,24 @@ export class ControlService {
         validationError: row.validation_error,
         validationProgress: {
           prepared: Number(row.validation_prepared_upstream ?? 0) + Number(row.validation_prepared_downstream ?? 0),
-          probed: Number(row.validation_probed_upstream ?? 0) + Number(row.validation_probed_downstream ?? 0),
+          probed: Number(upstreamProbe !== 0) + Number(downstreamProbe !== 0),
+          successful: Number(upstreamProbe > 0) + Number(downstreamProbe > 0),
+          failed: Number(upstreamProbe < 0) + Number(downstreamProbe < 0),
+        },
+        probeDirections: {
+          upstreamToDownstream: {
+            status: directionStatus(upstreamProbe),
+            error: row.validation_probe_error_upstream ?? null,
+          },
+          downstreamToUpstream: {
+            status: directionStatus(downstreamProbe),
+            error: row.validation_probe_error_downstream ?? null,
+          },
         },
         validationExpiresAt: row.validation_expires_at,
         validatedAt: row.validated_at,
-      }));
+      });
+      });
   }
 
   listPathPolicies(networkId) {
@@ -324,6 +639,15 @@ export class ControlService {
     }));
   }
 
+  failedLinkIds(networkId) {
+    return new Set(this.db.all(
+      `SELECT DISTINCT h.link_id FROM link_health_reports h
+       JOIN topology_links l ON l.id = h.link_id
+       WHERE l.network_id = ? AND h.status = 'unreachable'`,
+      networkId,
+    ).map((row) => row.link_id));
+  }
+
   getPathOptions(networkId, sourceId, targetId) {
     const source = this.getNode(sourceId);
     const target = this.getNode(targetId);
@@ -337,24 +661,52 @@ export class ControlService {
     const policy = this.listPathPolicies(networkId).find((item) =>
       item.sourceId === canonicalSourceId && item.targetId === canonicalTargetId);
     const selectedWeights = new Map((policy?.paths ?? []).map((path) => [path.pathId, Number(path.weight)]));
+    const failedLinkIds = this.failedLinkIds(networkId);
+    const policyPathStates = (policy?.paths ?? []).map((path) => {
+      const failed = (path.linkIds ?? []).filter((linkId) => failedLinkIds.has(linkId));
+      return { ...path, available: failed.length === 0, failedLinkIds: failed };
+    });
+    const activeWeight = policy?.mode === 'weighted'
+      ? policyPathStates.filter((path) => path.available).reduce((total, path) => total + Number(path.weight ?? 1), 0)
+      : 0;
 
     return {
       source,
       target,
-      paths: result.paths.map((path) => ({
-        ...path,
-        nodes: path.nodeIds.map((nodeId) => {
-          const node = nodeById.get(nodeId);
-          return { id: node.id, name: node.name, dataIp: node.dataIp, status: node.status };
-        }),
-        selected: selectedWeights.has(path.id),
-        weight: selectedWeights.get(path.id) ?? 1,
-      })),
+      paths: result.paths.map((path) => {
+        const failed = path.linkIds.filter((linkId) => failedLinkIds.has(linkId));
+        return {
+          ...path,
+          nodes: path.nodeIds.map((nodeId) => {
+            const node = nodeById.get(nodeId);
+            return { id: node.id, name: node.name, dataIp: node.dataIp, status: node.status };
+          }),
+          selected: selectedWeights.has(path.id),
+          weight: selectedWeights.get(path.id) ?? 1,
+          available: failed.length === 0,
+          failedLinkIds: failed,
+        };
+      }),
       truncated: result.truncated,
+      healthProbeIntervalSeconds: 20,
+      effectiveDefaultPathId: policy?.mode === 'failover'
+        ? policy.paths[0]?.pathId ?? result.paths[0]?.id ?? null
+        : result.paths[0]?.id ?? null,
       policy: policy ? {
         id: policy.id,
         mode: policy.mode,
-        paths: policy.paths.map((path) => ({ pathId: path.pathId, weight: Number(path.weight) })),
+        defaultPathId: policy.mode === 'failover' ? policy.paths[0]?.pathId ?? null : null,
+        paths: policyPathStates.map((path, index) => ({
+          pathId: path.pathId,
+          weight: Number(path.weight ?? 1),
+          effectiveWeight: policy.mode === 'weighted' && !path.available ? 0 : Number(path.weight ?? 1),
+          share: policy.mode === 'weighted'
+            ? path.available && activeWeight ? Number((Number(path.weight ?? 1) / activeWeight).toFixed(4)) : 0
+            : null,
+          available: path.available,
+          failedLinkIds: path.failedLinkIds,
+          order: Number(path.order ?? index),
+        })),
         updatedAt: policy.updatedAt,
       } : null,
     };
@@ -362,25 +714,44 @@ export class ControlService {
 
   savePathPolicy(networkId, input) {
     const details = this.getPathOptions(networkId, input.sourceId, input.targetId);
+    const mode = input.mode === 'failover' ? 'failover' : 'weighted';
     const requested = Array.isArray(input.paths) ? input.paths : [];
-    if (requested.length < 2) throw new Error('负载均衡至少需要选择两条无环路径');
     const available = new Map(details.paths.map((path) => [path.id, path]));
     const seen = new Set();
     const [sourceId, targetId] = canonicalNodePair(details.source.id, details.target.id);
-    const selectedPaths = requested.map((selection) => {
-      const option = available.get(selection.pathId);
-      if (!option || seen.has(selection.pathId)) throw new Error('所选路径不存在、已失效或重复');
-      seen.add(selection.pathId);
-      const weight = Number(selection.weight);
-      if (!Number.isInteger(weight) || weight < 1 || weight > 1000) throw new Error('路径权重必须是 1 到 1000 的整数');
-      const canonicalDirection = option.nodeIds[0] === sourceId;
-      return {
-        pathId: option.id,
-        weight,
-        nodeIds: canonicalDirection ? option.nodeIds : [...option.nodeIds].reverse(),
-        linkIds: canonicalDirection ? option.linkIds : [...option.linkIds].reverse(),
-      };
-    });
+    let selectedPaths;
+    if (mode === 'failover') {
+      const defaultPathId = String(input.defaultPathId || requested[0]?.pathId || '');
+      const preferred = available.get(defaultPathId);
+      if (!preferred) throw new Error('默认线路不存在或已经失效');
+      selectedPaths = [preferred, ...details.paths.filter((path) => path.id !== preferred.id)].map((option, order) => {
+        const canonicalDirection = option.nodeIds[0] === sourceId;
+        return {
+          pathId: option.id,
+          weight: 1,
+          order,
+          nodeIds: canonicalDirection ? option.nodeIds : [...option.nodeIds].reverse(),
+          linkIds: canonicalDirection ? option.linkIds : [...option.linkIds].reverse(),
+        };
+      });
+    } else {
+      if (requested.length < 2) throw new Error('负载均衡至少需要选择两条无环路径');
+      selectedPaths = requested.map((selection, order) => {
+        const option = available.get(selection.pathId);
+        if (!option || seen.has(selection.pathId)) throw new Error('所选路径不存在、已失效或重复');
+        seen.add(selection.pathId);
+        const weight = Number(selection.weight);
+        if (!Number.isInteger(weight) || weight < 1 || weight > 1000) throw new Error('路径权重必须是 1 到 1000 的整数');
+        const canonicalDirection = option.nodeIds[0] === sourceId;
+        return {
+          pathId: option.id,
+          weight,
+          order,
+          nodeIds: canonicalDirection ? option.nodeIds : [...option.nodeIds].reverse(),
+          linkIds: canonicalDirection ? option.linkIds : [...option.linkIds].reverse(),
+        };
+      });
+    }
     const existing = this.db.get(
       'SELECT id, created_at FROM path_policies WHERE network_id = ? AND source_id = ? AND target_id = ?',
       networkId, sourceId, targetId,
@@ -391,13 +762,16 @@ export class ControlService {
     this.db.transaction(() => {
       this.db.run(
         `INSERT INTO path_policies(id, network_id, source_id, target_id, mode, paths_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'weighted', ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(network_id, source_id, target_id) DO UPDATE SET
            mode = excluded.mode, paths_json = excluded.paths_json, updated_at = excluded.updated_at`,
-        id, networkId, sourceId, targetId, json(selectedPaths), existing?.created_at ?? timestamp, timestamp,
+        id, networkId, sourceId, targetId, mode, json(selectedPaths), existing?.created_at ?? timestamp, timestamp,
       );
-      versionId = this.createVersionInTransaction(networkId, '更新多路径负载均衡策略');
-      this.audit('path-policy.update', 'path-policy', id, { sourceId, targetId, paths: selectedPaths, versionId });
+      versionId = this.createVersionInTransaction(
+        networkId,
+        mode === 'weighted' ? '更新多路径负载均衡策略' : '更新默认线路与自动故障切换策略',
+      );
+      this.audit('path-policy.update', 'path-policy', id, { sourceId, targetId, mode, paths: selectedPaths, versionId });
     });
     return { details: this.getPathOptions(networkId, input.sourceId, input.targetId), version: this.getConfiguration(versionId) };
   }
@@ -469,6 +843,7 @@ export class ControlService {
     const nextIp = input.dataIp === undefined ? node.dataIp : String(input.dataIp).trim();
     const nextRelay = input.canRelay === undefined ? node.canRelay : Boolean(input.canRelay);
     const nextControlEndpoint = input.controlEndpoint === undefined ? node.controlEndpoint : String(input.controlEndpoint).trim() || null;
+    const nextControlListenPort = normalizePort(input.controlListenPort, `${node.name} 的控制中继端口`, node.controlListenPort);
     const nextDataEndpoint = input.dataEndpoint === undefined ? node.dataEndpoint : String(input.dataEndpoint).trim() || null;
     const nextDataListenPort = normalizePort(input.dataListenPort, `${node.name} 的 WireGuard 端口`, node.dataListenPort);
     if (!nextName) throw new Error('节点名称不能为空');
@@ -484,7 +859,8 @@ export class ControlService {
     const nodes = this.listNodes(node.networkId).map((item) => item.id === nodeId
       ? {
           ...item, name: nextName, dataIp: nextIp, canRelay: nextRelay,
-          controlEndpoint: nextControlEndpoint, dataEndpoint: nextDataEndpoint, dataListenPort: nextDataListenPort,
+          controlEndpoint: nextControlEndpoint, controlListenPort: nextControlListenPort,
+          dataEndpoint: nextDataEndpoint, dataListenPort: nextDataListenPort,
         }
       : item);
     const links = this.listLinks(node.networkId, true);
@@ -493,16 +869,93 @@ export class ControlService {
     this.db.transaction(() => {
       this.db.run(
         `UPDATE nodes SET name = ?, data_ip = ?, can_relay = ?, control_endpoint = ?,
-         data_endpoint = ?, data_listen_port = ?, updated_at = ? WHERE id = ?`,
-        nextName, nextIp, nextRelay ? 1 : 0, nextControlEndpoint, nextDataEndpoint, nextDataListenPort, now(), nodeId,
+         control_listen_port = ?, data_endpoint = ?, data_listen_port = ?, updated_at = ? WHERE id = ?`,
+        nextName, nextIp, nextRelay ? 1 : 0, nextControlEndpoint, nextControlListenPort,
+        nextDataEndpoint, nextDataListenPort, now(), nodeId,
       );
       versionId = this.createVersionInTransaction(node.networkId, '修改节点业务地址', compiled);
       this.audit('node.update', 'node', nodeId, {
-        before: { name: node.name, dataIp: node.dataIp, controlEndpoint: node.controlEndpoint, dataEndpoint: node.dataEndpoint, dataListenPort: node.dataListenPort },
-        after: { name: nextName, dataIp: nextIp, controlEndpoint: nextControlEndpoint, dataEndpoint: nextDataEndpoint, dataListenPort: nextDataListenPort }, versionId,
+        before: { name: node.name, dataIp: node.dataIp, controlEndpoint: node.controlEndpoint, controlListenPort: node.controlListenPort, dataEndpoint: node.dataEndpoint, dataListenPort: node.dataListenPort },
+        after: { name: nextName, dataIp: nextIp, controlEndpoint: nextControlEndpoint, controlListenPort: nextControlListenPort, dataEndpoint: nextDataEndpoint, dataListenPort: nextDataListenPort }, versionId,
       });
     });
     return { node: this.getNode(nodeId), version: this.getConfiguration(versionId) };
+  }
+
+  inspectNodeDeletion(nodeId) {
+    const node = this.getNode(nodeId);
+    if (node.isCenter) {
+      return { canDelete: false, node, reason: '当前配置协调节点不能直接删除；请先完成协调权迁移。' };
+    }
+    const network = this.getNetwork(node.networkId);
+    const remainingNodes = this.listNodes(node.networkId).filter((item) => item.id !== nodeId);
+    const remainingLinks = this.listLinks(node.networkId, true).filter((link) =>
+      link.upstreamId !== nodeId && link.downstreamId !== nodeId);
+    const proxies = this.db.all(
+      'SELECT node_id, manager_node_id, relay_path_json FROM managed_node_proxies WHERE manager_node_id = ? OR relay_path_json LIKE ?',
+      nodeId, `%${nodeId}%`,
+    ).filter((row) => row.manager_node_id === nodeId || JSON.parse(row.relay_path_json || '[]').includes(nodeId));
+    if (proxies.length) {
+      const affected = proxies.map((row) => this.getNode(row.node_id).name);
+      return {
+        canDelete: false,
+        node,
+        reason: `该节点仍承担 ${affected.length} 台被认领设备的认证代理：${affected.join('、')}。请先迁移这些设备。`,
+        affectedNodeIds: proxies.map((row) => row.node_id),
+      };
+    }
+    let compiled;
+    try {
+      compiled = validateAndCompileTopology({ network, nodes: remainingNodes, links: remainingLinks });
+    } catch (error) {
+      const unreachable = error.details?.unreachable ?? [];
+      const affected = unreachable.map((id) => remainingNodes.find((item) => item.id === id)?.name).filter(Boolean);
+      return {
+        canDelete: false,
+        node,
+        reason: affected.length
+          ? `删除后会使这些节点失联：${affected.join('、')}。请先建立替代链路。`
+          : `删除后剩余拓扑不再全网可达：${error.message}`,
+        affectedNodeIds: unreachable,
+      };
+    }
+    const incidentLinks = this.listLinks(node.networkId).filter((link) =>
+      link.upstreamId === nodeId || link.downstreamId === nodeId);
+    const children = remainingNodes.filter((item) => item.parentId === nodeId);
+    return {
+      canDelete: true,
+      node,
+      compiled,
+      removedLinks: incidentLinks.length,
+      reparentedNodeIds: children.map((item) => item.id),
+      warning: `将删除节点“${node.name}”及 ${incidentLinks.length} 条相邻链路，并生成新的全网配置版本。`,
+    };
+  }
+
+  deleteNode(nodeId) {
+    const impact = this.inspectNodeDeletion(nodeId);
+    if (!impact.canDelete) throw new Error(impact.reason);
+    const node = impact.node;
+    const center = this.listNodes(node.networkId).find((item) => item.isCenter);
+    let versionId;
+    this.db.transaction(() => {
+      if (center) this.db.run('UPDATE nodes SET parent_id = ? WHERE parent_id = ?', center.id, nodeId);
+      if (center) this.db.run('UPDATE join_tokens SET parent_id = ? WHERE parent_id = ?', center.id, nodeId);
+      for (const policy of this.listPathPolicies(node.networkId)) {
+        if (policy.paths.some((path) => path.nodeIds?.includes(nodeId))) {
+          this.db.run('DELETE FROM path_policies WHERE id = ?', policy.id);
+        }
+      }
+      this.db.run('DELETE FROM nodes WHERE id = ?', nodeId);
+      versionId = this.createVersionInTransaction(node.networkId, `删除节点 ${node.name}`, impact.compiled);
+      this.audit('node.delete', 'node', nodeId, {
+        name: node.name,
+        removedLinks: impact.removedLinks,
+        reparentedNodeIds: impact.reparentedNodeIds,
+        versionId,
+      });
+    });
+    return { deleted: true, nodeId, version: this.getConfiguration(versionId) };
   }
 
   createJoinToken(networkId, input = {}) {
@@ -511,37 +964,41 @@ export class ControlService {
     if (parent.networkId !== networkId) throw new Error('父节点不属于当前节点组');
     if (!parent.canRelay) throw new Error('所选父节点未启用下级接入能力');
     const mode = input.mode === 'passive' ? 'passive' : 'active';
-    const dataPort = input.dataPort === undefined || input.dataPort === null || input.dataPort === ''
-      ? null
-      : normalizePort(input.dataPort, '新节点 WireGuard 端口');
     const ttlMinutes = Math.min(1440, Math.max(5, Number(input.ttlMinutes ?? 30)));
     const token = `pwj_${randomBytes(24).toString('base64url')}`;
     const id = randomUUID();
     const expiresAt = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
+    let sourceUrl = null;
+    let parentConnection = null;
+    let publicSourceUrl = null;
+    let command;
+    if (mode === 'passive') {
+      publicSourceUrl = PASSIVE_GITHUB_SOURCE;
+      command = `curl -fsSL '${publicSourceUrl}/scripts/install.sh' | sudo bash -s -- --source '${publicSourceUrl}' --claim-token '${token}'`;
+    } else {
+      const requestedEndpoint = endpointDetails(input.sourceUrl) || endpointDetails(parent.controlEndpoint);
+      const parentProtocol = String(input.parentProtocol || requestedEndpoint?.protocol || 'http').replace(':', '').toLowerCase();
+      if (!['http', 'https'].includes(parentProtocol)) throw new Error('父节点接入协议只支持 HTTP 或 HTTPS');
+      const parentHostValue = input.parentHost || requestedEndpoint?.host;
+      if (!parentHostValue) throw new Error(`父节点 ${parent.name} 尚未配置新设备可访问的中继地址`);
+      const parentHost = normalizeReachableHost(parentHostValue, `${parent.name} 的可达地址`);
+      const parentPort = normalizePort(
+        input.parentPort,
+        `${parent.name} 的控制接入端口`,
+        requestedEndpoint?.port || parent.controlListenPort || (parentProtocol === 'https' ? 443 : 8790),
+      );
+      sourceUrl = `${parentProtocol}://${parentHost}:${parentPort}`;
+      parentConnection = { protocol: parentProtocol, host: parentHost, port: parentPort, url: sourceUrl };
+      const installerUrl = `${sourceUrl}/install.sh?source=${encodeURIComponent(sourceUrl)}`;
+      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --join-token '${token}' --upstream '${sourceUrl}'`;
+    }
     this.db.run(
       `INSERT INTO join_tokens(id, token_hash, network_id, parent_id, mode, expires_at, max_uses, used_count, created_at)
        VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?)`,
       id, hashSecret(token), networkId, parent.id, mode, expiresAt, now(),
     );
-    const rawSourceUrl = String(input.sourceUrl || parent.controlEndpoint || '').trim();
-    if (!rawSourceUrl) {
-      throw new Error(`父节点 ${parent.name} 尚未配置新设备可访问的中继地址`);
-    }
-    let sourceUrl;
-    try {
-      const parsed = new URL(rawSourceUrl);
-      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('invalid protocol');
-      sourceUrl = parsed.href.replace(/\/$/, '');
-    } catch {
-      throw new Error('安装包与接入地址必须是完整的 HTTP 或 HTTPS URL');
-    }
-    const installerUrl = `${sourceUrl}/install.sh?source=${encodeURIComponent(sourceUrl)}`;
-    const dataPortArgument = dataPort ? ` --data-port '${dataPort}'` : '';
-    const command = mode === 'passive'
-      ? `curl -fsSL '${installerUrl}' | sudo bash -s -- --claim-token '${token}'${dataPortArgument}`
-      : `curl -fsSL '${installerUrl}' | sudo bash -s -- --join-token '${token}' --upstream '${sourceUrl}'${dataPortArgument}`;
-    this.audit('join-token.create', 'join-token', id, { networkId, parentId: parent.id, mode, expiresAt, dataPort });
-    return { id, token, mode, expiresAt, parent, sourceUrl, dataPort, command };
+    this.audit('join-token.create', 'join-token', id, { networkId, parentId: parent.id, mode, expiresAt, parentConnection });
+    return { id, token, mode, expiresAt, parent, sourceUrl, publicSourceUrl, parentConnection, command };
   }
 
   createLinkValidation(networkId, input) {
@@ -628,20 +1085,36 @@ export class ControlService {
         `${name} 的 WireGuard 端口`,
         endpointPort(input.dataEndpoint) || DEFAULT_DATA_PORT,
       );
+      const controlListenPort = normalizePort(
+        input.controlListenPort,
+        `${name} 的控制中继端口`,
+        endpointDetails(input.controlEndpoint)?.port || 8790,
+      );
       this.db.run(
         `INSERT INTO nodes(id, network_id, name, status, is_center, can_relay, parent_id, control_ip, data_ip,
-          control_endpoint, data_endpoint, data_listen_port, wg_control_public_key, wg_data_public_key, credential_hash,
+          control_endpoint, control_listen_port, data_endpoint, data_listen_port,
+          wg_control_public_key, wg_data_public_key, credential_hash,
           agent_version, last_seen, created_at, updated_at)
-         VALUES (?, ?, ?, 'online', 0, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, 'online', 0, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         nodeId, network.id, name, parent.id, controlIp, dataIp,
-        input.controlEndpoint ?? null, input.dataEndpoint ?? null, dataListenPort,
+        input.controlEndpoint ?? null, controlListenPort, input.dataEndpoint ?? null, dataListenPort,
         input.wgControlPublicKey ?? '', input.wgDataPublicKey ?? '', hashSecret(credential),
         input.agentVersion ?? '0.1.0', timestamp, timestamp, timestamp,
       );
-      this.db.run(
-        'INSERT INTO topology_links(id, network_id, upstream_id, downstream_id, priority, created_at) VALUES (?, ?, ?, ?, 100, ?)',
-        randomUUID(), network.id, parent.id, nodeId, timestamp,
-      );
+      if (token.mode === 'passive') {
+        if (!input.dataEndpoint) throw new Error('被动认领节点必须提供父节点可访问的 WireGuard 地址');
+        this.db.run(
+          `INSERT INTO topology_links(
+            id, network_id, upstream_id, downstream_id, priority, upstream_endpoint, downstream_endpoint, created_at
+          ) VALUES (?, ?, ?, ?, 100, '', ?, ?)`,
+          randomUUID(), network.id, parent.id, nodeId, input.dataEndpoint, timestamp,
+        );
+      } else {
+        this.db.run(
+          'INSERT INTO topology_links(id, network_id, upstream_id, downstream_id, priority, created_at) VALUES (?, ?, ?, ?, 100, ?)',
+          randomUUID(), network.id, parent.id, nodeId, timestamp,
+        );
+      }
       this.db.run('UPDATE join_tokens SET used_count = used_count + 1 WHERE id = ?', token.id);
       const versionId = this.createVersionInTransaction(network.id, `节点 ${name} 加入`);
       this.audit('agent.register', 'node', nodeId, { parentId: parent.id, versionId }, `node:${nodeId}`);
@@ -668,13 +1141,31 @@ export class ControlService {
     };
   }
 
+  listLocalCenters() {
+    return this.db.all(
+      `SELECT n.*, k.data_private_key FROM nodes n
+       JOIN local_node_keys k ON k.node_id = n.id
+       WHERE n.is_center = 1 ORDER BY n.created_at`,
+    ).map((row) => ({ node: nodeFromRow(row), dataPrivateKey: row.data_private_key }));
+  }
+
   createVersionInTransaction(networkId, reason, precompiled = null) {
     const state = this.loadState(networkId);
     const compiled = precompiled ?? validateAndCompileTopology(state);
     const pathPolicies = this.listPathPolicies(networkId);
+    const controlPlans = compileControlPlans(state.nodes, state.links);
+    for (const [nodeId, config] of Object.entries(compiled.configs)) {
+      config.control = controlPlans[nodeId] ?? { maxHops: 16, forwarders: {}, routes: [], truncated: false };
+    }
     for (const config of Object.values(compiled.configs)) config.multipathPolicies = [];
+    const failedLinkIds = this.failedLinkIds(networkId);
     for (const policy of pathPolicies) {
-      const totalWeight = policy.paths.reduce((total, path) => total + Number(path.weight), 0);
+      const availablePathIds = new Set(policy.paths.filter((path) =>
+        !(path.linkIds ?? []).some((linkId) => failedLinkIds.has(linkId))).map((path) => path.pathId));
+      const totalWeight = policy.mode === 'weighted'
+        ? policy.paths.filter((path) => availablePathIds.has(path.pathId))
+          .reduce((total, path) => total + Number(path.weight), 0)
+        : 0;
       for (const [sourceId, targetId, reverse] of [
         [policy.sourceId, policy.targetId, false],
         [policy.targetId, policy.sourceId, true],
@@ -685,13 +1176,26 @@ export class ControlService {
           policyId: policy.id,
           targetNodeId: targetId,
           mode: policy.mode,
-          paths: policy.paths.map((path) => {
+          switchOnFailure: true,
+          selection: policy.mode === 'weighted' ? 'weighted-random' : 'ordered-failover',
+          healthProbeIntervalSeconds: 20,
+          activePathIds: policy.paths.filter((path) => availablePathIds.has(path.pathId)).map((path) => path.pathId),
+          paths: policy.paths.map((path, index) => {
             const nodeIds = reverse ? [...path.nodeIds].reverse() : [...path.nodeIds];
             const linkIds = reverse ? [...path.linkIds].reverse() : [...path.linkIds];
+            const available = availablePathIds.has(path.pathId);
             return {
               pathId: path.pathId,
               weight: Number(path.weight),
-              share: totalWeight ? Number((Number(path.weight) / totalWeight).toFixed(4)) : 0,
+              effectiveWeight: policy.mode === 'weighted' && !available ? 0 : Number(path.weight),
+              order: Number(path.order ?? 0),
+              isDefault: policy.mode === 'failover' && index === 0,
+              available,
+              health: available ? 'active' : 'temporarily-excluded',
+              failedLinkIds: linkIds.filter((linkId) => failedLinkIds.has(linkId)),
+              share: policy.mode === 'weighted' && available && totalWeight
+                ? Number((Number(path.weight) / totalWeight).toFixed(4))
+                : policy.mode === 'weighted' ? 0 : null,
               nextHopId: nodeIds[1],
               nodeIds,
               linkIds,
@@ -699,14 +1203,25 @@ export class ControlService {
           }),
         });
       }
+      if (policy.mode === 'failover' && policy.paths[0]?.nodeIds?.length > 1) {
+        applyPreferredPath(compiled, state, policy.paths[0].nodeIds);
+        applyPreferredPath(compiled, state, [...policy.paths[0].nodeIds].reverse());
+      }
     }
     const next = this.db.get('SELECT COALESCE(MAX(version), 0) + 1 AS version FROM config_versions WHERE network_id = ?', networkId);
     const id = randomUUID();
     const timestamp = now();
-    const onlyCenter = state.nodes.every((node) => node.isCenter);
+    const onlyCenter = !this.manageLocalCenters && state.nodes.every((node) => node.isCenter);
     const status = onlyCenter ? 'active' : 'preparing';
     this.db.run(
       "UPDATE config_versions SET status = 'superseded' WHERE network_id = ? AND status IN ('preparing', 'activating')",
+      networkId,
+    );
+    this.db.run(
+      `UPDATE network_cidr_changes SET status = 'superseded'
+       WHERE status = 'pending' AND version_id IN (
+         SELECT id FROM config_versions WHERE network_id = ? AND status = 'superseded'
+       )`,
       networkId,
     );
     this.db.run(
@@ -717,12 +1232,13 @@ export class ControlService {
       onlyCenter ? timestamp : null,
     );
     for (const node of state.nodes) {
-      const phase = node.isCenter ? 'activated' : 'pending';
+      const autoActivatedCenter = node.isCenter && !this.manageLocalCenters;
+      const phase = autoActivatedCenter ? 'activated' : 'pending';
       this.db.run(
         `INSERT INTO node_configs(version_id, node_id, phase, config_json, prepared_at, activated_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
         id, node.id, phase, json({ ...compiled.configs[node.id], version: Number(next.version), versionId: id }),
-        node.isCenter ? timestamp : null, node.isCenter ? timestamp : null,
+        autoActivatedCenter ? timestamp : null, autoActivatedCenter ? timestamp : null,
       );
     }
     return id;
@@ -770,26 +1286,84 @@ export class ControlService {
     return nodeFromRow(this.db.get('SELECT * FROM nodes WHERE credential_hash = ?', hashSecret(credential)));
   }
 
+  recordLinkHealthAndUpdatePolicies(node, linkHealth, timestamp) {
+    const empty = { rotated: [], weightedChanges: [] };
+    if (!linkHealth?.available || !Array.isArray(linkHealth.links)) return empty;
+    const beforeFailedLinkIds = this.failedLinkIds(node.networkId);
+    const incident = new Set(this.listLinks(node.networkId, true).filter((link) =>
+      link.upstreamId === node.id || link.downstreamId === node.id).map((link) => link.id));
+    for (const report of linkHealth.links) {
+      if (!incident.has(report.linkId) || !['reachable', 'unreachable'].includes(report.status)) continue;
+      this.db.run(
+        `INSERT INTO link_health_reports(node_id, link_id, status, observed_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(node_id, link_id) DO UPDATE SET status = excluded.status, observed_at = excluded.observed_at`,
+        node.id, report.linkId, report.status, timestamp,
+      );
+    }
+    const failedLinkIds = this.failedLinkIds(node.networkId);
+    const policies = this.listPathPolicies(node.networkId);
+    const weightedChanges = [];
+    for (const policy of policies.filter((item) => item.mode === 'weighted')) {
+      const beforeActive = policy.paths.filter((path) =>
+        !(path.linkIds ?? []).some((linkId) => beforeFailedLinkIds.has(linkId))).map((path) => path.pathId);
+      const afterActive = policy.paths.filter((path) =>
+        !(path.linkIds ?? []).some((linkId) => failedLinkIds.has(linkId))).map((path) => path.pathId);
+      if (beforeActive.join('\n') === afterActive.join('\n')) continue;
+      weightedChanges.push({
+        policyId: policy.id,
+        excludedPathIds: beforeActive.filter((pathId) => !afterActive.includes(pathId)),
+        recoveredPathIds: afterActive.filter((pathId) => !beforeActive.includes(pathId)),
+        activePathIds: afterActive,
+      });
+    }
+    const rotated = [];
+    for (const policy of policies.filter((item) => item.mode === 'failover')) {
+      const current = policy.paths[0];
+      if (!current?.linkIds?.some((linkId) => failedLinkIds.has(linkId))) continue;
+      const replacement = policy.paths.find((path) => !path.linkIds?.some((linkId) => failedLinkIds.has(linkId)));
+      if (!replacement || replacement.pathId === current.pathId) continue;
+      const reordered = [replacement, ...policy.paths.filter((path) => path.pathId !== replacement.pathId)]
+        .map((path, order) => ({ ...path, order }));
+      this.db.run('UPDATE path_policies SET paths_json = ?, updated_at = ? WHERE id = ?', json(reordered), timestamp, policy.id);
+      rotated.push({ policyId: policy.id, fromPathId: current.pathId, toPathId: replacement.pathId });
+    }
+    return { rotated, weightedChanges };
+  }
+
   heartbeat(nodeId, input = {}) {
     const timestamp = now();
     const node = this.getNode(nodeId);
     const dataListenPort = normalizePort(input.dataListenPort, `${node.name} 的 WireGuard 端口`, node.dataListenPort);
+    const controlListenPort = normalizePort(input.controlListenPort, `${node.name} 的控制中继端口`, node.controlListenPort);
     const portChanged = dataListenPort !== node.dataListenPort;
     let versionId = null;
     this.db.transaction(() => {
       this.db.run(
         `UPDATE nodes SET status = 'online', last_seen = ?, agent_version = COALESCE(?, agent_version),
          control_endpoint = COALESCE(?, control_endpoint), data_endpoint = COALESCE(?, data_endpoint),
-         data_listen_port = ?, updated_at = ? WHERE id = ?`,
+         control_listen_port = ?, data_listen_port = ?, updated_at = ? WHERE id = ?`,
         timestamp, input.agentVersion ?? null, input.controlEndpoint ?? null, input.dataEndpoint ?? null,
-        dataListenPort, timestamp, nodeId,
+        controlListenPort, dataListenPort, timestamp, nodeId,
       );
+      const policyHealth = this.recordLinkHealthAndUpdatePolicies(node, input.linkHealth, timestamp);
+      if (portChanged || policyHealth.rotated.length || policyHealth.weightedChanges.length) {
+        const reasons = [
+          portChanged ? `节点 ${node.name} 更新 WireGuard 端口` : '',
+          policyHealth.rotated.length ? `检测到线路故障，自动切换 ${policyHealth.rotated.length} 项默认路径` : '',
+          policyHealth.weightedChanges.length ? `检测到链路状态变化，更新 ${policyHealth.weightedChanges.length} 项负载均衡成员` : '',
+        ].filter(Boolean);
+        versionId = this.createVersionInTransaction(node.networkId, reasons.join('；'));
+        if (policyHealth.rotated.length) this.audit('path-policy.failover', 'network', node.networkId, { nodeId, rotated: policyHealth.rotated, versionId }, `node:${nodeId}`);
+        if (policyHealth.weightedChanges.length) this.audit('path-policy.weighted-health', 'network', node.networkId, {
+          nodeId, changes: policyHealth.weightedChanges, versionId,
+        }, `node:${nodeId}`);
+      }
       if (portChanged) {
-        versionId = this.createVersionInTransaction(node.networkId, `节点 ${node.name} 更新 WireGuard 端口`);
         this.audit('agent.data-port', 'node', nodeId, { before: node.dataListenPort, after: dataListenPort, versionId }, `node:${nodeId}`);
       }
     });
-    return { acknowledgedAt: timestamp, dataListenPort, versionId };
+    return { acknowledgedAt: timestamp, controlListenPort, dataListenPort, versionId };
   }
 
   getDesiredConfig(nodeId, currentVersion = 0) {
@@ -819,8 +1393,14 @@ export class ControlService {
       desiredPhase, error, timestamp, versionId, nodeId,
     );
     if (error) {
-      this.db.run("UPDATE config_versions SET status = 'failed' WHERE id = ?", versionId);
-      this.audit('config.failed', 'config-version', versionId, { nodeId, phase, error }, `node:${nodeId}`);
+      this.db.transaction(() => {
+        this.db.run("UPDATE config_versions SET status = 'failed' WHERE id = ?", versionId);
+        this.db.run(
+          "UPDATE network_cidr_changes SET status = 'failed', error = ? WHERE version_id = ? AND status = 'pending'",
+          error, versionId,
+        );
+        this.audit('config.failed', 'config-version', versionId, { nodeId, phase, error }, `node:${nodeId}`);
+      });
       return this.getConfiguration(versionId);
     }
 
@@ -838,6 +1418,7 @@ export class ControlService {
         this.db.transaction(() => {
           this.db.run("UPDATE config_versions SET status = 'superseded' WHERE network_id = ? AND status = 'active' AND id != ?", version.networkId, versionId);
           this.db.run("UPDATE config_versions SET status = 'active', activated_at = ? WHERE id = ?", timestamp, versionId);
+          this.applyNetworkCidrChangeInTransaction(versionId, timestamp);
         });
       }
     }
@@ -881,10 +1462,10 @@ export class ControlService {
 
   advanceLinkValidation(nodeId, commandType, payload, result) {
     const link = this.db.get('SELECT * FROM topology_links WHERE id = ?', payload.validationId);
-    if (!link || ['active', 'failed'].includes(link.validation_status)) return;
+    if (!link || link.validation_status === 'failed') return;
     const isUpstream = link.upstream_id === nodeId;
     if (!isUpstream && link.downstream_id !== nodeId) return;
-    if (!result.ok) {
+    if (commandType === 'prepare-link-probe' && !result.ok) {
       this.db.run(
         `UPDATE topology_links SET validation_status = 'failed', validation_error = ?, validation_token = NULL WHERE id = ?`,
         result.error || '节点连通性探测失败', link.id,
@@ -899,12 +1480,14 @@ export class ControlService {
       const updated = this.db.get('SELECT * FROM topology_links WHERE id = ?', link.id);
       if (updated.validation_prepared_upstream && updated.validation_prepared_downstream) {
         this.db.run("UPDATE topology_links SET validation_status = 'probing' WHERE id = ?", link.id);
+        const upstream = this.getNode(updated.upstream_id);
+        const downstream = this.getNode(updated.downstream_id);
         this.enqueueCommand(updated.upstream_id, 'execute-link-probe', {
           validationId: link.id,
           probeId: randomUUID(),
           maxHops: 16,
           token: updated.validation_token,
-          remoteUrl: `http://${endpointHost(updated.downstream_endpoint)}:8790`,
+          remoteUrl: probeUrl(downstream, updated.downstream_endpoint),
           expectedNodeId: updated.downstream_id,
         });
         this.enqueueCommand(updated.downstream_id, 'execute-link-probe', {
@@ -912,7 +1495,7 @@ export class ControlService {
           probeId: randomUUID(),
           maxHops: 16,
           token: updated.validation_token,
-          remoteUrl: `http://${endpointHost(updated.upstream_endpoint)}:8790`,
+          remoteUrl: probeUrl(upstream, updated.upstream_endpoint),
           expectedNodeId: updated.upstream_id,
         });
       }
@@ -920,9 +1503,20 @@ export class ControlService {
     }
 
     const field = isUpstream ? 'validation_probed_upstream' : 'validation_probed_downstream';
-    this.db.run(`UPDATE topology_links SET ${field} = 1 WHERE id = ?`, link.id);
+    const errorField = isUpstream ? 'validation_probe_error_upstream' : 'validation_probe_error_downstream';
+    const probeValue = result.ok ? 1 : -1;
+    this.db.run(
+      `UPDATE topology_links SET ${field} = ?, ${errorField} = ? WHERE id = ?`,
+      probeValue, result.ok ? null : (result.error || '该方向不可达'), link.id,
+    );
     const updated = this.db.get('SELECT * FROM topology_links WHERE id = ?', link.id);
-    if (updated.validation_probed_upstream && updated.validation_probed_downstream) {
+    const successes = Number(updated.validation_probed_upstream > 0) + Number(updated.validation_probed_downstream > 0);
+    const completed = Number(updated.validation_probed_upstream !== 0) + Number(updated.validation_probed_downstream !== 0);
+    if (link.validation_status === 'active') {
+      return;
+    }
+    if (completed < 2) return;
+    if (successes > 0) {
       let versionId;
       this.db.transaction(() => {
         this.db.run(
@@ -932,6 +1526,15 @@ export class ControlService {
         versionId = this.createVersionInTransaction(link.network_id, '新增已验证的数据通路');
         this.audit('topology-link.active', 'topology-link', link.id, { versionId });
       });
+      return;
+    }
+    if (completed === 2) {
+      const errors = [updated.validation_probe_error_upstream, updated.validation_probe_error_downstream].filter(Boolean);
+      this.db.run(
+        `UPDATE topology_links SET validation_status = 'failed', validation_error = ?, validation_token = NULL WHERE id = ?`,
+        errors.join('；') || '两个方向均无法建立连接', link.id,
+      );
+      this.audit('topology-link.failed', 'topology-link', link.id, { errors }, `node:${nodeId}`);
     }
   }
 

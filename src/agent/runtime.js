@@ -1,4 +1,5 @@
 import { createSocket } from 'node:dgram';
+import { createServer } from 'node:net';
 
 export const DEFAULT_DATA_PORT = 19801;
 export const MAX_PROBE_HOPS = 16;
@@ -37,6 +38,34 @@ export async function selectAvailableUdpPort({
   }
   if (strict) throw new Error(`指定的 WireGuard UDP 端口 ${firstPort} 已被占用或不可用`);
   throw new Error(`从 ${firstPort} 开始未找到可用的 WireGuard UDP 端口`);
+}
+
+export function isTcpPortAvailable(port, host = '0.0.0.0') {
+  const normalizedPort = normalizeDataPort(port, 'TCP 端口');
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once('error', (error) => {
+      if (error.code === 'EADDRINUSE' || error.code === 'EACCES') resolve(false);
+      else reject(error);
+    });
+    server.once('listening', () => server.close(() => resolve(true)));
+    server.listen({ port: normalizedPort, host, exclusive: true });
+  });
+}
+
+export async function selectAvailableTcpPort({
+  preferred = 8790,
+  strict = false,
+  host = '0.0.0.0',
+  searchSpan = 1024,
+} = {}) {
+  const firstPort = normalizeDataPort(preferred, 'TCP 端口');
+  const lastPort = strict ? firstPort : Math.min(65535, firstPort + Math.max(0, Number(searchSpan) || 0));
+  for (let port = firstPort; port <= lastPort; port += 1) {
+    if (await isTcpPortAvailable(port, host)) return port;
+  }
+  if (strict) throw new Error(`指定的 TCP 端口 ${firstPort} 已被占用或不可用`);
+  throw new Error(`从 ${firstPort} 开始未找到可用的 TCP 端口`);
 }
 
 function normalizeTrace(trace, maxHops) {
