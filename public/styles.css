@@ -60,6 +60,7 @@ nav a.active { color: var(--lime-2); background: var(--lime-dark); box-shadow: i
 .control-state strong { font-size: 11px; font-weight: 500; }
 .control-state small { margin-top: 4px; color: var(--subtle); font-size: 10px; }
 .pulse { width: 8px; height: 8px; margin-top: 3px; flex: 0 0 auto; border: 2px solid #dcfce7; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px #dcfce7; }
+.control-state.degraded .pulse { border-color: #fee2e2; background: var(--red); box-shadow: 0 0 0 4px #fee2e2; }
 .text-button { padding: 10px 8px; color: var(--subtle); border: 0; background: transparent; cursor: pointer; font-size: 11px; }
 .text-button:hover { color: var(--text); }
 
@@ -120,6 +121,7 @@ h3 { font-size: 14px; font-weight: 500; }
 .node-identity strong { font-weight: 500; }
 .node-identity small { margin-top: 3px; color: var(--subtle); font: 9px ui-monospace, monospace; }
 .mono { color: #334155; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.pending-ip { display: block; margin-top: 3px; color: var(--amber); font-size: 9px; }
 .status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
 .status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--subtle); }
 .status.online::before, .status.active::before { background: var(--green); box-shadow: 0 0 0 3px #dcfce7; }

@@ -65,9 +65,31 @@ test('修改业务 IP 生成新版本并拒绝地址冲突', () => {
     const enrollment = service.createJoinToken(network.id, { parentId: center.id });
     const edge = service.registerAgent({ token: enrollment.token, name: '边缘', wgDataPublicKey: 'd'.repeat(44) }).node;
     const changed = service.updateNode(edge.id, { dataIp: '10.77.0.25' });
-    assert.equal(changed.node.dataIp, '10.77.0.25');
+    assert.equal(changed.node.dataIp, edge.dataIp);
+    assert.equal(changed.pendingNode.dataIp, '10.77.0.25');
     assert.equal(changed.version.status, 'preparing');
+    assert.equal(service.getTopology(network.id).addressChange.assignments[0].after, '10.77.0.25');
     assert.throws(() => service.updateNode(edge.id, { dataIp: center.dataIp }), /被多个节点使用/);
+    service.reportConfig(edge.id, changed.version.id, 'prepared');
+    service.reportConfig(edge.id, changed.version.id, 'activated');
+    assert.equal(service.getNode(edge.id).dataIp, '10.77.0.25');
+    assert.equal(service.getTopology(network.id).addressChange, null);
+  } finally { database.close(); }
+});
+
+test('业务 IP 下发失败时数据库和面板继续保留原地址', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const enrollment = service.createJoinToken(network.id, { parentId: center.id });
+    const edge = service.registerAgent({ token: enrollment.token, name: '地址回滚节点', wgDataPublicKey: 'g'.repeat(44) }).node;
+    const changed = service.updateNode(edge.id, { dataIp: '10.77.0.88' });
+    service.reportConfig(edge.id, changed.version.id, 'prepared', '本机路由冲突');
+
+    assert.equal(service.getConfiguration(changed.version.id).status, 'failed');
+    assert.equal(service.getNode(edge.id).dataIp, edge.dataIp);
+    const addressChange = service.getTopology(network.id).addressChange;
+    assert.equal(addressChange.status, 'failed');
+    assert.equal(addressChange.error, '本机路由冲突');
   } finally { database.close(); }
 });
 
@@ -321,6 +343,32 @@ test('业务网段运行时预检失败时保留原网段和地址', () => {
     const change = database.get('SELECT status, error FROM network_cidr_changes WHERE version_id = ?', staged.version.id);
     assert.equal(change.status, 'failed');
     assert.equal(change.error, '业务网段已被本机路由使用');
+  } finally { database.close(); }
+});
+
+test('离线节点不再永久阻塞业务网段切换，并在恢复后追赶 active 配置', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const token = service.createJoinToken(network.id, { parentId: center.id });
+    const edge = service.registerAgent({ token: token.token, name: '暂时离线节点', wgDataPublicKey: 'f'.repeat(44) }).node;
+    const staged = service.updateNetwork(network.id, { dataCidr: '172.22.0.0/24' });
+    assert.equal(staged.version.status, 'preparing');
+
+    const afterDeadline = new Date(Date.parse(edge.lastSeen) + service.nodeOfflineAfterMs + 1);
+    const result = service.reconcileRuntimeState(afterDeadline);
+    assert.equal(result.offlineNodes, 1);
+    assert.equal(result.advancedRollouts, 1);
+    assert.equal(service.getConfiguration(staged.version.id).status, 'active');
+    assert.equal(service.getNetwork(network.id).dataCidr, '172.22.0.0/24');
+    assert.equal(service.getNode(center.id).dataIp, '172.22.0.1');
+    assert.equal(service.getNode(edge.id).dataIp, '172.22.0.2');
+
+    const edgeRollout = service.getConfiguration(staged.version.id).nodes.find((node) => node.nodeId === edge.id);
+    assert.equal(edgeRollout.required, false);
+    assert.equal(edgeRollout.phase, 'pending');
+    const catchUp = service.getDesiredConfig(edge.id, 0);
+    assert.equal(catchUp.phase, 'activate');
+    assert.equal(catchUp.config.data.address, '172.22.0.2/32');
   } finally { database.close(); }
 });
 

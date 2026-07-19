@@ -323,56 +323,64 @@ export class ControlService {
     );
     const expiredLinkIds = new Set(expiredLinks.map((link) => link.id));
 
-    if (!staleNodes.length && !expiredLinks.length) return { offlineNodes: 0, expiredLinks: 0, cancelledCommands: 0 };
-
     let cancelledCommands = 0;
-    this.db.transaction(() => {
-      for (const node of staleNodes) {
-        this.db.run("UPDATE nodes SET status = 'offline', updated_at = ? WHERE id = ?", timestamp, node.id);
-        this.audit('agent.offline', 'node', node.id, { lastSeenBefore: offlineBefore });
-      }
-
-      for (const link of expiredLinks) {
-        const probeSucceeded = link.validation_status === 'probing' &&
-          (Number(link.validation_probed_upstream) > 0 || Number(link.validation_probed_downstream) > 0);
-        if (probeSucceeded) {
+    if (staleNodes.length || expiredLinks.length) {
+      this.db.transaction(() => {
+        for (const node of staleNodes) {
+          this.db.run("UPDATE nodes SET status = 'offline', updated_at = ? WHERE id = ?", timestamp, node.id);
           this.db.run(
-            `UPDATE topology_links SET validation_status = 'active', validation_error = NULL,
-             validation_token = NULL, validated_at = ? WHERE id = ?`,
-            timestamp, link.id,
+            `UPDATE node_configs SET required = 0
+             WHERE node_id = ? AND phase != 'activated' AND version_id IN (
+               SELECT id FROM config_versions WHERE status IN ('preparing', 'activating')
+             )`,
+            node.id,
           );
-          const versionId = this.createVersionInTransaction(link.network_id, '单向探测成功，激活数据通路');
-          this.audit('topology-link.active-on-timeout', 'topology-link', link.id, { versionId });
-          continue;
+          this.audit('agent.offline', 'node', node.id, { lastSeenBefore: offlineBefore });
         }
-        const error = link.validation_status === 'preparing'
-          ? '验证超时：Agent 未在有效期内完成准备'
-          : '验证超时：节点未在有效期内完成双向探测';
-        this.db.run(
-          `UPDATE topology_links SET validation_status = 'failed', validation_error = ?, validation_token = NULL
-           WHERE id = ?`,
-          error, link.id,
-        );
-        this.audit('topology-link.expired', 'topology-link', link.id, { previousStatus: link.validation_status, error });
-      }
 
-      const queuedCommands = this.db.all(
-        `SELECT id, payload_json FROM commands
-         WHERE status IN ('pending', 'running') AND type IN ('prepare-link-probe', 'execute-link-probe')`,
-      );
-      for (const command of queuedCommands) {
-        let payload;
-        try { payload = JSON.parse(command.payload_json); } catch { continue; }
-        if (!expiredLinkIds.has(payload.validationId)) continue;
-        this.db.run(
-          `UPDATE commands SET status = 'failed', result_json = ?, completed_at = ? WHERE id = ?`,
-          json({ ok: false, error: '连接验证已超时，命令已取消' }), timestamp, command.id,
-        );
-        cancelledCommands += 1;
-      }
-    });
+        for (const link of expiredLinks) {
+          const probeSucceeded = link.validation_status === 'probing' &&
+            (Number(link.validation_probed_upstream) > 0 || Number(link.validation_probed_downstream) > 0);
+          if (probeSucceeded) {
+            this.db.run(
+              `UPDATE topology_links SET validation_status = 'active', validation_error = NULL,
+               validation_token = NULL, validated_at = ? WHERE id = ?`,
+              timestamp, link.id,
+            );
+            const versionId = this.createVersionInTransaction(link.network_id, '单向探测成功，激活数据通路');
+            this.audit('topology-link.active-on-timeout', 'topology-link', link.id, { versionId });
+            continue;
+          }
+          const error = link.validation_status === 'preparing'
+            ? '验证超时：Agent 未在有效期内完成准备'
+            : '验证超时：节点未在有效期内完成双向探测';
+          this.db.run(
+            `UPDATE topology_links SET validation_status = 'failed', validation_error = ?, validation_token = NULL
+             WHERE id = ?`,
+            error, link.id,
+          );
+          this.audit('topology-link.expired', 'topology-link', link.id, { previousStatus: link.validation_status, error });
+        }
 
-    return { offlineNodes: staleNodes.length, expiredLinks: expiredLinks.length, cancelledCommands };
+        const queuedCommands = this.db.all(
+          `SELECT id, payload_json FROM commands
+           WHERE status IN ('pending', 'running') AND type IN ('prepare-link-probe', 'execute-link-probe')`,
+        );
+        for (const command of queuedCommands) {
+          let payload;
+          try { payload = JSON.parse(command.payload_json); } catch { continue; }
+          if (!expiredLinkIds.has(payload.validationId)) continue;
+          this.db.run(
+            `UPDATE commands SET status = 'failed', result_json = ?, completed_at = ? WHERE id = ?`,
+            json({ ok: false, error: '连接验证已超时，命令已取消' }), timestamp, command.id,
+          );
+          cancelledCommands += 1;
+        }
+      });
+    }
+
+    const advancedRollouts = this.advanceConfigurationRollouts(timestamp);
+    return { offlineNodes: staleNodes.length, expiredLinks: expiredLinks.length, cancelledCommands, advancedRollouts };
   }
 
   audit(action, resourceType, resourceId, detail = {}, actor = 'admin') {
@@ -635,6 +643,74 @@ export class ControlService {
     return true;
   }
 
+  advanceConfigurationRollout(versionId, timestamp = now()) {
+    let version = this.db.get('SELECT id, network_id, status FROM config_versions WHERE id = ?', versionId);
+    if (!version || !['preparing', 'activating'].includes(version.status)) return version?.status ?? null;
+
+    if (version.status === 'preparing') {
+      const pending = this.db.get(
+        `SELECT COUNT(*) AS count FROM node_configs
+         WHERE version_id = ? AND required = 1 AND phase NOT IN ('prepared', 'activated')`,
+        versionId,
+      );
+      if (Number(pending.count) > 0) return version.status;
+      this.db.run("UPDATE config_versions SET status = 'activating' WHERE id = ? AND status = 'preparing'", versionId);
+      version = { ...version, status: 'activating' };
+    }
+
+    const pendingActivation = this.db.get(
+      `SELECT COUNT(*) AS count FROM node_configs
+       WHERE version_id = ? AND required = 1 AND phase != 'activated'`,
+      versionId,
+    );
+    if (Number(pendingActivation.count) > 0) return version.status;
+    this.db.transaction(() => {
+      this.db.run(
+        "UPDATE config_versions SET status = 'superseded' WHERE network_id = ? AND status = 'active' AND id != ?",
+        version.network_id, versionId,
+      );
+      this.db.run("UPDATE config_versions SET status = 'active', activated_at = ? WHERE id = ?", timestamp, versionId);
+      this.applyNetworkCidrChangeInTransaction(versionId, timestamp);
+    });
+    return 'active';
+  }
+
+  advanceConfigurationRollouts(timestamp = now()) {
+    let advanced = 0;
+    const versions = this.db.all(
+      "SELECT id, status FROM config_versions WHERE status IN ('preparing', 'activating') ORDER BY version",
+    );
+    for (const version of versions) {
+      const status = this.advanceConfigurationRollout(version.id, timestamp);
+      if (status !== version.status) advanced += 1;
+    }
+    return advanced;
+  }
+
+  getAddressChange(networkId) {
+    const row = this.db.get(
+      `SELECT c.*, v.version, v.status AS rollout_status, v.reason
+       FROM network_cidr_changes c JOIN config_versions v ON v.id = c.version_id
+       WHERE c.network_id = ? AND c.status IN ('pending', 'failed')
+       ORDER BY c.created_at DESC LIMIT 1`,
+      networkId,
+    );
+    if (!row) return null;
+    return {
+      versionId: row.version_id,
+      version: Number(row.version),
+      reason: row.reason,
+      status: row.status,
+      rolloutStatus: row.rollout_status,
+      beforeCidr: row.before_cidr,
+      afterCidr: row.after_cidr,
+      assignments: JSON.parse(row.assignments_json),
+      error: row.error,
+      createdAt: row.created_at,
+      rollout: this.getConfiguration(row.version_id),
+    };
+  }
+
   listNodes(networkId) {
     const coordinatorId = this.db.get('SELECT coordinator_node_id FROM cluster_state WHERE network_id = ?', networkId)?.coordinator_node_id;
     return this.db.all('SELECT * FROM nodes WHERE network_id = ? ORDER BY is_center DESC, created_at', networkId)
@@ -872,7 +948,7 @@ export class ControlService {
     } catch (error) {
       validation = { fullyReachable: false, error: error.message, details: error.details };
     }
-    return { network, nodes, links, validation };
+    return { network, nodes, links, validation, addressChange: this.getAddressChange(networkId) };
   }
 
   replaceTopology(networkId, links) {
@@ -927,21 +1003,37 @@ export class ControlService {
       : item);
     const links = this.listLinks(node.networkId, true);
     const compiled = validateAndCompileTopology({ network, nodes, links });
+    const dataIpChanged = nextIp !== node.dataIp;
     let versionId;
     this.db.transaction(() => {
       this.db.run(
         `UPDATE nodes SET name = ?, data_ip = ?, can_relay = ?, control_endpoint = ?,
          control_listen_port = ?, data_endpoint = ?, data_listen_port = ?, updated_at = ? WHERE id = ?`,
-        nextName, nextIp, nextRelay ? 1 : 0, nextControlEndpoint, nextControlListenPort,
+        nextName, node.dataIp, nextRelay ? 1 : 0, nextControlEndpoint, nextControlListenPort,
         nextDataEndpoint, nextDataListenPort, now(), nodeId,
       );
-      versionId = this.createVersionInTransaction(node.networkId, '修改节点业务地址', compiled);
+      versionId = this.createVersionInTransaction(node.networkId, dataIpChanged ? '修改节点业务地址' : '修改节点配置', compiled);
+      if (dataIpChanged) {
+        this.db.run(
+          `INSERT INTO network_cidr_changes(
+            version_id, network_id, before_cidr, after_cidr, assignments_json, status, created_at
+          ) VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+          versionId, node.networkId, network.dataCidr, network.dataCidr,
+          json([{ nodeId, name: nextName, before: node.dataIp, after: nextIp, changed: true }]), now(),
+        );
+        const version = this.db.get('SELECT status FROM config_versions WHERE id = ?', versionId);
+        if (version?.status === 'active') this.applyNetworkCidrChangeInTransaction(versionId, now());
+      }
       this.audit('node.update', 'node', nodeId, {
         before: { name: node.name, dataIp: node.dataIp, controlEndpoint: node.controlEndpoint, controlListenPort: node.controlListenPort, dataEndpoint: node.dataEndpoint, dataListenPort: node.dataListenPort },
         after: { name: nextName, dataIp: nextIp, controlEndpoint: nextControlEndpoint, controlListenPort: nextControlListenPort, dataEndpoint: nextDataEndpoint, dataListenPort: nextDataListenPort }, versionId,
       });
     });
-    return { node: this.getNode(nodeId), version: this.getConfiguration(versionId) };
+    return {
+      node: this.getNode(nodeId),
+      ...(dataIpChanged ? { pendingNode: { ...this.getNode(nodeId), dataIp: nextIp } } : {}),
+      version: this.getConfiguration(versionId),
+    };
   }
 
   inspectNodeDeletion(nodeId) {
@@ -1395,8 +1487,9 @@ export class ControlService {
     const next = this.db.get('SELECT COALESCE(MAX(version), 0) + 1 AS version FROM config_versions WHERE network_id = ?', networkId);
     const id = randomUUID();
     const timestamp = now();
-    const onlyCenter = !this.manageLocalCenters && state.nodes.every((node) => node.isCenter);
-    const status = onlyCenter ? 'active' : 'preparing';
+    const requiredNodes = state.nodes.filter((node) => node.status === 'online');
+    const autoActivated = !this.manageLocalCenters && requiredNodes.length > 0 && requiredNodes.every((node) => node.isCenter);
+    const status = autoActivated ? 'active' : 'preparing';
     this.db.run(
       "UPDATE config_versions SET status = 'superseded' WHERE network_id = ? AND status IN ('preparing', 'activating')",
       networkId,
@@ -1413,15 +1506,16 @@ export class ControlService {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       id, networkId, Number(next.version), status, reason,
       json({ links: compiled.links, paths: compiled.paths, pathPolicies, summary: compiled.summary }), timestamp,
-      onlyCenter ? timestamp : null,
+      autoActivated ? timestamp : null,
     );
     for (const node of state.nodes) {
       const autoActivatedCenter = node.isCenter && !this.manageLocalCenters;
       const phase = autoActivatedCenter ? 'activated' : 'pending';
+      const required = node.status === 'online';
       this.db.run(
-        `INSERT INTO node_configs(version_id, node_id, phase, config_json, prepared_at, activated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        id, node.id, phase, json({ ...compiled.configs[node.id], version: Number(next.version), versionId: id }),
+        `INSERT INTO node_configs(version_id, node_id, phase, required, config_json, prepared_at, activated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        id, node.id, phase, required ? 1 : 0, json({ ...compiled.configs[node.id], version: Number(next.version), versionId: id }),
         autoActivatedCenter ? timestamp : null, autoActivatedCenter ? timestamp : null,
       );
     }
@@ -1452,12 +1546,14 @@ export class ControlService {
     if (!row) throw new Error('配置版本不存在');
     const result = this.configurationFromRow(row);
     result.nodes = this.db.all(
-      `SELECT c.node_id, n.name, c.phase, c.error, c.prepared_at, c.activated_at
+      `SELECT c.node_id, n.name, n.status AS node_status, c.phase, c.required, c.error, c.prepared_at, c.activated_at
        FROM node_configs c JOIN nodes n ON n.id = c.node_id WHERE c.version_id = ? ORDER BY n.name`, id,
     ).map((item) => ({
       nodeId: item.node_id,
       name: item.name,
+      nodeStatus: item.node_status,
       phase: item.phase,
+      required: Boolean(item.required),
       error: item.error,
       preparedAt: item.prepared_at,
       activatedAt: item.activated_at,
@@ -1601,24 +1697,7 @@ export class ControlService {
       return this.getConfiguration(versionId);
     }
 
-    if (phase === 'prepared') {
-      const pending = this.db.get(
-        "SELECT COUNT(*) AS count FROM node_configs WHERE version_id = ? AND phase NOT IN ('prepared', 'activated')", versionId,
-      );
-      if (Number(pending.count) === 0) this.db.run("UPDATE config_versions SET status = 'activating' WHERE id = ?", versionId);
-    }
-    if (phase === 'activated') {
-      const pending = this.db.get(
-        "SELECT COUNT(*) AS count FROM node_configs WHERE version_id = ? AND phase != 'activated'", versionId,
-      );
-      if (Number(pending.count) === 0) {
-        this.db.transaction(() => {
-          this.db.run("UPDATE config_versions SET status = 'superseded' WHERE network_id = ? AND status = 'active' AND id != ?", version.networkId, versionId);
-          this.db.run("UPDATE config_versions SET status = 'active', activated_at = ? WHERE id = ?", timestamp, versionId);
-          this.applyNetworkCidrChangeInTransaction(versionId, timestamp);
-        });
-      }
-    }
+    this.advanceConfigurationRollout(versionId, timestamp);
     return this.getConfiguration(versionId);
   }
 

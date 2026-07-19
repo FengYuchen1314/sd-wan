@@ -187,7 +187,8 @@ choose_port() {
 }
 
 choose_distinct_tcp_port() {
-  local label="$1" start="$2" supplied="$3" reserved="$4" selected candidate="$supplied"
+  local label="$1" start="$2" supplied="$3" reserved="$4" selected candidate
+  candidate="$supplied"
   if [[ "$start" == "$reserved" ]]; then start=$((start + 1)); fi
   while true; do
     selected="$(choose_port "$label" tcp "$start" "$candidate")"

@@ -83,6 +83,12 @@ async function load() {
     api('/api/v1/dashboard'),
     api('/api/v1/panel-status'),
   ]);
+  const controlState = document.querySelector('.control-state');
+  controlState?.classList.toggle('degraded', !state.panelStatus?.writable);
+  if (controlState) {
+    controlState.querySelector('strong').textContent = state.panelStatus?.writable ? '面板配置已同步' : '当前只读';
+    controlState.querySelector('small').textContent = state.panelStatus?.writable ? '每个节点均可管理' : '等待协调多数派恢复';
+  }
   const networks = state.dashboard.networks;
   if (!networks.some((network) => network.id === state.networkId)) state.networkId = networks[0]?.id || '';
   localStorage.setItem('pathweaver-network', state.networkId);
@@ -147,7 +153,7 @@ function renderOverview() {
         ${nodeTable(nodes.slice(0, 6), false)}
       </article>
       <article class="card">
-        <div class="card-head"><div><h2>面板同步</h2><p>任意节点面板读写同一份版本化配置</p></div><span class="status online">已同步</span></div>
+        <div class="card-head"><div><h2>面板同步</h2><p>任意节点面板读写同一份版本化配置</p></div><span class="status ${state.panelStatus?.writable ? 'online' : 'failed'}">${state.panelStatus?.writable ? '可写' : '只读'}</span></div>
         <div class="card-body section-stack">
           <div class="notice"><strong>全节点可管理</strong><span>${escapeHtml(state.panelStatus?.message || '面板配置沿现有无环控制路径实时同步；业务通路变化不会改变管理入口。')}</span></div>
           <div class="metric metric-compact"><label>待推进配置</label><strong>${totals.preparing}</strong><small>${totals.pendingCommands} 条节点命令等待完成</small></div>
@@ -158,16 +164,39 @@ function renderOverview() {
 
 function nodeTable(nodes, editable = true) {
   if (!nodes.length) return '<div class="empty"><strong>尚无节点</strong>从接入页面生成第一条安装命令。</div>';
+  const addressChange = state.topology?.addressChange;
+  const pendingAddresses = new Map((addressChange?.status === 'pending' ? addressChange.assignments : [])
+    .filter((assignment) => assignment.changed)
+    .map((assignment) => [assignment.nodeId, assignment.after]));
   return `<div class="node-list">
     <div class="node-row header"><span>节点</span><span>业务 IP</span><span>控制 IP</span><span>状态</span><span></span></div>
     ${nodes.map((node) => `<div class="node-row">
       <span class="node-identity"><span class="node-glyph">◇</span><span><strong>${escapeHtml(node.name)}</strong><small>${escapeHtml(node.id.slice(0, 12))}</small></span></span>
-      <span class="mono">${escapeHtml(node.dataIp)}</span>
+      <span class="mono">${escapeHtml(node.dataIp)}${pendingAddresses.has(node.id) && pendingAddresses.get(node.id) !== node.dataIp
+        ? `<small class="pending-ip">→ ${escapeHtml(pendingAddresses.get(node.id))}</small>` : ''}</span>
       <span class="mono">${escapeHtml(node.controlIp)}</span>
       <span class="status ${escapeHtml(node.status)}">${node.status === 'online' ? '在线' : escapeHtml(node.status)}</span>
       ${editable ? `<button class="button ghost small edit-node" data-id="${node.id}">编辑</button>` : '<span></span>'}
     </div>`).join('')}
   </div>`;
+}
+
+function renderAddressChange(change) {
+  if (!change) return '';
+  const nodes = change.rollout?.nodes || [];
+  const required = nodes.filter((node) => node.required);
+  const deferred = nodes.filter((node) => !node.required && node.phase !== 'activated');
+  const completed = required.filter((node) => change.rolloutStatus === 'preparing'
+    ? ['prepared', 'activated'].includes(node.phase)
+    : node.phase === 'activated');
+  const assignment = change.assignments?.find((item) => item.changed);
+  const subject = change.beforeCidr !== change.afterCidr
+    ? `业务网段 ${change.beforeCidr} → ${change.afterCidr}`
+    : `${assignment?.name || '节点'} 业务 IP ${assignment?.before || '—'} → ${assignment?.after || '—'}`;
+  if (change.status === 'failed') {
+    return `<div class="notice warning"><strong>地址切换失败</strong><span>${escapeHtml(subject)}：${escapeHtml(change.error || '节点未能应用配置')}。当前业务地址未改变。</span></div>`;
+  }
+  return `<div class="notice warning"><strong>正在切换地址</strong><span>${escapeHtml(subject)} · v${change.version} ${escapeHtml(change.rolloutStatus)} · 在线节点 ${completed.length}/${required.length}。${deferred.length ? `${deferred.length} 台离线节点不会阻塞切换，恢复后会自动追赶当前配置。` : '所有在线节点必须完成准备和激活。'}</span></div>`;
 }
 
 function renderNodes() {
@@ -176,6 +205,8 @@ function renderNodes() {
   const changedAssignments = preview?.assignments?.filter((assignment) => assignment.changed) || [];
   return `<div class="section-stack">
     <div class="notice"><strong>地址变更策略</strong><span>业务 IP 必须位于 ${escapeHtml(network?.dataCidr)}。保存前会检查冲突和全网路由；控制 IP 不随业务地址变化。</span></div>
+    ${state.panelStatus?.writable ? '' : `<div class="notice warning"><strong>当前不能发布</strong><span>${escapeHtml(state.panelStatus?.message || '配置协调节点尚未取得多数派租约')}。地址预检仍可使用，恢复多数派后再确认发布。</span></div>`}
+    ${renderAddressChange(state.topology?.addressChange)}
     <article class="card"><div class="card-head"><div><h2>业务网段</h2><p>选择私有地址范围或手动输入；先检测，再生成全网配置版本</p></div></div>
       <form class="card-body form-stack" id="cidr-form">
         <div class="form-grid">
@@ -186,7 +217,7 @@ function renderNodes() {
       </form>
       ${preview ? `<div class="card-body section-stack"><div class="notice"><strong>静态检测通过</strong><span>${escapeHtml(preview.after)} 可容纳 ${preview.checks.capacity} 个地址；发布准备阶段还会由各 Agent 检查本机接口和路由。</span></div>
         <div class="command-box"><code>${changedAssignments.length ? changedAssignments.map((assignment) => `${escapeHtml(assignment.name)}：${escapeHtml(assignment.before)} → ${escapeHtml(assignment.after)}`).join('<br>') : '现有节点地址均可保留'}</code></div>
-        <button class="button primary" id="apply-cidr" type="button">确认修改并发布</button></div>` : ''}
+        <button class="button primary" id="apply-cidr" type="button" ${state.panelStatus?.writable ? '' : 'disabled'}>确认修改并发布</button></div>` : ''}
     </article>
     <article class="card"><div class="card-head"><div><h2>全部节点</h2><p>${state.topology.nodes.length} 台设备 · 点击编辑手动指定业务内网 IP</p></div></div>${nodeTable(state.topology.nodes)}</article>
   </div>`;
@@ -781,10 +812,7 @@ async function previewDataCidr(event) {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
   try {
-    state.cidrPreview = await api(`/api/v1/networks/${state.networkId}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ dataCidr: form.get('dataCidr'), dryRun: true }),
-    });
+    state.cidrPreview = await api(`/api/v1/networks/${state.networkId}/data-cidr-preview?dataCidr=${encodeURIComponent(form.get('dataCidr'))}`);
     render();
     toast('静态冲突与容量检测通过');
   } catch (error) { toast(error.message, 'error'); }
@@ -793,13 +821,14 @@ async function previewDataCidr(event) {
 async function applyDataCidr() {
   if (!state.cidrPreview) return;
   try {
-    await api(`/api/v1/networks/${state.networkId}`, {
+    const result = await api(`/api/v1/networks/${state.networkId}`, {
       method: 'PATCH',
       body: JSON.stringify({ dataCidr: state.cidrPreview.after }),
     });
     state.cidrPreview = null;
     await load();
-    toast('业务网段已进入全网准备与本机路由冲突检测阶段');
+    const deferred = result.version?.nodes?.filter((node) => !node.required).length || 0;
+    toast(deferred ? `业务网段开始切换；${deferred} 台离线节点将在恢复后自动追赶` : '业务网段已进入全网准备与本机路由冲突检测阶段');
   } catch (error) { toast(error.message, 'error'); }
 }
 
@@ -848,7 +877,11 @@ function openNode(id) {
   const deleteButton = document.querySelector('#delete-node');
   deleteButton.disabled = node.isCoordinator;
   deleteButton.textContent = node.isCoordinator ? '协调节点需先迁移' : '删除节点';
-  form.querySelector('[data-form-error]').textContent = '';
+  form.querySelector('[data-form-error]').textContent = state.panelStatus?.writable
+    ? ''
+    : `${state.panelStatus?.message || '当前配置面板只读'}，暂时不能发布业务 IP。`;
+  form.querySelector('button.primary[value="default"]').disabled = !state.panelStatus?.writable;
+  form.querySelector('#delete-node').disabled = !state.panelStatus?.writable;
   document.querySelector('#node-dialog').showModal();
 }
 
@@ -1003,7 +1036,7 @@ document.querySelector('#node-form').addEventListener('submit', async (event) =>
   const form = new FormData(event.currentTarget);
   const error = event.currentTarget.querySelector('[data-form-error]');
   try {
-    await api(`/api/v1/nodes/${form.get('nodeId')}`, {
+    const result = await api(`/api/v1/nodes/${form.get('nodeId')}`, {
       method: 'PATCH',
       body: JSON.stringify({
         name: form.get('name'), dataIp: form.get('dataIp'), controlEndpoint: form.get('controlEndpoint'),
@@ -1012,7 +1045,9 @@ document.querySelector('#node-form').addEventListener('submit', async (event) =>
         canRelay: form.get('canRelay') === 'on',
       }),
     });
-    document.querySelector('#node-dialog').close(); await load(); toast('节点地址已校验并生成新配置版本');
+    document.querySelector('#node-dialog').close(); await load();
+    const deferred = result.version?.nodes?.filter((node) => !node.required).length || 0;
+    toast(deferred ? `业务地址开始切换；${deferred} 台离线节点将在恢复后自动追赶` : '节点地址已校验并生成新配置版本');
   } catch (reason) { error.textContent = reason.message; }
 });
 document.querySelector('#delete-node').addEventListener('click', deleteSelectedNode);

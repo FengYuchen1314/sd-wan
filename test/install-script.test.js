@@ -47,6 +47,8 @@ test('初始节点一键命令使用固定 GitHub 源，安装器自动补齐 No
   assert.match(installer, /command -v systemctl/);
   assert.match(installer, /EUID/);
   assert.match(installer, /choose_distinct_tcp_port "节点控制中继 TCP 端口" 8790 "\$RELAY_PORT" "\$PANEL_PORT"/);
+  assert.doesNotMatch(installer, /local[^\n]*candidate="\$supplied"/);
+  assert.match(installer, /local label="\$1" start="\$2" supplied="\$3" reserved="\$4" selected candidate\n\s+candidate="\$supplied"/);
 });
 
 test('安装时写入完全离线的本机卸载器，并区分保留数据与永久清除', () => {

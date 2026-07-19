@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS node_configs (
   version_id TEXT NOT NULL REFERENCES config_versions(id) ON DELETE CASCADE,
   node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
   phase TEXT NOT NULL,
+  required INTEGER NOT NULL DEFAULT 1,
   config_json TEXT NOT NULL,
   error TEXT,
   prepared_at TEXT,
@@ -256,6 +257,17 @@ export class Database {
     if (!proxyColumns.has('relay_path_json')) {
       this.handle.exec("ALTER TABLE managed_node_proxies ADD COLUMN relay_path_json TEXT NOT NULL DEFAULT '[]'");
     }
+    const nodeConfigColumns = new Set(this.handle.prepare('PRAGMA table_info(node_configs)').all().map((column) => column.name));
+    if (!nodeConfigColumns.has('required')) {
+      this.handle.exec('ALTER TABLE node_configs ADD COLUMN required INTEGER NOT NULL DEFAULT 1');
+    }
+    this.handle.exec(`
+      UPDATE node_configs
+      SET required = 0
+      WHERE node_id IN (SELECT id FROM nodes WHERE is_center = 0 AND status = 'offline')
+        AND version_id IN (SELECT id FROM config_versions WHERE status IN ('preparing', 'activating'))
+        AND phase != 'activated'
+    `);
     const timestamp = new Date().toISOString();
     const revision = Number(this.get('SELECT COALESCE(MAX(id), 0) AS revision FROM audit_log')?.revision || 0);
     for (const network of this.all('SELECT id FROM networks')) {

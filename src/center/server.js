@@ -249,6 +249,15 @@ function requireCoordinatorWrite() {
   }
 }
 
+function coordinatorWriteStatus() {
+  try {
+    requireCoordinatorWrite();
+    return { writable: true, reason: null };
+  } catch (error) {
+    return { writable: false, reason: error.message };
+  }
+}
+
 function clusterRevision() {
   return Math.max(0, ...service.listNetworks().map((network) => service.getClusterState(network.id).revision));
 }
@@ -419,11 +428,15 @@ async function handleAdmin(req, res, pathname, url, authenticated = false) {
   if (!authenticated) requireAdmin(req);
   if (!authenticated && await proxyPanelToCoordinator(req, res)) return;
   if (req.method === 'GET' && pathname === '/api/v1/panel-status') {
+    const writeStatus = coordinatorWriteStatus();
     return send(res, 200, {
-      synchronized: true,
+      synchronized: writeStatus.writable,
+      writable: writeStatus.writable,
       syncMode: 'quorum-replicated-control-state',
       panelPort: port,
-      message: '面板通过无环控制路径读写当前协调节点；成功写入已同步到选民多数派',
+      message: writeStatus.writable
+        ? '面板通过无环控制路径读写当前协调节点；成功写入已同步到选民多数派'
+        : writeStatus.reason,
     });
   }
   if (req.method === 'GET' && pathname === '/api/v1/dashboard') {
@@ -438,6 +451,11 @@ async function handleAdmin(req, res, pathname, url, authenticated = false) {
 
   let params = match(pathname, '/api/v1/networks/:id');
   if (req.method === 'PATCH' && params) return send(res, 200, service.updateNetwork(params.id, await readJson(req)));
+
+  params = match(pathname, '/api/v1/networks/:id/data-cidr-preview');
+  if (req.method === 'GET' && params) {
+    return send(res, 200, { preview: true, ...service.planDataCidrChange(params.id, { dataCidr: url.searchParams.get('dataCidr') }) });
+  }
 
   params = match(pathname, '/api/v1/networks/:id/nodes');
   if (req.method === 'GET' && params) return send(res, 200, { nodes: service.listNodes(params.id) });

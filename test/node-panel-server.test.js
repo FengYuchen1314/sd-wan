@@ -80,6 +80,15 @@ test('配置节点使用安装密码登录，并接受已注册节点的面板�
       body: JSON.stringify({ token: enrollment.token, name: '面板代理节点', wgDataPublicKey: 'a'.repeat(44) }),
     }).then((response) => response.json());
 
+    const previewResponse = await fetch(
+      `${baseUrl}/api/v1/networks/${networkId}/data-cidr-preview?dataCidr=${encodeURIComponent('172.20.0.0/24')}`,
+      { headers: jsonHeaders(password) },
+    );
+    assert.equal(previewResponse.status, 200);
+    const preview = await previewResponse.json();
+    assert.equal(preview.after, '172.20.0.0/24');
+    assert.equal(preview.assignments.length, 2);
+
     const proxyResponse = await fetch(`${baseUrl}/agent/v1/panel-proxy`, {
       method: 'POST',
       headers: jsonHeaders(registered.credential),
