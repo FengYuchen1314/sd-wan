@@ -34,9 +34,16 @@ test('统一对等节点安装不再要求选择中心或边缘，并为每台�
   assert.match(installer, /pathweaver-node\.service/);
 });
 
-test('初始节点一键命令使用固定 GitHub 源，安装器严格检查运行环境', () => {
+test('初始节点一键命令使用固定 GitHub 源，安装器自动补齐 Node.js 运行时', () => {
   assert.match(readme, /curl -fsSL https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main\/scripts\/install\.sh \| sudo bash -s -- --source https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main/);
-  assert.match(installer, /NODE_MAJOR == 22 && NODE_MINOR < 5/);
+  assert.match(installer, /ensure_node_runtime/);
+  assert.match(installer, /https:\/\/nodejs\.org\/dist\/latest-v22\.x/);
+  assert.match(installer, /node_runtime_supported/);
+  assert.match(installer, /major === 22 && minor >= 5/);
+  assert.match(installer, /sha256sum -c/);
+  assert.match(installer, /node-v\[0-9\]/);
+  assert.doesNotMatch(installer, /Install it before running this command/);
+  assert.doesNotMatch(readme, /请先安装 Node\.js/);
   assert.match(installer, /command -v systemctl/);
   assert.match(installer, /EUID/);
   assert.match(installer, /choose_distinct_tcp_port "节点控制中继 TCP 端口" 8790 "\$RELAY_PORT" "\$PANEL_PORT"/);

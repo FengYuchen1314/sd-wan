@@ -14,6 +14,10 @@ WIREGUARD_TOOLS_VERSION="1.0.20260223"
 WIREGUARD_TOOLS_SHA256="af459827b80bfd31b83b08077f4b5843acb7d18ad9a33a2ef532d3090f291fbf"
 WIREGUARD_RUNTIME_ROOT="/opt/pathweaver-agent/runtime"
 WIREGUARD_RUNTIME_LINK="$WIREGUARD_RUNTIME_ROOT/wireguard-current"
+NODE_DIST_BASE="${PATHWEAVER_NODE_DIST_BASE:-https://nodejs.org/dist/latest-v22.x}"
+NODE_RUNTIME_ROOT="/opt/pathweaver/runtime"
+NODE_RUNTIME_LINK="$NODE_RUNTIME_ROOT/node-current"
+export PATH="$NODE_RUNTIME_LINK/bin:$PATH"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,19 +45,84 @@ if ! command -v systemctl >/dev/null 2>&1; then
   echo "当前安装器要求使用 systemd 的 Linux 发行版。" >&2
   exit 1
 fi
-if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-  echo "安装前需要 curl 和 tar。" >&2
-  exit 1
-fi
-if ! command -v node >/dev/null 2>&1; then
-  echo "Node.js 22.5+ is required. Install it before running this command." >&2
-  exit 1
-fi
-IFS=. read -r NODE_MAJOR NODE_MINOR NODE_PATCH <<<"$(node -p 'process.versions.node')"
-if (( NODE_MAJOR < 22 || (NODE_MAJOR == 22 && NODE_MINOR < 5) )); then
-  echo "Node.js 22.5+ is required; found $(node --version)." >&2
-  exit 1
-fi
+install_base_dependencies() {
+  if command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 &&
+     command -v xz >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; then return; fi
+  echo "正在安装 PathWeaver 所需的基础工具……"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl tar xz-utils coreutils
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y ca-certificates curl tar xz coreutils
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y ca-certificates curl tar xz coreutils
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache ca-certificates curl tar xz coreutils
+  else
+    echo "无法自动安装 curl、tar、xz 和 sha256sum：不支持当前 Linux 包管理器。" >&2
+    exit 1
+  fi
+}
+
+node_runtime_supported() {
+  local executable="$1"
+  [[ -x "$executable" ]] || return 1
+  "$executable" -e '
+const [major, minor] = process.versions.node.split(".").map(Number);
+process.exit(major > 22 || (major === 22 && minor >= 5) ? 0 : 1);
+' >/dev/null 2>&1
+}
+
+ensure_node_runtime() {
+  local current_node="" node_arch="" work_dir="" checksums="" archive_name="" expected_sha="" release_dir=""
+  current_node="$(command -v node 2>/dev/null || true)"
+  if [[ -n "$current_node" ]] && node_runtime_supported "$current_node"; then
+    echo "使用兼容的 Node.js：$($current_node --version) ($current_node)"
+    return
+  fi
+
+  case "$(uname -m)" in
+    x86_64|amd64) node_arch="x64" ;;
+    aarch64|arm64) node_arch="arm64" ;;
+    *) echo "无法自动安装 Node.js：暂不支持 CPU 架构 $(uname -m)，目前支持 x86_64 和 arm64。" >&2; exit 1 ;;
+  esac
+
+  if [[ -n "$current_node" ]]; then
+    echo "检测到的 $($current_node --version 2>/dev/null || echo Node.js) 低于 22.5，正在安装 PathWeaver 私有运行时……"
+  else
+    echo "未检测到 Node.js，正在安装 PathWeaver 私有运行时……"
+  fi
+  work_dir="$(mktemp -d)"
+  checksums="$work_dir/SHASUMS256.txt"
+  curl --retry 3 --retry-delay 2 -fsSL "$NODE_DIST_BASE/SHASUMS256.txt" -o "$checksums"
+  archive_name="$(awk '{print $2}' "$checksums" | grep -E "^node-v[0-9]+\.[0-9]+\.[0-9]+-linux-${node_arch}\.tar\.xz$" | head -n 1 || true)"
+  if [[ -z "$archive_name" ]]; then
+    rm -rf -- "$work_dir"
+    echo "Node.js 下载清单中没有适用于 linux-$node_arch 的运行时。" >&2
+    exit 1
+  fi
+  expected_sha="$(awk -v archive="$archive_name" '$2 == archive { print $1; exit }' "$checksums")"
+  curl --retry 3 --retry-delay 2 -fsSL "$NODE_DIST_BASE/$archive_name" -o "$work_dir/$archive_name"
+  echo "$expected_sha  $work_dir/$archive_name" | sha256sum -c -
+
+  install -d -m 0755 "$NODE_RUNTIME_ROOT"
+  release_dir="$NODE_RUNTIME_ROOT/${archive_name%.tar.xz}-$(date +%s)-$$"
+  install -d -m 0755 "$release_dir"
+  tar -xJf "$work_dir/$archive_name" -C "$release_dir" --strip-components=1
+  if ! node_runtime_supported "$release_dir/bin/node"; then
+    rm -rf -- "$release_dir" "$work_dir"
+    echo "下载的 Node.js 运行时未通过最低版本检查。" >&2
+    exit 1
+  fi
+  ln -sfn "$release_dir" "$NODE_RUNTIME_LINK"
+  rm -rf -- "$work_dir"
+  export PATH="$NODE_RUNTIME_LINK/bin:$PATH"
+  hash -r
+  echo "Node.js $($NODE_RUNTIME_LINK/bin/node --version) 已安装到 $NODE_RUNTIME_LINK。"
+}
+
+install_base_dependencies
+ensure_node_runtime
 
 TTY_DEVICE=""
 if [[ -r /dev/tty && -w /dev/tty ]]; then TTY_DEVICE="/dev/tty"; fi
@@ -321,7 +390,7 @@ Environment=SDWAN_DATA_DIR=/var/lib/pathweaver
 Environment=SDWAN_APPLY_NETWORK=1
 Environment=SDWAN_WIREGUARD_RUNTIME_DIR=$WIREGUARD_RUNTIME_LINK
 Environment=SDWAN_WIREGUARD_DIR=/etc/wireguard
-Environment=PATH=$WIREGUARD_RUNTIME_LINK/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=$NODE_RUNTIME_LINK/bin:$WIREGUARD_RUNTIME_LINK/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EnvironmentFile=$node_env
 Restart=always
 RestartSec=5
@@ -362,7 +431,7 @@ ExecStart=$(command -v node) /opt/pathweaver/current/src/agent/agent.js ${ARGS[*
 Environment=SDWAN_APPLY_NETWORK=1
 Environment=SDWAN_AGENT_DATA_DIR=/var/lib/pathweaver-agent
 Environment=SDWAN_WIREGUARD_RUNTIME_DIR=$WIREGUARD_RUNTIME_LINK
-Environment=PATH=$WIREGUARD_RUNTIME_LINK/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=$NODE_RUNTIME_LINK/bin:$WIREGUARD_RUNTIME_LINK/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Restart=always
 RestartSec=5
 NoNewPrivileges=false
