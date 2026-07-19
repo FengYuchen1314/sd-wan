@@ -112,19 +112,19 @@
       <div class="modal-head"><div><p class="eyebrow">NEW DATA PATH</p><h2>建立节点连接</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></div>
       <div class="connection-pair" id="connection-pair"></div>
       <div class="form-grid">
-        <label><span id="node-a-address-label">节点 A 的可达 IP 或域名</span><input name="nodeAAddress" required placeholder="例如 192.168.1.10"></label>
+        <label><span id="node-a-address-label">节点 A 的可达 IP 或域名（可留空）</span><input name="nodeAAddress" placeholder="例如 192.168.1.10"></label>
         <label>节点 A WireGuard 端口<input name="nodeAPort" type="number" min="1" max="65535" required></label>
-        <label><span id="node-b-address-label">节点 B 的可达 IP 或域名</span><input name="nodeBAddress" required placeholder="例如 10.10.0.23"></label>
+        <label><span id="node-b-address-label">节点 B 的可达 IP 或域名（可留空）</span><input name="nodeBAddress" placeholder="例如 10.10.0.23"></label>
         <label>节点 B WireGuard 端口<input name="nodeBPort" type="number" min="1" max="65535" required></label>
         <label class="span-2">路径优先级<input name="priority" type="number" min="0" value="10"><small>数字越小越优先；新直连通常会成为两节点之间的首选路径。</small></label>
       </div>
-      <div class="notice"><strong>双向探测，单向成功即可建链</strong><span>两个 WireGuard 端口自动采用节点数据库中保存的监听端口，也可手动覆盖；双方可达 IP 必须由你填写。系统会同时从两端探测，只要任一端能主动连接另一端，就会激活链路并保存实际可用方向。</span></div>
+      <div class="notice"><strong>至少填写一个可达地址</strong><span>填写节点 A 的地址表示允许节点 B 主动连接 A，填写节点 B 的地址表示允许节点 A 主动连接 B。两个地址都填时执行双向探测；只填一个时仅探测该方向。任一方向成功即可建链，未填写或探测失败方向的地址不会写入 WireGuard 配置。</span></div>
       <p class="form-error" data-form-error></p>
-      <div class="modal-actions"><button class="button ghost" value="cancel">取消</button><button class="button primary" value="default">开始双向探测</button></div>
+      <div class="modal-actions"><button class="button ghost" value="cancel">取消</button><button class="button primary" value="default">开始连通性探测</button></div>
     </form>
   </dialog>
 
   <div id="toast-region" class="toast-region" aria-live="assertive"></div>
-  <script type="module" src="/app.js?v=17"></script>
+  <script type="module" src="/app.js?v=18"></script>
 </body>
 </html>

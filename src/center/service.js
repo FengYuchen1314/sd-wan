@@ -342,18 +342,14 @@ export class ControlService {
           const probeSucceeded = link.validation_status === 'probing' &&
             (Number(link.validation_probed_upstream) > 0 || Number(link.validation_probed_downstream) > 0);
           if (probeSucceeded) {
-            this.db.run(
-              `UPDATE topology_links SET validation_status = 'active', validation_error = NULL,
-               validation_token = NULL, validated_at = ? WHERE id = ?`,
-              timestamp, link.id,
+            this.activateValidatedLinkInTransaction(
+              link, timestamp, '单向探测成功，激活数据通路', 'topology-link.active-on-timeout',
             );
-            const versionId = this.createVersionInTransaction(link.network_id, '单向探测成功，激活数据通路');
-            this.audit('topology-link.active-on-timeout', 'topology-link', link.id, { versionId });
             continue;
           }
           const error = link.validation_status === 'preparing'
             ? '验证超时：Agent 未在有效期内完成准备'
-            : '验证超时：节点未在有效期内完成双向探测';
+            : '验证超时：节点未在有效期内完成已填写方向的探测';
           this.db.run(
             `UPDATE topology_links SET validation_status = 'failed', validation_error = ?, validation_token = NULL
              WHERE id = ?`,
@@ -730,7 +726,9 @@ export class ControlService {
       .map((row) => {
         const upstreamProbe = Number(row.validation_probed_upstream ?? 0);
         const downstreamProbe = Number(row.validation_probed_downstream ?? 0);
-        const directionStatus = (value) => value > 0 ? 'reachable' : value < 0 ? 'unreachable' : 'unknown';
+        const upstreamRequested = Boolean(row.downstream_endpoint) || upstreamProbe !== 0;
+        const downstreamRequested = Boolean(row.upstream_endpoint) || downstreamProbe !== 0;
+        const directionStatus = (value, requested) => !requested ? 'not-requested' : value > 0 ? 'reachable' : value < 0 ? 'unreachable' : 'unknown';
         return ({
         id: row.id,
         upstreamId: row.upstream_id,
@@ -742,17 +740,18 @@ export class ControlService {
         validationError: row.validation_error,
         validationProgress: {
           prepared: Number(row.validation_prepared_upstream ?? 0) + Number(row.validation_prepared_downstream ?? 0),
+          requested: Number(upstreamRequested) + Number(downstreamRequested),
           probed: Number(upstreamProbe !== 0) + Number(downstreamProbe !== 0),
           successful: Number(upstreamProbe > 0) + Number(downstreamProbe > 0),
           failed: Number(upstreamProbe < 0) + Number(downstreamProbe < 0),
         },
         probeDirections: {
           upstreamToDownstream: {
-            status: directionStatus(upstreamProbe),
+            status: directionStatus(upstreamProbe, upstreamRequested),
             error: row.validation_probe_error_upstream ?? null,
           },
           downstreamToUpstream: {
-            status: directionStatus(downstreamProbe),
+            status: directionStatus(downstreamProbe, downstreamRequested),
             error: row.validation_probe_error_downstream ?? null,
           },
         },
@@ -1177,12 +1176,15 @@ export class ControlService {
       networkId, upstream.id, downstream.id, downstream.id, upstream.id,
     );
 
-    const upstreamHost = normalizeReachableHost(input.nodeAAddress, `${upstream.name} 的可达地址`);
-    const downstreamHost = normalizeReachableHost(input.nodeBAddress, `${downstream.name} 的可达地址`);
-    const upstreamPort = normalizePort(input.nodeAPort, `${upstream.name} 的 WireGuard 端口`, upstream.dataListenPort);
-    const downstreamPort = normalizePort(input.nodeBPort, `${downstream.name} 的 WireGuard 端口`, downstream.dataListenPort);
-    const upstreamEndpoint = `${upstreamHost}:${upstreamPort}`;
-    const downstreamEndpoint = `${downstreamHost}:${downstreamPort}`;
+    const upstreamAddress = String(input.nodeAAddress ?? '').trim();
+    const downstreamAddress = String(input.nodeBAddress ?? '').trim();
+    if (!upstreamAddress && !downstreamAddress) throw new Error('至少填写一个节点可被对方访问的 IP 或域名');
+    const upstreamEndpoint = upstreamAddress
+      ? `${normalizeReachableHost(upstreamAddress, `${upstream.name} 的可达地址`)}:${normalizePort(input.nodeAPort, `${upstream.name} 的 WireGuard 端口`, upstream.dataListenPort)}`
+      : null;
+    const downstreamEndpoint = downstreamAddress
+      ? `${normalizeReachableHost(downstreamAddress, `${downstream.name} 的可达地址`)}:${normalizePort(input.nodeBPort, `${downstream.name} 的 WireGuard 端口`, downstream.dataListenPort)}`
+      : null;
     const priority = Math.max(0, Number.isInteger(Number(input.priority)) ? Number(input.priority) : 10);
     const id = randomUUID();
     const validationToken = `pwv_${randomBytes(24).toString('base64url')}`;
@@ -1759,22 +1761,26 @@ export class ControlService {
         this.db.run("UPDATE topology_links SET validation_status = 'probing' WHERE id = ?", link.id);
         const upstream = this.getNode(updated.upstream_id);
         const downstream = this.getNode(updated.downstream_id);
-        this.enqueueCommand(updated.upstream_id, 'execute-link-probe', {
-          validationId: link.id,
-          probeId: randomUUID(),
-          maxHops: 16,
-          token: updated.validation_token,
-          remoteUrl: probeUrl(downstream, updated.downstream_endpoint),
-          expectedNodeId: updated.downstream_id,
-        });
-        this.enqueueCommand(updated.downstream_id, 'execute-link-probe', {
-          validationId: link.id,
-          probeId: randomUUID(),
-          maxHops: 16,
-          token: updated.validation_token,
-          remoteUrl: probeUrl(upstream, updated.upstream_endpoint),
-          expectedNodeId: updated.upstream_id,
-        });
+        if (updated.downstream_endpoint) {
+          this.enqueueCommand(updated.upstream_id, 'execute-link-probe', {
+            validationId: link.id,
+            probeId: randomUUID(),
+            maxHops: 16,
+            token: updated.validation_token,
+            remoteUrl: probeUrl(downstream, updated.downstream_endpoint),
+            expectedNodeId: updated.downstream_id,
+          });
+        }
+        if (updated.upstream_endpoint) {
+          this.enqueueCommand(updated.downstream_id, 'execute-link-probe', {
+            validationId: link.id,
+            probeId: randomUUID(),
+            maxHops: 16,
+            token: updated.validation_token,
+            remoteUrl: probeUrl(upstream, updated.upstream_endpoint),
+            expectedNodeId: updated.upstream_id,
+          });
+        }
       }
       return;
     }
@@ -1789,30 +1795,48 @@ export class ControlService {
     const updated = this.db.get('SELECT * FROM topology_links WHERE id = ?', link.id);
     const successes = Number(updated.validation_probed_upstream > 0) + Number(updated.validation_probed_downstream > 0);
     const completed = Number(updated.validation_probed_upstream !== 0) + Number(updated.validation_probed_downstream !== 0);
+    const requested = Number(Boolean(updated.downstream_endpoint)) + Number(Boolean(updated.upstream_endpoint));
     if (link.validation_status === 'active') {
       return;
     }
-    if (completed < 2) return;
+    if (completed < requested) return;
     if (successes > 0) {
-      let versionId;
       this.db.transaction(() => {
-        this.db.run(
-          `UPDATE topology_links SET validation_status = 'active', validation_error = NULL,
-           validation_token = NULL, validated_at = ? WHERE id = ?`, now(), link.id,
-        );
-        versionId = this.createVersionInTransaction(link.network_id, '新增已验证的数据通路');
-        this.audit('topology-link.active', 'topology-link', link.id, { versionId });
+        this.activateValidatedLinkInTransaction(link, now(), '新增已验证的数据通路', 'topology-link.active');
       });
       return;
     }
-    if (completed === 2) {
+    if (completed === requested) {
       const errors = [updated.validation_probe_error_upstream, updated.validation_probe_error_downstream].filter(Boolean);
       this.db.run(
         `UPDATE topology_links SET validation_status = 'failed', validation_error = ?, validation_token = NULL WHERE id = ?`,
-        errors.join('；') || '两个方向均无法建立连接', link.id,
+        errors.join('；') || '所有已填写方向均无法建立连接', link.id,
       );
       this.audit('topology-link.failed', 'topology-link', link.id, { errors }, `node:${nodeId}`);
     }
+  }
+
+  activateValidatedLinkInTransaction(link, timestamp, reason, auditAction) {
+    this.db.run(
+      `UPDATE topology_links SET validation_status = 'active', validation_error = NULL,
+       upstream_endpoint = CASE WHEN validation_probed_downstream > 0 THEN upstream_endpoint ELSE '' END,
+       downstream_endpoint = CASE WHEN validation_probed_upstream > 0 THEN downstream_endpoint ELSE '' END,
+       validation_token = NULL, validated_at = ? WHERE id = ?`,
+      timestamp, link.id,
+    );
+    const validated = this.db.get(
+      'SELECT validation_probed_upstream, validation_probed_downstream FROM topology_links WHERE id = ?',
+      link.id,
+    );
+    const versionId = this.createVersionInTransaction(link.network_id, reason);
+    this.audit(auditAction, 'topology-link', link.id, {
+      versionId,
+      usableDirections: {
+        upstreamToDownstream: Number(validated.validation_probed_upstream) > 0,
+        downstreamToUpstream: Number(validated.validation_probed_downstream) > 0,
+      },
+    });
+    return versionId;
   }
 
   dashboard() {

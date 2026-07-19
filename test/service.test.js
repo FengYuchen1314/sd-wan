@@ -235,6 +235,71 @@ test('双向探测只要一个方向成功即可建链，并使用数据库中�
     assert.equal(active.validationProgress.failed, 1);
     assert.equal(active.probeDirections.upstreamToDownstream.status, 'unreachable');
     assert.equal(active.probeDirections.downstreamToUpstream.status, 'reachable');
+    assert.equal(active.upstreamEndpoint, '192.168.50.10:21001');
+    assert.equal(active.downstreamEndpoint, '');
+  } finally { database.close(); }
+});
+
+test('只填写一个可达地址时仅探测该方向，成功后建立单向发起链路', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
+    const nodeA = service.registerAgent({
+      token: tokenA.token,
+      name: '单地址节点 A',
+      controlListenPort: 19101,
+      dataListenPort: 21101,
+      wgDataPublicKey: 'a'.repeat(44),
+      dataEndpoint: '192.168.60.10:21101',
+    }).node;
+    const tokenB = service.createJoinToken(network.id, { parentId: center.id });
+    const nodeB = service.registerAgent({
+      token: tokenB.token,
+      name: '单地址节点 B',
+      controlListenPort: 19102,
+      dataListenPort: 21102,
+      wgDataPublicKey: 'b'.repeat(44),
+      dataEndpoint: '10.30.40.50:21102',
+    }).node;
+
+    const candidate = service.createLinkValidation(network.id, {
+      nodeAId: nodeA.id,
+      nodeBId: nodeB.id,
+      nodeAAddress: '192.168.60.10',
+    });
+    assert.equal(candidate.validationProgress.requested, 1);
+    assert.equal(candidate.upstreamEndpoint, '192.168.60.10:21101');
+    assert.equal(candidate.downstreamEndpoint, null);
+
+    for (const node of [nodeA, nodeB]) {
+      const command = service.claimCommand(node.id);
+      assert.equal(command.type, 'prepare-link-probe');
+      service.completeCommand(node.id, command.id, { ok: true });
+    }
+
+    assert.equal(service.claimCommand(nodeA.id), null);
+    const probeB = service.claimCommand(nodeB.id);
+    assert.equal(probeB.type, 'execute-link-probe');
+    assert.equal(probeB.payload.remoteUrl, 'http://192.168.60.10:19101');
+    service.completeCommand(nodeB.id, probeB.id, { ok: true, remoteNodeId: nodeA.id });
+
+    const active = service.listLinks(network.id).find((link) => link.id === candidate.id);
+    assert.equal(active.validationStatus, 'active');
+    assert.equal(active.validationProgress.requested, 1);
+    assert.equal(active.upstreamEndpoint, '192.168.60.10:21101');
+    assert.equal(active.downstreamEndpoint, '');
+    assert.equal(active.probeDirections.upstreamToDownstream.status, 'not-requested');
+    assert.equal(active.probeDirections.downstreamToUpstream.status, 'reachable');
+
+    const version = service.listConfigurations(network.id)[0];
+    const configA = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, nodeA.id,
+    ).config_json);
+    const configB = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, nodeB.id,
+    ).config_json);
+    assert.equal(configA.data.peers.find((peer) => peer.nodeId === nodeB.id).endpoint, '');
+    assert.equal(configB.data.peers.find((peer) => peer.nodeId === nodeA.id).endpoint, '192.168.60.10:21101');
   } finally { database.close(); }
 });
 
@@ -379,6 +444,9 @@ test('新增连接拒绝非法互访地址和重复节点对', () => {
     const edge = service.registerAgent({ token: token.token, name: '边缘', wgDataPublicKey: 'c'.repeat(44) }).node;
     const token2 = service.createJoinToken(network.id, { parentId: center.id });
     const edge2 = service.registerAgent({ token: token2.token, name: '边缘 2', wgDataPublicKey: 'd'.repeat(44) }).node;
+    assert.throws(() => service.createLinkValidation(network.id, {
+      nodeAId: edge.id, nodeBId: edge2.id,
+    }), /至少填写一个/);
     assert.throws(() => service.createLinkValidation(network.id, {
       nodeAId: edge.id, nodeBId: edge2.id, nodeAAddress: 'https://bad.example', nodeBAddress: '10.0.0.2',
     }), /不要包含协议/);

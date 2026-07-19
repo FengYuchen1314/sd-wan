@@ -367,9 +367,9 @@ function graphPath(from, to) {
 
 function linkStatusText(link) {
   if (link.validationStatus === 'preparing') return `等待 Agent ${link.validationProgress?.prepared || 0}/2`;
-  if (link.validationStatus === 'probing') return `双向探测 ${link.validationProgress?.probed || 0}/2`;
+  if (link.validationStatus === 'probing') return `连通性探测 ${link.validationProgress?.probed || 0}/${link.validationProgress?.requested || 1}`;
   if (link.validationStatus === 'failed') return link.validationError?.includes('超时') ? '验证超时' : '验证失败';
-  if (link.validationProgress?.successful === 1 && link.validationProgress?.failed === 1) return '单向可用';
+  if (link.validationProgress?.successful === 1) return '单向可用';
   return '';
 }
 
@@ -411,7 +411,7 @@ function renderTopology() {
   const probing = state.topology.links.filter((link) => link.validationStatus === 'probing').length;
   const validationText = [
     waiting ? `${waiting} 条等待 Agent` : '',
-    probing ? `${probing} 条正在双向探测（任一方向成功即可）` : '',
+    probing ? `${probing} 条正在探测已填写方向（任一成功即可）` : '',
   ].filter(Boolean).join(' · ') || '可建立直连或查看端到端路径';
   const selectionText = selected.length === 0
     ? '点击画布中的两个节点'
@@ -425,7 +425,7 @@ function renderTopology() {
       <div class="graph-actions"><button class="button ghost" id="clear-node-selection" ${selected.length ? '' : 'disabled'}>取消选择</button><button class="button ghost" id="connect-selected" ${selected.length === 2 ? '' : 'disabled'}>建立连接</button><button class="button primary" id="detail-selected" ${selected.length === 2 ? '' : 'disabled'}>详细配置</button></div>
     </div>
     ${renderTopologyGraph()}
-    <div class="graph-legend"><span>已验证通路</span><span class="waiting">等待 Agent</span><span class="probing">双向探测 · 单向成功可用</span><span class="failed">两个方向均失败</span><span class="graph-legend-hint">点击节点进行选择</span></div>
+    <div class="graph-legend"><span>已验证通路</span><span class="waiting">等待 Agent</span><span class="probing">按填写方向探测 · 任一成功可用</span><span class="failed">所填方向均失败</span><span class="graph-legend-hint">点击节点进行选择</span></div>
   </article>`;
 }
 
@@ -864,8 +864,8 @@ function openConnectionDialog() {
   form.elements.nodeBPort.value = reachablePort(nodeB);
   form.elements.priority.value = 10;
   document.querySelector('#connection-pair').innerHTML = `<strong>${escapeHtml(nodeA.name)}</strong><span>↔</span><strong>${escapeHtml(nodeB.name)}</strong>`;
-  document.querySelector('#node-a-address-label').textContent = `手动填写 ${nodeA.name} 可被 ${nodeB.name} 访问的 IP 或域名`;
-  document.querySelector('#node-b-address-label').textContent = `手动填写 ${nodeB.name} 可被 ${nodeA.name} 访问的 IP 或域名`;
+  document.querySelector('#node-a-address-label').textContent = `${nodeA.name} 可被 ${nodeB.name} 访问的 IP 或域名（可留空）`;
+  document.querySelector('#node-b-address-label').textContent = `${nodeB.name} 可被 ${nodeA.name} 访问的 IP 或域名（可留空）`;
   form.querySelector('[data-form-error]').textContent = '';
   document.querySelector('#connection-dialog').showModal();
 }
@@ -1072,23 +1072,31 @@ document.querySelector('#connection-form').addEventListener('submit', async (eve
   const form = new FormData(event.currentTarget);
   const error = event.currentTarget.querySelector('[data-form-error]');
   error.textContent = '';
+  const nodeAAddress = String(form.get('nodeAAddress') || '').trim();
+  const nodeBAddress = String(form.get('nodeBAddress') || '').trim();
+  if (!nodeAAddress && !nodeBAddress) {
+    error.textContent = '至少填写一个节点可被对方访问的 IP 或域名';
+    return;
+  }
   try {
-    await api(`/api/v1/networks/${state.networkId}/links`, {
+    const result = await api(`/api/v1/networks/${state.networkId}/links`, {
       method: 'POST',
       body: JSON.stringify({
         nodeAId: form.get('nodeAId'),
         nodeBId: form.get('nodeBId'),
-        nodeAAddress: form.get('nodeAAddress'),
-        nodeBAddress: form.get('nodeBAddress'),
-        nodeAPort: Number(form.get('nodeAPort')),
-        nodeBPort: Number(form.get('nodeBPort')),
+        nodeAAddress,
+        nodeBAddress,
+        nodeAPort: nodeAAddress ? Number(form.get('nodeAPort')) : undefined,
+        nodeBPort: nodeBAddress ? Number(form.get('nodeBPort')) : undefined,
         priority: Number(form.get('priority')),
       }),
     });
     document.querySelector('#connection-dialog').close();
     state.selectedNodeIds = [];
     await load();
-    toast('端口已按节点数据库记录提交；正在执行双向探测，任一方向成功即可建链');
+    toast(result.validationProgress?.requested === 1
+      ? '正在探测唯一填写的方向；成功后即建立连接'
+      : '正在执行双向探测；任一方向成功即可建链，失败方向不会保存');
   } catch (reason) { error.textContent = reason.message; }
 });
 
