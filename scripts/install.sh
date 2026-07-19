@@ -344,7 +344,7 @@ install_node_bundle() {
   else
     rm -f -- "$bundle"
     bundle="$(mktemp)"
-    curl -fsSL "https://github.com/FengYuchen1314/sd-wan/archive/refs/heads/main.tar.gz" -o "$bundle"
+    curl -fsSL "https://github.com/FengYuchen1314/sd-wan/archive/refs/heads/main.tar.gz?cache=$(date +%s)" -o "$bundle"
     archive_root="$(tar -tzf "$bundle" | awk -F/ 'NR == 1 { root = $1 } END { print root }')"
     tar -xzf "$bundle" -C "$release" --strip-components=1 "$archive_root"
   fi

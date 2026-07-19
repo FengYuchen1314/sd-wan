@@ -1129,7 +1129,8 @@ export class ControlService {
     let command;
     if (mode === 'passive') {
       publicSourceUrl = PASSIVE_GITHUB_SOURCE;
-      command = `curl -fsSL '${publicSourceUrl}/scripts/install.sh' | sudo bash -s -- --source '${publicSourceUrl}' --claim-token '${token}'`;
+      const installerUrl = `${publicSourceUrl}/scripts/install.sh?cache=${Date.now()}`;
+      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${publicSourceUrl}' --claim-token '${token}'`;
     } else {
       const requestedEndpoint = endpointDetails(input.sourceUrl) || endpointDetails(parent.controlEndpoint);
       const parentProtocol = String(input.parentProtocol || requestedEndpoint?.protocol || 'http').replace(':', '').toLowerCase();

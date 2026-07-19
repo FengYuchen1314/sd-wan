@@ -35,8 +35,9 @@ test('统一对等节点安装不再要求选择中心或边缘，并为每台�
 });
 
 test('初始节点一键命令使用固定 GitHub 源，安装器自动补齐 Node.js 运行时', () => {
-  assert.match(readme, /curl -fsSL https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main\/scripts\/install\.sh \| sudo bash -s -- --source https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main/);
+  assert.match(readme, /curl -fsSL "https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main\/scripts\/install\.sh\?cache=\$\(date \+%s\)" \| sudo bash -s -- --source https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main/);
   assert.match(installer, /ensure_node_runtime/);
+  assert.match(installer, /archive\/refs\/heads\/main\.tar\.gz\?cache=\$\(date \+%s\)/);
   assert.match(installer, /https:\/\/nodejs\.org\/dist\/latest-v22\.x/);
   assert.match(installer, /node_runtime_supported/);
   assert.match(installer, /major === 22 && minor >= 5/);

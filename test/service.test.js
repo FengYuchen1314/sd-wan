@@ -123,7 +123,7 @@ test('被动认领固定从指定 GitHub 仓库安装，命令不要求目标访
       parentHost: '',
     });
     assert.equal(enrollment.publicSourceUrl, 'https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main');
-    assert.match(enrollment.command, /raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main\/scripts\/install\.sh/);
+    assert.match(enrollment.command, /raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main\/scripts\/install\.sh\?cache=\d+/);
     assert.match(enrollment.command, /--source 'https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main'/);
     assert.match(enrollment.command, /--claim-token/);
     assert.doesNotMatch(enrollment.command, /--data-port/);
