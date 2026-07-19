@@ -74,6 +74,8 @@ test('已安装节点支持无交互原地更新，并在服务异常时自动�
   assert.match(installer, /services_healthy/);
   assert.match(installer, /patch_private_wireguard_runtime/);
   assert.match(installer, /PATHWEAVER_WG_QUICK_NO_AUTO_SU/);
+  assert.match(installer, /\^\[\[:space:\]\]\*auto_su\[\[:space:\]\]\*\$/);
+  assert.match(installer, /s\/auto_su\/\[\[ "\$\{PATHWEAVER_WG_QUICK_NO_AUTO_SU:-0\}" == "1" \]\] \|\| auto_su/);
   assert.match(readme, /--source https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main --update/);
   assert.match(readme, /数据库、节点密钥、面板端口、WireGuard 端口与当前网络配置/);
 });

@@ -236,7 +236,7 @@ install_private_wireguard_runtime() {
   build_dir="$(mktemp -d)"
   trap 'rm -rf -- "$build_dir"' RETURN
   archive="$build_dir/wireguard-tools.tar.xz"
-  if ! curl -fsSL "$SOURCE/artifacts/wireguard/wireguard-tools-$WIREGUARD_TOOLS_VERSION.tar.xz" -o "$archive"; then
+  if ! curl -fsSL "$SOURCE/artifacts/wireguard/wireguard-tools-$WIREGUARD_TOOLS_VERSION.tar.xz" -o "$archive" 2>/dev/null; then
     rm -f -- "$archive"
     curl -fsSL "https://git.zx2c4.com/wireguard-tools/snapshot/wireguard-tools-$WIREGUARD_TOOLS_VERSION.tar.xz" -o "$archive"
   fi
@@ -254,7 +254,10 @@ install_private_wireguard_runtime() {
   install -d -m 0755 "$release_dir/bin"
   install -m 0755 "$source_dir/src/wg" "$release_dir/bin/wg"
   install -m 0755 "$source_dir/src/wg-quick/linux.bash" "$release_dir/bin/wg-quick"
-  patch_private_wireguard_runtime "$release_dir/bin/wg-quick"
+  if ! patch_private_wireguard_runtime "$release_dir/bin/wg-quick"; then
+    rm -rf -- "$release_dir"
+    exit 1
+  fi
   cat >"$release_dir/runtime.json" <<EOF
 {"schemaVersion":1,"toolsVersion":"$WIREGUARD_TOOLS_VERSION","installedAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","managedBy":"pathweaver"}
 EOF
@@ -265,17 +268,23 @@ EOF
 }
 
 patch_private_wireguard_runtime() {
-  local quick="${1:-$WIREGUARD_RUNTIME_LINK/bin/wg-quick}"
+  local quick="${1:-$WIREGUARD_RUNTIME_LINK/bin/wg-quick}" call_count
   if [[ ! -f "$quick" ]]; then
     echo "PathWeaver 私有 wg-quick 不存在：$quick" >&2
-    exit 1
+    return 1
   fi
   if ! grep -q 'PATHWEAVER_WG_QUICK_NO_AUTO_SU' "$quick"; then
-    if ! grep -q '^auto_su$' "$quick"; then
+    call_count="$(grep -Ec '^[[:space:]]*auto_su[[:space:]]*$' "$quick" || true)"
+    if [[ "$call_count" -lt 1 ]]; then
       echo "无法识别 PathWeaver 私有 wg-quick 的提权入口，拒绝修改。" >&2
-      exit 1
+      return 1
     fi
-    sed -i 's/^auto_su$/if [[ "${PATHWEAVER_WG_QUICK_NO_AUTO_SU:-0}" != "1" ]]; then auto_su; fi/' "$quick"
+    sed -i '/^[[:space:]]*auto_su[[:space:]]*$/s/auto_su/[[ "${PATHWEAVER_WG_QUICK_NO_AUTO_SU:-0}" == "1" ]] || auto_su/' "$quick"
+  fi
+  if grep -Eq '^[[:space:]]*auto_su[[:space:]]*$' "$quick" ||
+     ! grep -q 'PATHWEAVER_WG_QUICK_NO_AUTO_SU' "$quick"; then
+    echo "PathWeaver 私有 wg-quick 提权入口修补后校验失败。" >&2
+    return 1
   fi
   chmod 0755 "$quick"
 }
@@ -330,7 +339,7 @@ install_node_bundle() {
   release="/opt/pathweaver/releases/node-$(date +%s)-$$"
   install -d -m 0755 "$release"
   bundle="$(mktemp)"
-  if curl -fsSL "$SOURCE/artifacts/center/pathweaver-center.tar.gz" -o "$bundle"; then
+  if curl -fsSL "$SOURCE/artifacts/center/pathweaver-center.tar.gz" -o "$bundle" 2>/dev/null; then
     tar -xzf "$bundle" -C "$release"
   else
     rm -f -- "$bundle"
@@ -382,7 +391,11 @@ update_node() {
   fi
   install -m 0755 "$new_release/scripts/uninstall.sh" /usr/local/sbin/pathweaver-uninstall
   if [[ -x "$WIREGUARD_RUNTIME_LINK/bin/wg-quick" ]]; then
-    patch_private_wireguard_runtime
+    if ! patch_private_wireguard_runtime; then
+      ln -sfn "$previous_release" /opt/pathweaver/current
+      echo "私有 WireGuard 运行时修补失败，已恢复旧程序版本，服务没有重启。" >&2
+      exit 1
+    fi
   else
     echo "私有 WireGuard 运行时缺失，正在重新安装……"
     install_private_wireguard_runtime
