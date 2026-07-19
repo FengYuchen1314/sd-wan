@@ -14,6 +14,16 @@ curl -fsSL https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main/scripts/
 
 > 推送到 GitHub `main` 分支后上述命令才可下载本仓库。公网部署应使用 HTTPS 反向代理，并只向可信管理网开放面板；通过纯 HTTP 传递安装包不具备抗中间人篡改能力。
 
+## 已安装节点原地更新
+
+仓库推送到 GitHub `main` 分支后，在需要更新的节点执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main/scripts/install.sh | sudo bash -s -- --source https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main --update
+```
+
+更新模式不会再次询问端口或密码，也不会重新初始化节点。它只替换 `/opt/pathweaver/current` 指向的程序版本并重启已有服务，保留数据库、节点密钥、面板端口、WireGuard 端口与当前网络配置；如果新版服务不能保持运行，会自动恢复到更新前的版本。父节点更新完成后，其 `/install.sh` 和安装包接口会自动向后续节点分发新版。
+
 ## 本机离线卸载
 
 安装完成后，卸载器已经保存在本机，不需要访问 GitHub、面板或其他节点。卸载节点前，建议先在面板删除该节点；如果它是当前配置协调节点，应先等待或完成协调权迁移。

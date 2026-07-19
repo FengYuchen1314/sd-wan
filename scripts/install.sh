@@ -10,6 +10,7 @@ RELAY_PORT=""
 DATA_PORT=""
 REACHABLE_HOST=""
 PANEL_PASSWORD=""
+UPDATE_ONLY=0
 WIREGUARD_TOOLS_VERSION="1.0.20260223"
 WIREGUARD_TOOLS_SHA256="af459827b80bfd31b83b08077f4b5843acb7d18ad9a33a2ef532d3090f291fbf"
 WIREGUARD_RUNTIME_ROOT="/opt/pathweaver-agent/runtime"
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
     --reachable-host) REACHABLE_HOST="$2"; shift 2 ;;
     --panel-password) PANEL_PASSWORD="$2"; shift 2 ;;
     --admin-token) PANEL_PASSWORD="$2"; shift 2 ;;
+    --update) UPDATE_ONLY=1; shift ;;
     --listen) shift ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
@@ -324,6 +326,65 @@ install_node_bundle() {
   ln -sfn "$release" /opt/pathweaver/current
 }
 
+installed_services() {
+  local service
+  for service in pathweaver-agent.service pathweaver-node.service; do
+    if [[ -f "/etc/systemd/system/$service" ]]; then printf '%s\n' "$service"; fi
+  done
+}
+
+services_healthy() {
+  local service
+  for service in "$@"; do
+    if ! systemctl is-active --quiet "$service"; then return 1; fi
+  done
+}
+
+update_node() {
+  local previous_release new_release
+  local -a services=()
+  previous_release="$(readlink -f /opt/pathweaver/current 2>/dev/null || true)"
+  if [[ -z "$previous_release" || ! -d "$previous_release" || ! -f /etc/systemd/system/pathweaver-node.service ]]; then
+    echo "未检测到完整的 PathWeaver 安装，请先执行初始节点或接入节点安装命令。" >&2
+    exit 2
+  fi
+  mapfile -t services < <(installed_services)
+  if [[ "${#services[@]}" -eq 0 ]]; then
+    echo "未找到可更新的 PathWeaver systemd 服务。" >&2
+    exit 2
+  fi
+
+  echo "正在下载并校验 PathWeaver 新版本……"
+  install_node_bundle
+  new_release="$(readlink -f /opt/pathweaver/current 2>/dev/null || true)"
+  if [[ -z "$new_release" || ! -f "$new_release/package.json" ||
+        ! -f "$new_release/scripts/install.sh" || ! -f "$new_release/src/center/server.js" ]]; then
+    ln -sfn "$previous_release" /opt/pathweaver/current
+    echo "下载的版本不完整，已恢复旧版本，服务没有重启。" >&2
+    exit 1
+  fi
+  install -m 0755 "$new_release/scripts/uninstall.sh" /usr/local/sbin/pathweaver-uninstall
+
+  systemctl daemon-reload
+  if ! systemctl restart "${services[@]}"; then
+    ln -sfn "$previous_release" /opt/pathweaver/current
+    systemctl daemon-reload
+    systemctl restart "${services[@]}" || true
+    echo "新版服务启动失败，已自动恢复旧版本。" >&2
+    exit 1
+  fi
+  sleep 2
+  if ! services_healthy "${services[@]}"; then
+    ln -sfn "$previous_release" /opt/pathweaver/current
+    systemctl daemon-reload
+    systemctl restart "${services[@]}" || true
+    echo "新版服务未保持运行，已自动恢复旧版本。" >&2
+    exit 1
+  fi
+
+  echo "PathWeaver 已原地更新并重启。数据库、节点密钥、端口、密码和 WireGuard 配置均已保留。"
+}
+
 install_node() {
   local endpoint_host control_endpoint data_endpoint node_env panel_password_hash panel_proxy_token bootstrap
   bootstrap=0
@@ -482,4 +543,8 @@ if [[ "$SOURCE" == "__PATHWEAVER_SOURCE__" ]]; then
   echo "安装源未设置；请使用任意已入网节点生成的命令，或传入 --source URL。" >&2
   exit 2
 fi
-install_node
+if [[ "$UPDATE_ONLY" -eq 1 ]]; then
+  update_node
+else
+  install_node
+fi

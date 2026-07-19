@@ -64,3 +64,14 @@ test('安装时写入完全离线的本机卸载器，并区分保留数据与�
   assert.match(readme, /sudo pathweaver-uninstall/);
   assert.match(readme, /sudo pathweaver-uninstall --purge/);
 });
+
+test('已安装节点支持无交互原地更新，并在服务异常时自动回滚', () => {
+  assert.match(installer, /--update\) UPDATE_ONLY=1/);
+  assert.match(installer, /if \[\[ "\$UPDATE_ONLY" -eq 1 \]\]; then\s+update_node/);
+  assert.match(installer, /previous_release="\$\(readlink -f \/opt\/pathweaver\/current/);
+  assert.match(installer, /systemctl restart "\$\{services\[@\]\}"/);
+  assert.match(installer, /ln -sfn "\$previous_release" \/opt\/pathweaver\/current/);
+  assert.match(installer, /services_healthy/);
+  assert.match(readme, /--source https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main --update/);
+  assert.match(readme, /数据库、节点密钥、面板端口、WireGuard 端口与当前网络配置/);
+});
