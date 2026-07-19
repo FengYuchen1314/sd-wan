@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS join_tokens (
   token_hash TEXT NOT NULL UNIQUE,
   network_id TEXT NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
   parent_id TEXT REFERENCES nodes(id),
+  parent_data_endpoint TEXT,
   mode TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   max_uses INTEGER NOT NULL,
@@ -291,6 +292,10 @@ export class Database {
     const nodeConfigColumns = new Set(this.handle.prepare('PRAGMA table_info(node_configs)').all().map((column) => column.name));
     if (!nodeConfigColumns.has('required')) {
       this.handle.exec('ALTER TABLE node_configs ADD COLUMN required INTEGER NOT NULL DEFAULT 1');
+    }
+    const joinTokenColumns = new Set(this.handle.prepare('PRAGMA table_info(join_tokens)').all().map((column) => column.name));
+    if (!joinTokenColumns.has('parent_data_endpoint')) {
+      this.handle.exec('ALTER TABLE join_tokens ADD COLUMN parent_data_endpoint TEXT');
     }
     this.handle.exec(`
       UPDATE node_configs

@@ -96,6 +96,59 @@ test('一次性令牌注册节点并自动加入所选父节点', () => {
   } finally { database.close(); }
 });
 
+test('IX 主动加入不会因本机 NAT 端口无效而从节点列表回滚', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    database.run('UPDATE nodes SET data_endpoint = NULL WHERE id = ?', center.id);
+    const token = service.createJoinToken(network.id, {
+      parentId: center.id,
+      parentHost: 'panel-gateway.example',
+      parentPort: 19773,
+      parentDataHost: 'london-wg.example',
+      parentDataPort: 31801,
+    });
+    assert.deepEqual(token.parentDataConnection, {
+      host: 'london-wg.example', port: 31801, endpoint: 'london-wg.example:31801',
+    });
+    const ix = service.registerAgent({
+      token: token.token,
+      name: '上海 IX',
+      dataEndpoint: '10.20.30.40:19801',
+      dataListenPort: 19801,
+      wgDataPublicKey: 'i'.repeat(44),
+    }).node;
+    assert.ok(service.listNodes(network.id).some((node) => node.id === ix.id));
+    const link = service.listLinks(network.id, true).find((item) => item.downstreamId === ix.id);
+    assert.equal(link.upstreamEndpoint, 'london-wg.example:31801');
+    assert.equal(link.downstreamEndpoint, '');
+    const version = service.listConfigurations(network.id)[0];
+    const parentConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, center.id,
+    ).config_json);
+    const ixConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, ix.id,
+    ).config_json);
+    assert.equal(parentConfig.data.peers.find((peer) => peer.nodeId === ix.id).endpoint, null);
+    assert.equal(parentConfig.data.peers.find((peer) => peer.nodeId === ix.id).endpointMode, 'dynamic-learn');
+    assert.equal(ixConfig.data.peers.find((peer) => peer.nodeId === center.id).endpoint, 'london-wg.example:31801');
+    assert.equal(ixConfig.data.peers.find((peer) => peer.nodeId === center.id).endpointMode, 'static-dial');
+
+    const legacyToken = service.createJoinToken(network.id, {
+      parentId: center.id,
+      parentHost: 'panel-gateway.example',
+      parentDataHost: 'london-wg.example',
+    });
+    database.run('UPDATE join_tokens SET parent_data_endpoint = NULL WHERE id = ?', legacyToken.id);
+    const legacyIx = service.registerAgent({
+      token: legacyToken.token, name: '旧令牌 IX', wgDataPublicKey: 'j'.repeat(44),
+    }).node;
+    assert.ok(service.listNodes(network.id).some((node) => node.id === legacyIx.id));
+    const legacyLink = service.listLinks(network.id, true).find((item) => item.downstreamId === legacyIx.id);
+    assert.equal(legacyLink.upstreamEndpoint, 'center.example:51820');
+    assert.equal(legacyLink.downstreamEndpoint, '');
+  } finally { database.close(); }
+});
+
 test('修改业务 IP 生成新版本并拒绝地址冲突', () => {
   const { database, service, network, center } = fixture();
   try {
@@ -275,6 +328,17 @@ test('双向探测只要一个方向成功即可建链，并使用数据库中�
     assert.equal(active.probeDirections.downstreamToUpstream.status, 'reachable');
     assert.equal(active.upstreamEndpoint, '192.168.50.10:21001');
     assert.equal(active.downstreamEndpoint, '');
+    const version = service.listConfigurations(network.id)[0];
+    const configA = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, nodeA.id,
+    ).config_json);
+    const configB = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, nodeB.id,
+    ).config_json);
+    assert.equal(configA.data.peers.find((peer) => peer.nodeId === nodeB.id).endpoint, null);
+    assert.equal(configA.data.peers.find((peer) => peer.nodeId === nodeB.id).endpointMode, 'dynamic-learn');
+    assert.equal(configB.data.peers.find((peer) => peer.nodeId === nodeA.id).endpoint, '192.168.50.10:21001');
+    assert.equal(configB.data.peers.find((peer) => peer.nodeId === nodeA.id).endpointMode, 'static-dial');
   } finally { database.close(); }
 });
 

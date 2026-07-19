@@ -687,19 +687,23 @@ function renderJoin() {
   const mode = state.joinMode || result?.mode || 'active';
   const selectedParent = nodes.find((node) => node.id === (state.joinParentId || result?.parent?.id)) || nodes[0];
   const parentConnection = controlConnection(selectedParent);
+  const parentDataConnection = wireGuardConnection(selectedParent, parentConnection.host);
   return `<div class="join-layout">
     <article class="card"><div class="card-head"><div><h2>生成安装命令</h2><p>${mode === 'passive' ? '选择负责主动连接待认领设备的已入网节点' : '选择新设备实际能够访问的接入节点'}</p></div></div>
       <form class="card-body form-stack" id="join-form">
         <div class="segmented"><label><input type="radio" name="mode" value="active" ${mode === 'active' ? 'checked' : ''}><span>设备主动加入</span></label><label><input type="radio" name="mode" value="passive" ${mode === 'passive' ? 'checked' : ''}><span>已入网节点主动认领</span></label></div>
-        <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '这里只配置接入节点入口'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。' : '所有设备安装同一套节点服务和完整面板；面板端口、登录密码、控制中继端口与 WireGuard 端口均在新设备本机交互设置。'}</span></div>
+        <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '新设备主动拨号父节点'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。' : '控制入口和 WireGuard UDP 入口分别保存到一次性令牌；新设备自己的 NAT 地址和监听端口不会写到父节点 Endpoint。'}</span></div>
         <label>${mode === 'passive' ? '执行认领的已入网节点' : '接入节点'}<select name="parentId">${nodes.map((node) => {
           const connection = controlConnection(node);
-          return `<option value="${node.id}" data-host="${escapeHtml(connection.host)}" data-port="${connection.port}" data-protocol="${connection.protocol}" ${node.id === selectedParent?.id ? 'selected' : ''}>${escapeHtml(node.name)} · ${escapeHtml(node.controlIp)}</option>`;
+          const dataConnection = wireGuardConnection(node, connection.host);
+          return `<option value="${node.id}" data-host="${escapeHtml(connection.host)}" data-port="${connection.port}" data-protocol="${connection.protocol}" data-data-host="${escapeHtml(dataConnection.host)}" data-data-port="${dataConnection.port}" ${node.id === selectedParent?.id ? 'selected' : ''}>${escapeHtml(node.name)} · ${escapeHtml(node.controlIp)}</option>`;
         }).join('')}</select></label>
         ${mode === 'active' ? `<div class="form-grid">
           <label>接入协议<select name="parentProtocol"><option value="http" ${parentConnection.protocol === 'http' ? 'selected' : ''}>HTTP</option><option value="https" ${parentConnection.protocol === 'https' ? 'selected' : ''}>HTTPS</option></select></label>
           <label>父节点控制端口<input name="parentPort" type="number" min="1" max="65535" required value="${parentConnection.port || ''}"></label>
           <label class="span-2">新设备能访问的父节点 IP 或域名<input name="parentHost" required value="${escapeHtml(parentConnection.host)}" placeholder="选择父节点后自动填充，也可覆盖"></label>
+          <label>父节点 WireGuard IP 或域名<input name="parentDataHost" required value="${escapeHtml(parentDataConnection.host)}" placeholder="默认跟随父节点入口，也可覆盖"></label>
+          <label>父节点 WireGuard UDP 端口<input name="parentDataPort" type="number" min="1" max="65535" required value="${parentDataConnection.port || ''}"></label>
         </div>` : '<div class="notice"><strong>固定 GitHub 安装源</strong><span><a href="https://github.com/FengYuchen1314/sd-wan" target="_blank" rel="noreferrer">FengYuchen1314/sd-wan</a> · main。目标设备下载与其他设备完全相同的节点服务、面板和 Agent。</span></div>'}
         <label>令牌有效时间（分钟）<input name="ttlMinutes" type="number" min="5" max="1440" value="30"></label>
         <button class="button primary" type="submit">${mode === 'passive' ? '生成 GitHub 节点安装命令' : '生成一次性命令'}</button>
@@ -707,7 +711,7 @@ function renderJoin() {
     </article>
     <article class="card"><div class="card-head"><div><h2>可复制命令</h2><p>令牌仅显示一次，默认使用后立即失效</p></div>${result ? '<button class="button ghost small" id="copy-command">复制命令</button>' : ''}</div>
       <div class="card-body section-stack">
-        <div class="command-box">${result ? `<code>${escapeHtml(result.command)}</code><div class="command-meta"><span>入口：${escapeHtml(result.parent.name)}</span><span>有效至 ${formatDate(result.expiresAt)}</span></div>` : '<div class="empty"><strong>等待生成</strong>命令将绑定节点组、父节点和短时效认证令牌。</div>'}</div>
+        <div class="command-box">${result ? `<code>${escapeHtml(result.command)}</code><div class="command-meta"><span>入口：${escapeHtml(result.parent.name)}</span>${result.parentDataConnection ? `<span>WireGuard：${escapeHtml(result.parentDataConnection.endpoint)}</span>` : ''}<span>有效至 ${formatDate(result.expiresAt)}</span></div>` : '<div class="empty"><strong>等待生成</strong>命令将绑定节点组、父节点和短时效认证令牌。</div>'}</div>
         <div class="notice"><strong>${mode === 'passive' ? '单向被动认领' : '传递式安装'}</strong><span>${mode === 'passive' ? '目标节点不需要反向访问接入节点；认领方会持续代理控制通信，目标本机仍提供完整面板。' : '任意已入网节点都能传递同一份安装包；新设备加入后立即拥有本机面板，所有操作实时写入全网版本化配置。'}</span></div>
         ${result?.mode === 'passive' ? `<form id="adopt-form" class="form-stack">
           <div class="form-grid"><label>待认领节点 IP 或域名<input name="targetHost" required placeholder="安装脚本最后显示的地址"></label><label>待认领节点控制端口<input name="targetPort" type="number" min="1" max="65535" required placeholder="由目标节点安装时选择"></label></div>
@@ -732,6 +736,25 @@ function controlConnection(node) {
     } catch {}
   }
   return { protocol, host, port };
+}
+
+function wireGuardConnection(node, fallbackHost = '') {
+  let host = fallbackHost;
+  let port = Number(node?.dataListenPort || currentNetwork()?.listenPort || 19801);
+  const endpoint = String(node?.dataEndpoint || '').trim();
+  if (endpoint.startsWith('[')) {
+    const closing = endpoint.indexOf(']');
+    if (closing > 0) {
+      host = endpoint.slice(0, closing + 1);
+      const parsedPort = Number(endpoint.slice(closing + 2));
+      if (Number.isInteger(parsedPort)) port = parsedPort;
+    }
+  } else if (endpoint.lastIndexOf(':') > 0) {
+    host = endpoint.slice(0, endpoint.lastIndexOf(':'));
+    const parsedPort = Number(endpoint.slice(endpoint.lastIndexOf(':') + 1));
+    if (Number.isInteger(parsedPort)) port = parsedPort;
+  }
+  return { host, port };
 }
 
 function renderRollouts() {
@@ -804,6 +827,8 @@ function bindViewEvents() {
     if (form.elements.parentHost) form.elements.parentHost.value = option?.dataset.host || '';
     if (form.elements.parentPort) form.elements.parentPort.value = option?.dataset.port || '';
     if (form.elements.parentProtocol) form.elements.parentProtocol.value = option?.dataset.protocol || 'http';
+    if (form.elements.parentDataHost) form.elements.parentDataHost.value = option?.dataset.dataHost || option?.dataset.host || '';
+    if (form.elements.parentDataPort) form.elements.parentDataPort.value = option?.dataset.dataPort || '';
   });
   document.querySelector('#copy-command')?.addEventListener('click', async () => {
     try {
@@ -950,6 +975,8 @@ async function createJoinToken(event) {
         parentProtocol: form.get('parentProtocol') || undefined,
         parentHost: form.get('parentHost') || undefined,
         parentPort: form.get('parentPort') ? Number(form.get('parentPort')) : undefined,
+        parentDataHost: form.get('parentDataHost') || undefined,
+        parentDataPort: form.get('parentDataPort') ? Number(form.get('parentDataPort')) : undefined,
         ttlMinutes: Number(form.get('ttlMinutes')),
       }),
     });

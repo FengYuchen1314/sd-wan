@@ -1184,7 +1184,7 @@ export class ControlService {
   }
 
   createJoinToken(networkId, input = {}) {
-    this.getNetwork(networkId);
+    const network = this.getNetwork(networkId);
     const parent = this.getNode(input.parentId);
     if (parent.networkId !== networkId) throw new Error('父节点不属于当前节点组');
     if (!parent.canRelay) throw new Error('所选父节点未启用下级接入能力');
@@ -1195,6 +1195,8 @@ export class ControlService {
     const expiresAt = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
     let sourceUrl = null;
     let parentConnection = null;
+    let parentDataConnection = null;
+    let parentDataEndpoint = null;
     let publicSourceUrl = null;
     let command;
     if (mode === 'passive') {
@@ -1215,16 +1217,32 @@ export class ControlService {
       );
       sourceUrl = `${parentProtocol}://${parentHost}:${parentPort}`;
       parentConnection = { protocol: parentProtocol, host: parentHost, port: parentPort, url: sourceUrl };
+      const parentDataHost = normalizeReachableHost(
+        input.parentDataHost || hostFromEndpoint(parent.dataEndpoint) || parentHost,
+        `${parent.name} 的 WireGuard 可达地址`,
+      );
+      const parentDataPort = normalizePort(
+        input.parentDataPort,
+        `${parent.name} 的 WireGuard 端口`,
+        endpointPort(parent.dataEndpoint) || parent.dataListenPort || network.listenPort || DEFAULT_DATA_PORT,
+      );
+      parentDataEndpoint = `${parentDataHost}:${parentDataPort}`;
+      parentDataConnection = { host: parentDataHost, port: parentDataPort, endpoint: parentDataEndpoint };
       const installerUrl = `${sourceUrl}/install.sh`;
       command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${sourceUrl}' --join-token '${token}' --upstream '${sourceUrl}'`;
     }
     this.db.run(
-      `INSERT INTO join_tokens(id, token_hash, network_id, parent_id, mode, expires_at, max_uses, used_count, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?)`,
-      id, hashSecret(token), networkId, parent.id, mode, expiresAt, now(),
+      `INSERT INTO join_tokens(
+        id, token_hash, network_id, parent_id, parent_data_endpoint, mode, expires_at, max_uses, used_count, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?)`,
+      id, hashSecret(token), networkId, parent.id, parentDataEndpoint, mode, expiresAt, now(),
     );
-    this.audit('join-token.create', 'join-token', id, { networkId, parentId: parent.id, mode, expiresAt, parentConnection });
-    return { id, token, mode, expiresAt, parent, sourceUrl, publicSourceUrl, parentConnection, command };
+    this.audit('join-token.create', 'join-token', id, {
+      networkId, parentId: parent.id, mode, expiresAt, parentConnection, parentDataConnection,
+    });
+    return {
+      id, token, mode, expiresAt, parent, sourceUrl, publicSourceUrl, parentConnection, parentDataConnection, command,
+    };
   }
 
   createLinkValidation(networkId, input) {
@@ -1339,8 +1357,10 @@ export class ControlService {
           randomUUID(), network.id, parent.id, nodeId, input.dataEndpoint, timestamp,
         );
       } else {
-        const parentEndpoint = parent.dataEndpoint || null;
-        if (!parentEndpoint) throw new Error(`父节点 ${parent.name} 尚未配置可供新节点拨入的 WireGuard 地址`);
+        const parentControlHost = endpointDetails(parent.controlEndpoint)?.host || null;
+        const parentEndpoint = token.parent_data_endpoint || parent.dataEndpoint || (parentControlHost
+          ? `${parentControlHost}:${parent.dataListenPort || network.listenPort || DEFAULT_DATA_PORT}`
+          : null);
         this.db.run(
           `INSERT INTO topology_links(
             id, network_id, upstream_id, downstream_id, priority, upstream_endpoint, downstream_endpoint, created_at
