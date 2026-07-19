@@ -96,7 +96,7 @@
         <label>接入中继地址<input name="controlEndpoint" placeholder="http://公网或内网IP:8790"></label>
         <label>控制中继 TCP 端口<input name="controlListenPort" type="number" min="1" max="65535" required></label>
         <label>WireGuard 监听端口<input name="dataListenPort" type="number" min="1" max="65535" required></label>
-        <label>WireGuard 数据端点<input name="dataEndpoint" placeholder="公网或内网IP:19801"></label>
+        <label>供其他节点拨入的 WireGuard 固定端点<input name="dataEndpoint" placeholder="公网或内网IP:19801；NAT 后可留空"></label>
         <label class="toggle-line span-2"><input name="canRelay" type="checkbox"><span>允许作为下级节点的接入和控制中继</span></label>
       </div>
       <div class="notice warning"><strong>版本化变更</strong><span>保存后将生成全网配置版本。新 IP、下一跳和所有相关 AllowedIPs 会一起下发。</span></div>
@@ -113,18 +113,18 @@
       <div class="connection-pair" id="connection-pair"></div>
       <div class="form-grid">
         <label><span id="node-a-address-label">节点 A 的可达 IP 或域名（可留空）</span><input name="nodeAAddress" placeholder="例如 192.168.1.10"></label>
-        <label>节点 A WireGuard 端口<input name="nodeAPort" type="number" min="1" max="65535" required></label>
+        <label><span id="node-a-port-label">节点 A 固定入口端口</span><input name="nodeAPort" type="number" min="1" max="65535" required></label>
         <label><span id="node-b-address-label">节点 B 的可达 IP 或域名（可留空）</span><input name="nodeBAddress" placeholder="例如 10.10.0.23"></label>
-        <label>节点 B WireGuard 端口<input name="nodeBPort" type="number" min="1" max="65535" required></label>
+        <label><span id="node-b-port-label">节点 B 固定入口端口</span><input name="nodeBPort" type="number" min="1" max="65535" required></label>
         <label class="span-2">路径优先级<input name="priority" type="number" min="0" value="10"><small>数字越小越优先；新直连通常会成为两节点之间的首选路径。</small></label>
       </div>
-      <div class="notice"><strong>至少填写一个可达地址</strong><span>填写节点 A 的地址表示允许节点 B 主动连接 A，填写节点 B 的地址表示允许节点 A 主动连接 B。两个地址都填时执行双向探测；只填一个时仅探测该方向。任一方向成功即可建链，未填写或探测失败方向的地址不会写入 WireGuard 配置。</span></div>
+      <div class="notice"><strong>NAT 节点不要填写自己的入口</strong><span>填写节点 A 的地址表示节点 B 主动拨号到 A，填写节点 B 的地址表示节点 A 主动拨号到 B。若 IX 只能主动连接海外节点，只填写海外节点的固定地址和端口；IX 一侧保持空白，海外节点会从 WireGuard 认证握手中动态学习 NAT 出口地址和端口。</span></div>
       <p class="form-error" data-form-error></p>
       <div class="modal-actions"><button class="button ghost" value="cancel">取消</button><button class="button primary" value="default">开始连通性探测</button></div>
     </form>
   </dialog>
 
   <div id="toast-region" class="toast-region" aria-live="assertive"></div>
-  <script type="module" src="/app.js?v=18"></script>
+  <script type="module" src="/app.js?v=19"></script>
 </body>
 </html>

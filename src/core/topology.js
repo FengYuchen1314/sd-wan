@@ -96,13 +96,19 @@ export function validateAndCompileTopology({ network, nodes, links }) {
     if (linkKeys.has(key)) throw new TopologyError('两个节点之间存在重复连接', { link });
     linkKeys.add(key);
     const priority = Number.isInteger(Number(link.priority)) ? Math.max(0, Number(link.priority)) : 100;
+    const upstreamEndpoint = link.upstreamEndpoint === undefined
+      ? nodeById.get(upstreamId).dataEndpoint ?? null
+      : link.upstreamEndpoint || null;
+    const downstreamEndpoint = link.downstreamEndpoint === undefined
+      ? nodeById.get(downstreamId).dataEndpoint ?? null
+      : link.downstreamEndpoint || null;
     const normalized = {
       ...(link.id ? { id: link.id } : {}),
       upstreamId,
       downstreamId,
       priority,
-      upstreamEndpoint: link.upstreamEndpoint ?? null,
-      downstreamEndpoint: link.downstreamEndpoint ?? null,
+      upstreamEndpoint,
+      downstreamEndpoint,
       validationStatus: link.validationStatus ?? 'active',
     };
     normalizedLinks.push(normalized);
@@ -155,14 +161,16 @@ export function validateAndCompileTopology({ network, nodes, links }) {
       .sort(([a], [b]) => stableCompare(a, b))
       .map(([peerId, route]) => {
         const peer = nodeById.get(peerId);
+        const endpoint = route.endpoint || null;
         return {
           nodeId: peerId,
           name: peer.name,
           publicKey: peer.wgDataPublicKey ?? '',
-          endpoint: route.endpoint ?? peer.dataEndpoint ?? null,
+          endpoint,
+          endpointMode: endpoint ? 'static-dial' : 'dynamic-learn',
           probeIp: peer.dataIp,
           allowedIps: route.allowedIps.sort(),
-          persistentKeepalive: 25,
+          persistentKeepalive: endpoint ? 25 : null,
         };
       });
 

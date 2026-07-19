@@ -48,6 +48,10 @@ const service = new ControlService(database, {
 });
 const wireGuardArtifacts = new WireGuardArtifactStore(join(dataDir, 'artifacts', 'wireguard'));
 service.ensureDefaultNetwork();
+const endpointSemanticMigration = service.ensureEndpointSemanticConfigurations();
+for (const failure of endpointSemanticMigration.errors) {
+  console.warn(`WireGuard NAT 拨号方向迁移失败 (${failure.networkId})：${failure.error}`);
+}
 if (promotedNodeId) service.promoteCoordinator(promotedNodeId, promotedTerm);
 const centerDataPlane = new CenterDataPlane(service, {
   dataDir,

@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS topology_links (
   validation_probe_error_downstream TEXT,
   validation_expires_at TEXT,
   validated_at TEXT,
+  endpoint_semantics_version INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
 
@@ -241,10 +242,40 @@ export class Database {
       ['validation_probe_error_downstream', 'TEXT'],
       ['validation_expires_at', 'TEXT'],
       ['validated_at', 'TEXT'],
+      ['endpoint_semantics_version', 'INTEGER NOT NULL DEFAULT 0'],
     ];
     for (const [name, definition] of additions) {
       if (!columns.has(name)) this.handle.exec(`ALTER TABLE topology_links ADD COLUMN ${name} ${definition}`);
     }
+    this.handle.exec(`
+      UPDATE topology_links
+      SET upstream_endpoint = CASE
+            WHEN upstream_endpoint IS NOT NULL THEN upstream_endpoint
+            WHEN EXISTS (
+              SELECT 1 FROM nodes child
+              WHERE child.id = topology_links.downstream_id AND child.parent_id = topology_links.upstream_id
+            ) THEN COALESCE((SELECT data_endpoint FROM nodes WHERE id = topology_links.upstream_id), '')
+            WHEN EXISTS (
+              SELECT 1 FROM nodes child
+              WHERE child.id = topology_links.upstream_id AND child.parent_id = topology_links.downstream_id
+            ) THEN ''
+            ELSE COALESCE((SELECT data_endpoint FROM nodes WHERE id = topology_links.upstream_id), '')
+          END,
+          downstream_endpoint = CASE
+            WHEN downstream_endpoint IS NOT NULL THEN downstream_endpoint
+            WHEN EXISTS (
+              SELECT 1 FROM nodes child
+              WHERE child.id = topology_links.upstream_id AND child.parent_id = topology_links.downstream_id
+            ) THEN COALESCE((SELECT data_endpoint FROM nodes WHERE id = topology_links.downstream_id), '')
+            WHEN EXISTS (
+              SELECT 1 FROM nodes child
+              WHERE child.id = topology_links.downstream_id AND child.parent_id = topology_links.upstream_id
+            ) THEN ''
+            ELSE COALESCE((SELECT data_endpoint FROM nodes WHERE id = topology_links.downstream_id), '')
+          END,
+          endpoint_semantics_version = 1
+      WHERE endpoint_semantics_version = 0
+    `);
 
     const nodeColumns = new Set(this.handle.prepare('PRAGMA table_info(nodes)').all().map((column) => column.name));
     if (!nodeColumns.has('control_listen_port')) {
@@ -350,7 +381,10 @@ export class Database {
       for (const table of SNAPSHOT_TABLES) {
         const columns = this.all(`PRAGMA table_info(${table})`).map((column) => column.name);
         const allowed = new Set(columns);
-        for (const row of snapshot.tables[table]) {
+        for (const snapshotRow of snapshot.tables[table]) {
+          const row = table === 'topology_links' && !Object.hasOwn(snapshotRow, 'endpoint_semantics_version')
+            ? { ...snapshotRow, endpoint_semantics_version: 0 }
+            : snapshotRow;
           const keys = Object.keys(row);
           if (!keys.length || keys.some((key) => !allowed.has(key))) throw new Error(`协调快照中的 ${table} 字段无效`);
           const placeholders = keys.map(() => '?').join(', ');
@@ -369,6 +403,7 @@ export class Database {
     } finally {
       this.handle.exec('PRAGMA foreign_keys = ON;');
     }
+    this.migrate();
     return { revision: Number(snapshot.revision || 0) };
   }
 

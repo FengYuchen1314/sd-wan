@@ -53,8 +53,45 @@ test('一次性令牌注册节点并自动加入所选父节点', () => {
     assert.equal(result.node.parentId, center.id);
     assert.equal(result.node.dataIp, '10.77.0.2');
     assert.equal(result.node.dataListenPort, 51820);
-    assert.equal(service.listLinks(network.id).length, 1);
+    const initialLink = service.listLinks(network.id)[0];
+    assert.equal(initialLink.upstreamEndpoint, center.dataEndpoint);
+    assert.equal(initialLink.downstreamEndpoint, '');
+    const version = service.listConfigurations(network.id)[0];
+    const centerConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, center.id,
+    ).config_json);
+    const childConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, result.node.id,
+    ).config_json);
+    assert.equal(centerConfig.data.peers.find((peer) => peer.nodeId === result.node.id).endpoint, null);
+    assert.equal(centerConfig.data.peers.find((peer) => peer.nodeId === result.node.id).endpointMode, 'dynamic-learn');
+    assert.equal(childConfig.data.peers.find((peer) => peer.nodeId === center.id).endpoint, center.dataEndpoint);
+    assert.equal(childConfig.data.peers.find((peer) => peer.nodeId === center.id).endpointMode, 'static-dial');
     assert.equal(service.getTopology(network.id).validation.fullyReachable, true);
+    database.run(
+      'UPDATE topology_links SET upstream_endpoint = NULL, downstream_endpoint = NULL, endpoint_semantics_version = 0 WHERE id = ?',
+      initialLink.id,
+    );
+    database.migrate();
+    const migrated = service.listLinks(network.id)[0];
+    assert.equal(migrated.upstreamEndpoint, center.dataEndpoint);
+    assert.equal(migrated.downstreamEndpoint, '');
+    for (const row of database.all('SELECT node_id, config_json FROM node_configs WHERE version_id = ?', version.id)) {
+      const legacyConfig = JSON.parse(row.config_json);
+      for (const peer of legacyConfig.data.peers) delete peer.endpointMode;
+      database.run(
+        'UPDATE node_configs SET config_json = ? WHERE version_id = ? AND node_id = ?',
+        JSON.stringify(legacyConfig), version.id, row.node_id,
+      );
+    }
+    const regenerated = service.ensureEndpointSemanticConfigurations();
+    assert.equal(regenerated.created.length, 1);
+    assert.equal(regenerated.errors.length, 0);
+    const regeneratedConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', regenerated.created[0].versionId, center.id,
+    ).config_json);
+    assert.equal(regeneratedConfig.data.peers[0].endpoint, null);
+    assert.equal(regeneratedConfig.data.peers[0].endpointMode, 'dynamic-learn');
     assert.throws(() => service.registerAgent({ token: enrollment.token, name: '重复使用' }), /已过期或已使用/);
   } finally { database.close(); }
 });
@@ -299,8 +336,11 @@ test('只填写一个可达地址时仅探测该方向，成功后建立单向�
     const configB = JSON.parse(database.get(
       'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, nodeB.id,
     ).config_json);
-    assert.equal(configA.data.peers.find((peer) => peer.nodeId === nodeB.id).endpoint, '');
+    assert.equal(configA.data.peers.find((peer) => peer.nodeId === nodeB.id).endpoint, null);
+    assert.equal(configA.data.peers.find((peer) => peer.nodeId === nodeB.id).endpointMode, 'dynamic-learn');
+    assert.equal(configA.data.peers.find((peer) => peer.nodeId === nodeB.id).persistentKeepalive, null);
     assert.equal(configB.data.peers.find((peer) => peer.nodeId === nodeA.id).endpoint, '192.168.60.10:21101');
+    assert.equal(configB.data.peers.find((peer) => peer.nodeId === nodeA.id).endpointMode, 'static-dial');
   } finally { database.close(); }
 });
 

@@ -846,6 +846,16 @@ function reachablePort(node) {
   return Number(currentNetwork()?.listenPort || 19801);
 }
 
+function syncConnectionEndpointInputs(form) {
+  for (const suffix of ['A', 'B']) {
+    const address = form.elements[`node${suffix}Address`];
+    const port = form.elements[`node${suffix}Port`];
+    const enabled = Boolean(String(address.value || '').trim());
+    port.disabled = !enabled;
+    port.required = enabled;
+  }
+}
+
 function openConnectionDialog() {
   if (state.selectedNodeIds.length !== 2) return;
   const [nodeA, nodeB] = state.selectedNodeIds.map((id) => state.topology.nodes.find((node) => node.id === id));
@@ -862,6 +872,7 @@ function openConnectionDialog() {
   form.elements.nodeBAddress.value = '';
   form.elements.nodeAPort.value = reachablePort(nodeA);
   form.elements.nodeBPort.value = reachablePort(nodeB);
+  syncConnectionEndpointInputs(form);
   form.elements.priority.value = 10;
   document.querySelector('#connection-pair').innerHTML = `<strong>${escapeHtml(nodeA.name)}</strong><span>↔</span><strong>${escapeHtml(nodeB.name)}</strong>`;
   document.querySelector('#node-a-address-label').textContent = `${nodeA.name} 可被 ${nodeB.name} 访问的 IP 或域名（可留空）`;
@@ -1065,6 +1076,10 @@ document.querySelector('#node-form').addEventListener('submit', async (event) =>
   } catch (reason) { error.textContent = reason.message; }
 });
 document.querySelector('#delete-node').addEventListener('click', deleteSelectedNode);
+
+for (const input of document.querySelectorAll('#connection-form [name="nodeAAddress"], #connection-form [name="nodeBAddress"]')) {
+  input.addEventListener('input', (event) => syncConnectionEndpointInputs(event.currentTarget.form));
+}
 
 document.querySelector('#connection-form').addEventListener('submit', async (event) => {
   event.preventDefault();

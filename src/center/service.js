@@ -239,14 +239,16 @@ function applyPreferredPath(compiled, state, pathNodeIds) {
     let peer = config.data.peers.find((item) => item.nodeId === nextHopId);
     if (!peer) {
       const endpoint = link.upstreamId === sourceId ? link.downstreamEndpoint : link.upstreamEndpoint;
+      const staticEndpoint = endpoint || null;
       peer = {
         nodeId: nextHopId,
         name: nextHop.name,
         publicKey: nextHop.wgDataPublicKey ?? '',
-        endpoint: endpoint || nextHop.dataEndpoint || null,
+        endpoint: staticEndpoint,
+        endpointMode: staticEndpoint ? 'static-dial' : 'dynamic-learn',
         probeIp: nextHop.dataIp,
         allowedIps: [],
-        persistentKeepalive: 25,
+        persistentKeepalive: staticEndpoint ? 25 : null,
       };
       config.data.peers.push(peer);
     }
@@ -269,14 +271,16 @@ function attachFailedLinkHealthPeers(compiled, state, failedLinkIds) {
       const peerNode = nodeById.get(peerId);
       if (!config || !peerNode) continue;
       if (!config.data.peers.some((peer) => peer.nodeId === peerId)) {
+        const staticEndpoint = explicitEndpoint || null;
         config.data.peers.push({
           nodeId: peerId,
           name: peerNode.name,
           publicKey: peerNode.wgDataPublicKey ?? '',
-          endpoint: explicitEndpoint ?? peerNode.dataEndpoint ?? null,
+          endpoint: staticEndpoint,
+          endpointMode: staticEndpoint ? 'static-dial' : 'dynamic-learn',
           probeIp: peerNode.dataIp,
           allowedIps: [],
-          persistentKeepalive: 25,
+          persistentKeepalive: staticEndpoint ? 25 : null,
           healthProbeOnly: true,
         });
         config.data.peers.sort((left, right) => String(left.nodeId).localeCompare(String(right.nodeId)));
@@ -423,6 +427,38 @@ export class ControlService {
       'UPDATE cluster_state SET revision = MAX(revision, ?), updated_at = ?',
       Number(result.lastInsertRowid || 0), now(),
     );
+  }
+
+  ensureEndpointSemanticConfigurations() {
+    const created = [];
+    const errors = [];
+    for (const network of this.db.all('SELECT id FROM networks ORDER BY created_at')) {
+      const latest = this.db.get(
+        'SELECT id FROM config_versions WHERE network_id = ? ORDER BY version DESC LIMIT 1',
+        network.id,
+      );
+      if (!latest) continue;
+      const configs = this.db.all('SELECT config_json FROM node_configs WHERE version_id = ?', latest.id);
+      const needsMigration = configs.some((row) => {
+        try {
+          return (JSON.parse(row.config_json)?.data?.peers ?? []).some((peer) => !peer.endpointMode);
+        } catch {
+          return true;
+        }
+      });
+      if (!needsMigration) continue;
+      try {
+        let versionId;
+        this.db.transaction(() => {
+          versionId = this.createVersionInTransaction(network.id, '迁移 WireGuard NAT 拨号方向');
+          this.audit('topology-link.endpoint-semantics', 'network', network.id, { versionId });
+        });
+        created.push({ networkId: network.id, versionId });
+      } catch (error) {
+        errors.push({ networkId: network.id, error: error.message });
+      }
+    }
+    return { created, errors };
   }
 
   ensureDefaultNetwork() {
@@ -1303,9 +1339,13 @@ export class ControlService {
           randomUUID(), network.id, parent.id, nodeId, input.dataEndpoint, timestamp,
         );
       } else {
+        const parentEndpoint = parent.dataEndpoint || null;
+        if (!parentEndpoint) throw new Error(`父节点 ${parent.name} 尚未配置可供新节点拨入的 WireGuard 地址`);
         this.db.run(
-          'INSERT INTO topology_links(id, network_id, upstream_id, downstream_id, priority, created_at) VALUES (?, ?, ?, ?, 100, ?)',
-          randomUUID(), network.id, parent.id, nodeId, timestamp,
+          `INSERT INTO topology_links(
+            id, network_id, upstream_id, downstream_id, priority, upstream_endpoint, downstream_endpoint, created_at
+          ) VALUES (?, ?, ?, ?, 100, ?, '', ?)`,
+          randomUUID(), network.id, parent.id, nodeId, parentEndpoint, timestamp,
         );
       }
       this.db.run('UPDATE join_tokens SET used_count = used_count + 1 WHERE id = ?', token.id);

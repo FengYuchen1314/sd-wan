@@ -230,7 +230,8 @@ test('严格单向认领由中心主动连接目标并代理配置，目标不�
     const childConfig = database.get(
       'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', adopted.versionId, adopted.node.id,
     );
-    assert.equal(JSON.parse(childConfig.config_json).data.peers[0].endpoint, '');
+    assert.equal(JSON.parse(childConfig.config_json).data.peers[0].endpoint, null);
+    assert.equal(JSON.parse(childConfig.config_json).data.peers[0].endpointMode, 'dynamic-learn');
 
     const descendantDirectory = join(directory, 'descendant-agent');
     const descendantRelayPort = await availableTcpPort();

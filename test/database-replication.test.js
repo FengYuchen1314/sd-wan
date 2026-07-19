@@ -31,7 +31,17 @@ test('逻辑快照完整复制协调状态并在导入前校验外键', () => {
   try {
     const snapshot = source.database.exportSnapshot();
     assert.equal(snapshot.revision > 0, true);
-    replica.importSnapshot(snapshot);
+    const legacySnapshot = structuredClone(snapshot);
+    for (const link of legacySnapshot.tables.topology_links) {
+      delete link.endpoint_semantics_version;
+      link.upstream_endpoint = null;
+      link.downstream_endpoint = null;
+    }
+    replica.importSnapshot(legacySnapshot);
+    const migratedLink = replica.get('SELECT upstream_endpoint, downstream_endpoint, endpoint_semantics_version FROM topology_links');
+    assert.equal(migratedLink.upstream_endpoint, 'coordinator.example:19801');
+    assert.equal(migratedLink.downstream_endpoint, '');
+    assert.equal(migratedLink.endpoint_semantics_version, 1);
     assert.deepEqual(
       replica.all('SELECT id, name FROM nodes ORDER BY created_at'),
       source.database.all('SELECT id, name FROM nodes ORDER BY created_at'),

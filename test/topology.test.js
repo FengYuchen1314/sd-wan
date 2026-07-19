@@ -70,4 +70,10 @@ test('拒绝孤立节点、自连接和重复 IP', () => {
   assert.throws(() => validateAndCompileTopology({
     network, nodes: [node('a', 1), node('b', 1)], links: [{ upstreamId: 'a', downstreamId: 'b' }],
   }), /被多个节点使用/);
+  const dynamicOnly = validateAndCompileTopology({
+    network,
+    nodes: [node('a', 1), node('b', 2)],
+    links: [{ upstreamId: 'a', downstreamId: 'b', upstreamEndpoint: '', downstreamEndpoint: null }],
+  });
+  assert.ok(Object.values(dynamicOnly.configs).every((config) => config.data.peers[0].endpointMode === 'dynamic-learn'));
 });

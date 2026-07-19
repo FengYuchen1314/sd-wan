@@ -52,6 +52,7 @@ test('单向 Endpoint 激活后立即发送业务网段预热包以建立 NAT �
     dataDir: '.',
     privateKey: 'b'.repeat(44),
     applyNetwork: false,
+    warmupAttempts: 1,
     warmupSender: async (address) => { sent.push(address); },
   });
   assert.deepEqual(await manager.warmDataPlane(config), ['10.77.0.8']);

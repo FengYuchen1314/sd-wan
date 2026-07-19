@@ -174,6 +174,8 @@ export class WireGuardManager {
     this.linkHealthCheckedAt = 0;
     this.activeMultipathPlan = { aliases: [], tunnels: [], routes: [] };
     this.warmupSender = options.warmupSender ?? sendWireGuardWarmup;
+    this.warmupAttempts = Math.max(1, Number(options.warmupAttempts ?? 6));
+    this.warmupIntervalMs = Math.max(0, Number(options.warmupIntervalMs ?? 1_000));
   }
 
   runtimeInfo() {
@@ -210,7 +212,12 @@ export class WireGuardManager {
 
   async warmDataPlane(config) {
     const targets = dataPlaneWarmupTargets(config);
-    await Promise.allSettled(targets.map((address) => this.warmupSender(address)));
+    for (let attempt = 0; attempt < this.warmupAttempts && targets.length; attempt += 1) {
+      await Promise.allSettled(targets.map((address) => this.warmupSender(address)));
+      if (attempt + 1 < this.warmupAttempts && this.warmupIntervalMs) {
+        await new Promise((resolve) => setTimeout(resolve, this.warmupIntervalMs));
+      }
+    }
     return targets;
   }
 
