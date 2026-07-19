@@ -139,3 +139,47 @@ test('新增连接拒绝非法互访地址和重复节点对', () => {
     }), /已经存在连接/);
   } finally { database.close(); }
 });
+
+test('连接验证超过有效期后自动失败并取消节点命令', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
+    const nodeA = service.registerAgent({ token: tokenA.token, name: '超时节点 A', wgDataPublicKey: 'a'.repeat(44) }).node;
+    const tokenB = service.createJoinToken(network.id, { parentId: center.id });
+    const nodeB = service.registerAgent({ token: tokenB.token, name: '超时节点 B', wgDataPublicKey: 'b'.repeat(44) }).node;
+    const candidate = service.createLinkValidation(network.id, {
+      nodeAId: nodeA.id, nodeBId: nodeB.id,
+      nodeAAddress: '192.168.1.20', nodeBAddress: '192.168.1.21', priority: 10,
+    });
+
+    const result = service.reconcileRuntimeState(new Date(Date.parse(candidate.validationExpiresAt) + 1));
+    const expired = service.listLinks(network.id).find((link) => link.id === candidate.id);
+    const commands = database.all(
+      "SELECT status, result_json FROM commands WHERE type = 'prepare-link-probe' ORDER BY created_at",
+    );
+
+    assert.equal(result.expiredLinks, 1);
+    assert.equal(result.cancelledCommands, 2);
+    assert.equal(expired.validationStatus, 'failed');
+    assert.match(expired.validationError, /超时/);
+    assert.deepEqual(commands.map((command) => command.status), ['failed', 'failed']);
+    assert.ok(commands.every((command) => JSON.parse(command.result_json).ok === false));
+  } finally { database.close(); }
+});
+
+test('边缘节点心跳超时后离线并可通过新心跳恢复', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const token = service.createJoinToken(network.id, { parentId: center.id });
+    const edge = service.registerAgent({ token: token.token, name: '心跳节点', wgDataPublicKey: 'c'.repeat(44) }).node;
+    const afterDeadline = new Date(Date.parse(edge.lastSeen) + service.nodeOfflineAfterMs + 1);
+
+    const result = service.reconcileRuntimeState(afterDeadline);
+    assert.equal(result.offlineNodes, 1);
+    assert.equal(service.getNode(edge.id).status, 'offline');
+    assert.equal(service.getNode(center.id).status, 'online');
+
+    service.heartbeat(edge.id);
+    assert.equal(service.getNode(edge.id).status, 'online');
+  } finally { database.close(); }
+});
