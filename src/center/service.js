@@ -1,10 +1,27 @@
 import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
 import { parseCIDR, parseIPv4, usableHost } from '../core/ipv4.js';
+import { enumerateSimplePaths } from '../core/paths.js';
 import { validateAndCompileTopology } from '../core/topology.js';
 
 const now = () => new Date().toISOString();
 const hashSecret = (value) => createHash('sha256').update(String(value)).digest('hex');
 const json = (value) => JSON.stringify(value ?? {});
+const DEFAULT_DATA_PORT = 19801;
+
+function normalizePort(value, label = 'WireGuard 端口', fallback = undefined) {
+  if (value === undefined || value === null || value === '') {
+    if (fallback !== undefined) return fallback;
+    throw new Error(`${label}不能为空`);
+  }
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`${label}必须是 1 到 65535 的整数`);
+  return port;
+}
+
+function endpointPort(endpoint) {
+  const match = String(endpoint ?? '').trim().match(/:(\d+)$/);
+  return match ? normalizePort(match[1]) : null;
+}
 
 function normalizeReachableHost(value, label) {
   const host = String(value ?? '').trim();
@@ -65,6 +82,7 @@ function nodeFromRow(row) {
     dataIp: row.data_ip,
     controlEndpoint: row.control_endpoint,
     dataEndpoint: row.data_endpoint,
+    dataListenPort: Number(row.data_listen_port || DEFAULT_DATA_PORT),
     wgControlPublicKey: row.wg_control_public_key,
     wgDataPublicKey: row.wg_data_public_key,
     agentVersion: row.agent_version,
@@ -72,6 +90,12 @@ function nodeFromRow(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function canonicalNodePair(nodeAId, nodeBId) {
+  return String(nodeAId).localeCompare(String(nodeBId)) <= 0
+    ? [nodeAId, nodeBId]
+    : [nodeBId, nodeAId];
 }
 
 export class ControlService {
@@ -157,7 +181,7 @@ export class ControlService {
       name: '默认网络',
       dataCidr: '10.77.0.0/16',
       controlCidr: '10.254.0.0/16',
-      listenPort: 51820,
+      listenPort: DEFAULT_DATA_PORT,
       mtu: 1380,
     }).id;
   }
@@ -196,7 +220,7 @@ export class ControlService {
     if (!(data.broadcast < control.network || control.broadcast < data.network)) {
       throw new Error('业务网段与控制网段不能重叠');
     }
-    const listenPort = Number(input.listenPort ?? 51820);
+    const listenPort = Number(input.listenPort ?? DEFAULT_DATA_PORT);
     const mtu = Number(input.mtu ?? 1380);
     if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) throw new Error('监听端口无效');
     if (!Number.isInteger(mtu) || mtu < 576 || mtu > 9000) throw new Error('MTU 无效');
@@ -217,10 +241,11 @@ export class ControlService {
       );
       this.db.run(
         `INSERT INTO nodes(id, network_id, name, status, is_center, can_relay, parent_id, control_ip, data_ip,
-          control_endpoint, data_endpoint, wg_control_public_key, wg_data_public_key, created_at, updated_at, last_seen)
-         VALUES (?, ?, ?, 'online', 1, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          control_endpoint, data_endpoint, data_listen_port, wg_control_public_key, wg_data_public_key,
+          created_at, updated_at, last_seen)
+         VALUES (?, ?, ?, 'online', 1, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         centerId, id, '中心节点', usableHost(control, 1), usableHost(data, 1), this.publicUrl, centerDataEndpoint,
-        centerControlKeys.publicKey, centerDataKeys.publicKey, timestamp, timestamp, timestamp,
+        listenPort, centerControlKeys.publicKey, centerDataKeys.publicKey, timestamp, timestamp, timestamp,
       );
       this.db.run(
         'INSERT INTO local_node_keys(node_id, control_private_key, data_private_key, created_at) VALUES (?, ?, ?, ?)',
@@ -284,6 +309,122 @@ export class ControlService {
       }));
   }
 
+  listPathPolicies(networkId) {
+    return this.db.all(
+      'SELECT * FROM path_policies WHERE network_id = ? ORDER BY source_id, target_id', networkId,
+    ).map((row) => ({
+      id: row.id,
+      networkId: row.network_id,
+      sourceId: row.source_id,
+      targetId: row.target_id,
+      mode: row.mode,
+      paths: JSON.parse(row.paths_json),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  getPathOptions(networkId, sourceId, targetId) {
+    const source = this.getNode(sourceId);
+    const target = this.getNode(targetId);
+    if (source.networkId !== networkId || target.networkId !== networkId) throw new Error('所选节点不属于当前节点组');
+    if (source.id === target.id) throw new Error('请选择两个不同的节点');
+    const nodes = this.listNodes(networkId);
+    const links = this.listLinks(networkId, true);
+    const result = enumerateSimplePaths({ nodes, links, sourceId: source.id, targetId: target.id });
+    const nodeById = new Map(nodes.map((node) => [node.id, node]));
+    const [canonicalSourceId, canonicalTargetId] = canonicalNodePair(source.id, target.id);
+    const policy = this.listPathPolicies(networkId).find((item) =>
+      item.sourceId === canonicalSourceId && item.targetId === canonicalTargetId);
+    const selectedWeights = new Map((policy?.paths ?? []).map((path) => [path.pathId, Number(path.weight)]));
+
+    return {
+      source,
+      target,
+      paths: result.paths.map((path) => ({
+        ...path,
+        nodes: path.nodeIds.map((nodeId) => {
+          const node = nodeById.get(nodeId);
+          return { id: node.id, name: node.name, dataIp: node.dataIp, status: node.status };
+        }),
+        selected: selectedWeights.has(path.id),
+        weight: selectedWeights.get(path.id) ?? 1,
+      })),
+      truncated: result.truncated,
+      policy: policy ? {
+        id: policy.id,
+        mode: policy.mode,
+        paths: policy.paths.map((path) => ({ pathId: path.pathId, weight: Number(path.weight) })),
+        updatedAt: policy.updatedAt,
+      } : null,
+    };
+  }
+
+  savePathPolicy(networkId, input) {
+    const details = this.getPathOptions(networkId, input.sourceId, input.targetId);
+    const requested = Array.isArray(input.paths) ? input.paths : [];
+    if (requested.length < 2) throw new Error('负载均衡至少需要选择两条无环路径');
+    const available = new Map(details.paths.map((path) => [path.id, path]));
+    const seen = new Set();
+    const [sourceId, targetId] = canonicalNodePair(details.source.id, details.target.id);
+    const selectedPaths = requested.map((selection) => {
+      const option = available.get(selection.pathId);
+      if (!option || seen.has(selection.pathId)) throw new Error('所选路径不存在、已失效或重复');
+      seen.add(selection.pathId);
+      const weight = Number(selection.weight);
+      if (!Number.isInteger(weight) || weight < 1 || weight > 1000) throw new Error('路径权重必须是 1 到 1000 的整数');
+      const canonicalDirection = option.nodeIds[0] === sourceId;
+      return {
+        pathId: option.id,
+        weight,
+        nodeIds: canonicalDirection ? option.nodeIds : [...option.nodeIds].reverse(),
+        linkIds: canonicalDirection ? option.linkIds : [...option.linkIds].reverse(),
+      };
+    });
+    const existing = this.db.get(
+      'SELECT id, created_at FROM path_policies WHERE network_id = ? AND source_id = ? AND target_id = ?',
+      networkId, sourceId, targetId,
+    );
+    const id = existing?.id ?? randomUUID();
+    const timestamp = now();
+    let versionId;
+    this.db.transaction(() => {
+      this.db.run(
+        `INSERT INTO path_policies(id, network_id, source_id, target_id, mode, paths_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'weighted', ?, ?, ?)
+         ON CONFLICT(network_id, source_id, target_id) DO UPDATE SET
+           mode = excluded.mode, paths_json = excluded.paths_json, updated_at = excluded.updated_at`,
+        id, networkId, sourceId, targetId, json(selectedPaths), existing?.created_at ?? timestamp, timestamp,
+      );
+      versionId = this.createVersionInTransaction(networkId, '更新多路径负载均衡策略');
+      this.audit('path-policy.update', 'path-policy', id, { sourceId, targetId, paths: selectedPaths, versionId });
+    });
+    return { details: this.getPathOptions(networkId, input.sourceId, input.targetId), version: this.getConfiguration(versionId) };
+  }
+
+  deletePathPolicy(networkId, sourceNodeId, targetNodeId) {
+    const source = this.getNode(sourceNodeId);
+    const target = this.getNode(targetNodeId);
+    if (source.networkId !== networkId || target.networkId !== networkId) throw new Error('所选节点不属于当前节点组');
+    const [sourceId, targetId] = canonicalNodePair(source.id, target.id);
+    const existing = this.db.get(
+      'SELECT id FROM path_policies WHERE network_id = ? AND source_id = ? AND target_id = ?',
+      networkId, sourceId, targetId,
+    );
+    if (!existing) return { deleted: false, details: this.getPathOptions(networkId, sourceNodeId, targetNodeId) };
+    let versionId;
+    this.db.transaction(() => {
+      this.db.run('DELETE FROM path_policies WHERE id = ?', existing.id);
+      versionId = this.createVersionInTransaction(networkId, '关闭多路径负载均衡策略');
+      this.audit('path-policy.delete', 'path-policy', existing.id, { sourceId, targetId, versionId });
+    });
+    return {
+      deleted: true,
+      details: this.getPathOptions(networkId, sourceNodeId, targetNodeId),
+      version: this.getConfiguration(versionId),
+    };
+  }
+
   getTopology(networkId) {
     const network = this.getNetwork(networkId);
     const nodes = this.listNodes(networkId);
@@ -304,6 +445,7 @@ export class ControlService {
     const compiled = validateAndCompileTopology({ network, nodes, links });
     let versionId;
     this.db.transaction(() => {
+      this.db.run('DELETE FROM path_policies WHERE network_id = ?', networkId);
       this.db.run('DELETE FROM topology_links WHERE network_id = ?', networkId);
       for (const link of compiled.links) {
         this.db.run(
@@ -328,6 +470,7 @@ export class ControlService {
     const nextRelay = input.canRelay === undefined ? node.canRelay : Boolean(input.canRelay);
     const nextControlEndpoint = input.controlEndpoint === undefined ? node.controlEndpoint : String(input.controlEndpoint).trim() || null;
     const nextDataEndpoint = input.dataEndpoint === undefined ? node.dataEndpoint : String(input.dataEndpoint).trim() || null;
+    const nextDataListenPort = normalizePort(input.dataListenPort, `${node.name} 的 WireGuard 端口`, node.dataListenPort);
     if (!nextName) throw new Error('节点名称不能为空');
     if (nextControlEndpoint) {
       let parsed;
@@ -341,7 +484,7 @@ export class ControlService {
     const nodes = this.listNodes(node.networkId).map((item) => item.id === nodeId
       ? {
           ...item, name: nextName, dataIp: nextIp, canRelay: nextRelay,
-          controlEndpoint: nextControlEndpoint, dataEndpoint: nextDataEndpoint,
+          controlEndpoint: nextControlEndpoint, dataEndpoint: nextDataEndpoint, dataListenPort: nextDataListenPort,
         }
       : item);
     const links = this.listLinks(node.networkId, true);
@@ -350,13 +493,13 @@ export class ControlService {
     this.db.transaction(() => {
       this.db.run(
         `UPDATE nodes SET name = ?, data_ip = ?, can_relay = ?, control_endpoint = ?,
-         data_endpoint = ?, updated_at = ? WHERE id = ?`,
-        nextName, nextIp, nextRelay ? 1 : 0, nextControlEndpoint, nextDataEndpoint, now(), nodeId,
+         data_endpoint = ?, data_listen_port = ?, updated_at = ? WHERE id = ?`,
+        nextName, nextIp, nextRelay ? 1 : 0, nextControlEndpoint, nextDataEndpoint, nextDataListenPort, now(), nodeId,
       );
       versionId = this.createVersionInTransaction(node.networkId, '修改节点业务地址', compiled);
       this.audit('node.update', 'node', nodeId, {
-        before: { name: node.name, dataIp: node.dataIp, controlEndpoint: node.controlEndpoint, dataEndpoint: node.dataEndpoint },
-        after: { name: nextName, dataIp: nextIp, controlEndpoint: nextControlEndpoint, dataEndpoint: nextDataEndpoint }, versionId,
+        before: { name: node.name, dataIp: node.dataIp, controlEndpoint: node.controlEndpoint, dataEndpoint: node.dataEndpoint, dataListenPort: node.dataListenPort },
+        after: { name: nextName, dataIp: nextIp, controlEndpoint: nextControlEndpoint, dataEndpoint: nextDataEndpoint, dataListenPort: nextDataListenPort }, versionId,
       });
     });
     return { node: this.getNode(nodeId), version: this.getConfiguration(versionId) };
@@ -368,6 +511,9 @@ export class ControlService {
     if (parent.networkId !== networkId) throw new Error('父节点不属于当前节点组');
     if (!parent.canRelay) throw new Error('所选父节点未启用下级接入能力');
     const mode = input.mode === 'passive' ? 'passive' : 'active';
+    const dataPort = input.dataPort === undefined || input.dataPort === null || input.dataPort === ''
+      ? null
+      : normalizePort(input.dataPort, '新节点 WireGuard 端口');
     const ttlMinutes = Math.min(1440, Math.max(5, Number(input.ttlMinutes ?? 30)));
     const token = `pwj_${randomBytes(24).toString('base64url')}`;
     const id = randomUUID();
@@ -390,11 +536,12 @@ export class ControlService {
       throw new Error('安装包与接入地址必须是完整的 HTTP 或 HTTPS URL');
     }
     const installerUrl = `${sourceUrl}/install.sh?source=${encodeURIComponent(sourceUrl)}`;
+    const dataPortArgument = dataPort ? ` --data-port '${dataPort}'` : '';
     const command = mode === 'passive'
-      ? `curl -fsSL '${installerUrl}' | sudo bash -s -- --claim-token '${token}'`
-      : `curl -fsSL '${installerUrl}' | sudo bash -s -- --join-token '${token}' --upstream '${sourceUrl}'`;
-    this.audit('join-token.create', 'join-token', id, { networkId, parentId: parent.id, mode, expiresAt });
-    return { id, token, mode, expiresAt, parent, sourceUrl, command };
+      ? `curl -fsSL '${installerUrl}' | sudo bash -s -- --claim-token '${token}'${dataPortArgument}`
+      : `curl -fsSL '${installerUrl}' | sudo bash -s -- --join-token '${token}' --upstream '${sourceUrl}'${dataPortArgument}`;
+    this.audit('join-token.create', 'join-token', id, { networkId, parentId: parent.id, mode, expiresAt, dataPort });
+    return { id, token, mode, expiresAt, parent, sourceUrl, dataPort, command };
   }
 
   createLinkValidation(networkId, input) {
@@ -419,8 +566,10 @@ export class ControlService {
 
     const upstreamHost = normalizeReachableHost(input.nodeAAddress, `${upstream.name} 的可达地址`);
     const downstreamHost = normalizeReachableHost(input.nodeBAddress, `${downstream.name} 的可达地址`);
-    const upstreamEndpoint = `${upstreamHost}:${network.listenPort}`;
-    const downstreamEndpoint = `${downstreamHost}:${network.listenPort}`;
+    const upstreamPort = normalizePort(input.nodeAPort, `${upstream.name} 的 WireGuard 端口`, upstream.dataListenPort);
+    const downstreamPort = normalizePort(input.nodeBPort, `${downstream.name} 的 WireGuard 端口`, downstream.dataListenPort);
+    const upstreamEndpoint = `${upstreamHost}:${upstreamPort}`;
+    const downstreamEndpoint = `${downstreamHost}:${downstreamPort}`;
     const priority = Math.max(0, Number.isInteger(Number(input.priority)) ? Number(input.priority) : 10);
     const id = randomUUID();
     const validationToken = `pwv_${randomBytes(24).toString('base64url')}`;
@@ -474,13 +623,18 @@ export class ControlService {
       if (existingIps.has(dataIp) || existingIps.has(controlIp)) throw new Error('无法分配节点地址');
       const nodeId = randomUUID();
       const name = String(input.name || `节点-${nodeId.slice(0, 6)}`).slice(0, 80);
+      const dataListenPort = normalizePort(
+        input.dataListenPort,
+        `${name} 的 WireGuard 端口`,
+        endpointPort(input.dataEndpoint) || DEFAULT_DATA_PORT,
+      );
       this.db.run(
         `INSERT INTO nodes(id, network_id, name, status, is_center, can_relay, parent_id, control_ip, data_ip,
-          control_endpoint, data_endpoint, wg_control_public_key, wg_data_public_key, credential_hash,
+          control_endpoint, data_endpoint, data_listen_port, wg_control_public_key, wg_data_public_key, credential_hash,
           agent_version, last_seen, created_at, updated_at)
-         VALUES (?, ?, ?, 'online', 0, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, 'online', 0, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         nodeId, network.id, name, parent.id, controlIp, dataIp,
-        input.controlEndpoint ?? null, input.dataEndpoint ?? null,
+        input.controlEndpoint ?? null, input.dataEndpoint ?? null, dataListenPort,
         input.wgControlPublicKey ?? '', input.wgDataPublicKey ?? '', hashSecret(credential),
         input.agentVersion ?? '0.1.0', timestamp, timestamp, timestamp,
       );
@@ -517,6 +671,35 @@ export class ControlService {
   createVersionInTransaction(networkId, reason, precompiled = null) {
     const state = this.loadState(networkId);
     const compiled = precompiled ?? validateAndCompileTopology(state);
+    const pathPolicies = this.listPathPolicies(networkId);
+    for (const config of Object.values(compiled.configs)) config.multipathPolicies = [];
+    for (const policy of pathPolicies) {
+      const totalWeight = policy.paths.reduce((total, path) => total + Number(path.weight), 0);
+      for (const [sourceId, targetId, reverse] of [
+        [policy.sourceId, policy.targetId, false],
+        [policy.targetId, policy.sourceId, true],
+      ]) {
+        const config = compiled.configs[sourceId];
+        if (!config) continue;
+        config.multipathPolicies.push({
+          policyId: policy.id,
+          targetNodeId: targetId,
+          mode: policy.mode,
+          paths: policy.paths.map((path) => {
+            const nodeIds = reverse ? [...path.nodeIds].reverse() : [...path.nodeIds];
+            const linkIds = reverse ? [...path.linkIds].reverse() : [...path.linkIds];
+            return {
+              pathId: path.pathId,
+              weight: Number(path.weight),
+              share: totalWeight ? Number((Number(path.weight) / totalWeight).toFixed(4)) : 0,
+              nextHopId: nodeIds[1],
+              nodeIds,
+              linkIds,
+            };
+          }),
+        });
+      }
+    }
     const next = this.db.get('SELECT COALESCE(MAX(version), 0) + 1 AS version FROM config_versions WHERE network_id = ?', networkId);
     const id = randomUUID();
     const timestamp = now();
@@ -530,7 +713,7 @@ export class ControlService {
       `INSERT INTO config_versions(id, network_id, version, status, reason, topology_json, created_at, activated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       id, networkId, Number(next.version), status, reason,
-      json({ links: compiled.links, paths: compiled.paths, summary: compiled.summary }), timestamp,
+      json({ links: compiled.links, paths: compiled.paths, pathPolicies, summary: compiled.summary }), timestamp,
       onlyCenter ? timestamp : null,
     );
     for (const node of state.nodes) {
@@ -589,12 +772,24 @@ export class ControlService {
 
   heartbeat(nodeId, input = {}) {
     const timestamp = now();
-    this.db.run(
-      `UPDATE nodes SET status = 'online', last_seen = ?, agent_version = COALESCE(?, agent_version),
-       control_endpoint = COALESCE(?, control_endpoint), data_endpoint = COALESCE(?, data_endpoint), updated_at = ? WHERE id = ?`,
-      timestamp, input.agentVersion ?? null, input.controlEndpoint ?? null, input.dataEndpoint ?? null, timestamp, nodeId,
-    );
-    return { acknowledgedAt: timestamp };
+    const node = this.getNode(nodeId);
+    const dataListenPort = normalizePort(input.dataListenPort, `${node.name} 的 WireGuard 端口`, node.dataListenPort);
+    const portChanged = dataListenPort !== node.dataListenPort;
+    let versionId = null;
+    this.db.transaction(() => {
+      this.db.run(
+        `UPDATE nodes SET status = 'online', last_seen = ?, agent_version = COALESCE(?, agent_version),
+         control_endpoint = COALESCE(?, control_endpoint), data_endpoint = COALESCE(?, data_endpoint),
+         data_listen_port = ?, updated_at = ? WHERE id = ?`,
+        timestamp, input.agentVersion ?? null, input.controlEndpoint ?? null, input.dataEndpoint ?? null,
+        dataListenPort, timestamp, nodeId,
+      );
+      if (portChanged) {
+        versionId = this.createVersionInTransaction(node.networkId, `节点 ${node.name} 更新 WireGuard 端口`);
+        this.audit('agent.data-port', 'node', nodeId, { before: node.dataListenPort, after: dataListenPort, versionId }, `node:${nodeId}`);
+      }
+    });
+    return { acknowledgedAt: timestamp, dataListenPort, versionId };
   }
 
   getDesiredConfig(nodeId, currentVersion = 0) {
@@ -706,12 +901,16 @@ export class ControlService {
         this.db.run("UPDATE topology_links SET validation_status = 'probing' WHERE id = ?", link.id);
         this.enqueueCommand(updated.upstream_id, 'execute-link-probe', {
           validationId: link.id,
+          probeId: randomUUID(),
+          maxHops: 16,
           token: updated.validation_token,
           remoteUrl: `http://${endpointHost(updated.downstream_endpoint)}:8790`,
           expectedNodeId: updated.downstream_id,
         });
         this.enqueueCommand(updated.downstream_id, 'execute-link-probe', {
           validationId: link.id,
+          probeId: randomUUID(),
+          maxHops: 16,
           token: updated.validation_token,
           remoteUrl: `http://${endpointHost(updated.upstream_endpoint)}:8790`,
           expectedNodeId: updated.upstream_id,

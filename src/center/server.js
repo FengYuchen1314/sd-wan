@@ -164,6 +164,27 @@ async function handleAdmin(req, res, pathname, url) {
     return send(res, 202, service.createLinkValidation(params.id, await readJson(req)));
   }
 
+  params = match(pathname, '/api/v1/networks/:id/path-options');
+  if (req.method === 'GET' && params) {
+    return send(res, 200, service.getPathOptions(
+      params.id,
+      url.searchParams.get('sourceId'),
+      url.searchParams.get('targetId'),
+    ));
+  }
+
+  params = match(pathname, '/api/v1/networks/:id/path-policies');
+  if (req.method === 'PUT' && params) {
+    return send(res, 200, service.savePathPolicy(params.id, await readJson(req)));
+  }
+  if (req.method === 'DELETE' && params) {
+    return send(res, 200, service.deletePathPolicy(
+      params.id,
+      url.searchParams.get('sourceId'),
+      url.searchParams.get('targetId'),
+    ));
+  }
+
   params = match(pathname, '/api/v1/networks/:id/join-tokens');
   if (req.method === 'POST' && params) return send(res, 201, service.createJoinToken(params.id, await readJson(req)));
 
@@ -237,6 +258,12 @@ const server = createServer(async (req, res) => {
     }
     if (pathname === '/artifacts/agent/agent.js') {
       return send(res, 200, readFileSync(join(rootDir, 'src', 'agent', 'agent.js')), {
+        'Content-Type': 'text/javascript; charset=utf-8',
+        'Cache-Control': 'public, max-age=300',
+      });
+    }
+    if (pathname === '/artifacts/agent/runtime.js') {
+      return send(res, 200, readFileSync(join(rootDir, 'src', 'agent', 'runtime.js')), {
         'Content-Type': 'text/javascript; charset=utf-8',
         'Cache-Control': 'public, max-age=300',
       });

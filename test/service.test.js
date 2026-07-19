@@ -183,3 +183,51 @@ test('边缘节点心跳超时后离线并可通过新心跳恢复', () => {
     assert.equal(service.getNode(edge.id).status, 'online');
   } finally { database.close(); }
 });
+
+test('保存两节点多路径权重并写入版本化节点配置', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
+    const nodeA = service.registerAgent({ token: tokenA.token, name: '多路径 A', wgDataPublicKey: 'a'.repeat(44) }).node;
+    const tokenB = service.createJoinToken(network.id, { parentId: center.id });
+    const nodeB = service.registerAgent({ token: tokenB.token, name: '多路径 B', wgDataPublicKey: 'b'.repeat(44) }).node;
+    const direct = service.createLinkValidation(network.id, {
+      nodeAId: nodeA.id, nodeBId: nodeB.id,
+      nodeAAddress: '192.168.10.10', nodeBAddress: '192.168.10.11', priority: 1,
+    });
+    for (const node of [nodeA, nodeB]) {
+      const command = service.claimCommand(node.id);
+      service.completeCommand(node.id, command.id, { ok: true });
+    }
+    for (const node of [nodeA, nodeB]) {
+      const command = service.claimCommand(node.id);
+      service.completeCommand(node.id, command.id, { ok: true });
+    }
+    assert.equal(service.listLinks(network.id).find((link) => link.id === direct.id).validationStatus, 'active');
+
+    const options = service.getPathOptions(network.id, nodeA.id, nodeB.id);
+    assert.equal(options.paths.length, 2);
+    const saved = service.savePathPolicy(network.id, {
+      sourceId: nodeA.id,
+      targetId: nodeB.id,
+      paths: [
+        { pathId: options.paths[0].id, weight: 3 },
+        { pathId: options.paths[1].id, weight: 1 },
+      ],
+    });
+    assert.equal(saved.details.policy.paths.length, 2);
+    assert.deepEqual(saved.details.policy.paths.map((path) => path.weight), [3, 1]);
+
+    const row = database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', saved.version.id, nodeA.id,
+    );
+    const config = JSON.parse(row.config_json);
+    assert.equal(config.multipathPolicies.length, 1);
+    assert.equal(config.multipathPolicies[0].targetNodeId, nodeB.id);
+    assert.deepEqual(config.multipathPolicies[0].paths.map((path) => path.share), [0.75, 0.25]);
+
+    const removed = service.deletePathPolicy(network.id, nodeA.id, nodeB.id);
+    assert.equal(removed.deleted, true);
+    assert.equal(removed.details.policy, null);
+  } finally { database.close(); }
+});

@@ -172,7 +172,7 @@ export function validateAndCompileTopology({ network, nodes, links }) {
       data: {
         interfaceName: 'pw-data',
         address: `${node.dataIp}/32`,
-        listenPort: network.listenPort,
+        listenPort: node.dataListenPort ?? network.listenPort ?? 19801,
         mtu: network.mtu,
         peers,
       },

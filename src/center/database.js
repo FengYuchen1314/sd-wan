@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   data_ip TEXT NOT NULL,
   control_endpoint TEXT,
   data_endpoint TEXT,
+  data_listen_port INTEGER,
   wg_control_public_key TEXT,
   wg_data_public_key TEXT,
   credential_hash TEXT,
@@ -68,6 +69,20 @@ CREATE TABLE IF NOT EXISTS topology_links (
 
 CREATE UNIQUE INDEX IF NOT EXISTS topology_link_direction
   ON topology_links(network_id, upstream_id, downstream_id);
+
+CREATE TABLE IF NOT EXISTS path_policies (
+  id TEXT PRIMARY KEY,
+  network_id TEXT NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  target_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL DEFAULT 'weighted',
+  paths_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(network_id, source_id, target_id)
+);
+
+CREATE INDEX IF NOT EXISTS path_policies_network ON path_policies(network_id);
 
 CREATE TABLE IF NOT EXISTS join_tokens (
   id TEXT PRIMARY KEY,
@@ -156,6 +171,20 @@ export class Database {
     for (const [name, definition] of additions) {
       if (!columns.has(name)) this.handle.exec(`ALTER TABLE topology_links ADD COLUMN ${name} ${definition}`);
     }
+
+    const nodeColumns = new Set(this.handle.prepare('PRAGMA table_info(nodes)').all().map((column) => column.name));
+    if (!nodeColumns.has('data_listen_port')) {
+      this.handle.exec('ALTER TABLE nodes ADD COLUMN data_listen_port INTEGER');
+    }
+    this.handle.exec(`
+      UPDATE nodes
+      SET data_listen_port = COALESCE(
+        data_listen_port,
+        (SELECT listen_port FROM networks WHERE networks.id = nodes.network_id),
+        19801
+      )
+      WHERE data_listen_port IS NULL
+    `);
   }
 
   run(sql, ...params) {

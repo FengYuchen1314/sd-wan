@@ -3,6 +3,14 @@ import { createServer } from 'node:http';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
+import {
+  acceptProbeEnvelope,
+  DEFAULT_DATA_PORT,
+  extendRelayTrace,
+  MAX_PROBE_HOPS,
+  normalizeDataPort,
+  selectAvailableUdpPort,
+} from './runtime.js';
 import { WireGuardManager } from './wireguard.js';
 
 const args = parseArgs(process.argv.slice(2));
@@ -64,6 +72,16 @@ function loadState() {
 }
 
 let state = loadState();
+state.agentInstanceId ||= `agent-${randomBytes(12).toString('hex')}`;
+const explicitDataPort = args.dataPort ?? process.env.SDWAN_DATA_PORT;
+if (explicitDataPort !== undefined && explicitDataPort !== null && explicitDataPort !== '') {
+  const requestedPort = normalizeDataPort(explicitDataPort);
+  if (state.dataListenPort !== requestedPort || !state.nodeId) {
+    state.dataListenPort = await selectAvailableUdpPort({ preferred: requestedPort, strict: true });
+  }
+} else if (!state.dataListenPort) {
+  state.dataListenPort = await selectAvailableUdpPort({ preferred: DEFAULT_DATA_PORT });
+}
 atomicJson(stateFile, state);
 
 function safeEqualHash(token, expectedHash) {
@@ -98,6 +116,7 @@ async function register({ passive = false } = {}) {
       wgDataPublicKey: state.dataKeys.publicKey,
       controlEndpoint: args.controlEndpoint || null,
       dataEndpoint: args.dataEndpoint || null,
+      dataListenPort: state.dataListenPort,
     }),
   });
   state = {
@@ -177,19 +196,32 @@ async function executeCommand(command) {
       atomicJson(stateFile, state);
       result = { ok: true, prepared: true };
     } else if (command.type === 'execute-link-probe') {
+      const probeId = String(command.payload.probeId || `probe-${randomBytes(16).toString('hex')}`);
+      const maxHops = Math.min(MAX_PROBE_HOPS, Math.max(1, Number(command.payload.maxHops) || MAX_PROBE_HOPS));
       const response = await fetch(
         new URL(`/agent/v1/link-probe/${command.payload.validationId}`, command.payload.remoteUrl),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: command.payload.token }),
+          body: JSON.stringify({
+            token: command.payload.token,
+            probeId,
+            trace: [state.nodeId || state.agentInstanceId],
+            remainingHops: maxHops - 1,
+          }),
           signal: AbortSignal.timeout(12_000),
         },
       );
       const probe = await response.json();
       if (!response.ok) throw new Error(probe.error || `探测返回 HTTP ${response.status}`);
       if (probe.nodeId !== command.payload.expectedNodeId) throw new Error('目标节点身份与预期不一致');
-      result = { ok: true, remoteNodeId: probe.nodeId, reachedAt: new Date().toISOString() };
+      result = {
+        ok: true,
+        probeId,
+        remoteNodeId: probe.nodeId,
+        trace: probe.trace,
+        reachedAt: new Date().toISOString(),
+      };
     } else if (command.type === 'probe') {
       result = { ok: true, nodeId: state.nodeId, time: new Date().toISOString() };
     } else {
@@ -205,7 +237,7 @@ async function tick() {
   if (!state.credential) return;
   await api('/agent/v1/heartbeat', {
     method: 'POST',
-    body: JSON.stringify({ agentVersion: '0.1.0' }),
+    body: JSON.stringify({ agentVersion: '0.1.0', dataListenPort: state.dataListenPort }),
   });
   await syncConfig();
   const command = await api('/agent/v1/commands/next');
@@ -219,11 +251,16 @@ async function proxy(req, res) {
   }
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
+  const relayTrace = extendRelayTrace(
+    req.headers['x-pathweaver-relay-trace'],
+    state.nodeId || state.agentInstanceId,
+  );
   const upstream = await fetch(new URL(req.url, `${state.upstream.replace(/\/$/, '')}/`), {
     method: req.method,
     headers: {
       ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),
       ...(req.headers['content-type'] ? { 'Content-Type': req.headers['content-type'] } : {}),
+      'X-PathWeaver-Relay-Trace': relayTrace,
     },
     body: ['GET', 'HEAD'].includes(req.method) ? undefined : Buffer.concat(chunks),
     signal: AbortSignal.timeout(30_000),
@@ -267,8 +304,23 @@ const relayServer = createServer(async (req, res) => {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: '链路探测凭据无效或已过期' }));
       }
+      const accepted = acceptProbeEnvelope(input, state.nodeId || state.agentInstanceId);
+      pending.seenProbeIds ||= [];
+      if (pending.seenProbeIds.includes(accepted.probeId)) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: '重复的链路探测请求已被拒绝' }));
+      }
+      pending.seenProbeIds = [...pending.seenProbeIds.slice(-63), accepted.probeId];
+      atomicJson(stateFile, state);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true, nodeId: state.nodeId, reachedAt: new Date().toISOString() }));
+      return res.end(JSON.stringify({
+        ok: true,
+        nodeId: state.nodeId,
+        probeId: accepted.probeId,
+        trace: accepted.trace,
+        remainingHops: accepted.remainingHops,
+        reachedAt: new Date().toISOString(),
+      }));
     }
     if (req.url.startsWith('/agent/v1/') || req.url === '/install.sh' || req.url.startsWith('/artifacts/')) {
       return await proxy(req, res);

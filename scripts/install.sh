@@ -6,12 +6,14 @@ SOURCE="__PATHWEAVER_SOURCE__"
 JOIN_TOKEN=""
 CLAIM_TOKEN=""
 LISTEN=""
+DATA_PORT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --upstream) UPSTREAM="$2"; shift 2 ;;
     --join-token) JOIN_TOKEN="$2"; shift 2 ;;
     --claim-token) CLAIM_TOKEN="$2"; shift 2 ;;
+    --data-port) DATA_PORT="$2"; shift 2 ;;
     --listen) LISTEN="--listen"; shift ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
@@ -39,6 +41,7 @@ fi
 install -d -m 0755 /opt/pathweaver-agent
 install -d -m 0700 /var/lib/pathweaver-agent
 curl -fsSL "$SOURCE/artifacts/agent/agent.js" -o /opt/pathweaver-agent/agent.js
+curl -fsSL "$SOURCE/artifacts/agent/runtime.js" -o /opt/pathweaver-agent/runtime.js
 curl -fsSL "$SOURCE/artifacts/agent/wireguard.js" -o /opt/pathweaver-agent/wireguard.js
 cat >/opt/pathweaver-agent/package.json <<'EOF'
 {"type":"module","private":true}
@@ -48,6 +51,7 @@ ARGS=()
 if [[ -n "$UPSTREAM" ]]; then ARGS+=(--upstream "$UPSTREAM"); fi
 if [[ -n "$JOIN_TOKEN" ]]; then ARGS+=(--join-token "$JOIN_TOKEN"); fi
 if [[ -n "$CLAIM_TOKEN" ]]; then ARGS+=(--claim-token "$CLAIM_TOKEN"); fi
+if [[ -n "$DATA_PORT" ]]; then ARGS+=(--data-port "$DATA_PORT"); fi
 if [[ -n "$LISTEN" || -n "$CLAIM_TOKEN" ]]; then ARGS+=(--listen); fi
 
 cat >/etc/systemd/system/pathweaver-agent.service <<EOF
