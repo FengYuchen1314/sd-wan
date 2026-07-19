@@ -705,15 +705,111 @@ test('全网更新选择首个可访问 GitHub 的节点并把同一摘要制品
     const distributing = service.getUpdateRollout(rollout.id);
     assert.equal(distributing.status, 'distributing');
     assert.equal(distributing.source.id, edge.id);
-    assert.equal(staged.length, 1);
-    assert.equal(staged[0].bundleSha256, distributing.bundleSha256);
+    assert.equal(staged.length, 0, '协调节点必须等待更新制品先送达其他在线节点');
+    const storedCommand = database.get(
+      "SELECT payload_json FROM commands WHERE node_id = ? AND type = 'install-update-bundle'", edge.id,
+    );
+    assert.equal(Object.hasOwn(JSON.parse(storedCommand.payload_json), 'bundleBase64'), false, '数据库命令不得为每台节点重复保存更新包');
     const install = service.claimCommand(edge.id);
     assert.equal(install.type, 'install-update-bundle');
     assert.equal(install.payload.bundleSha256, distributing.bundleSha256);
     service.completeCommand(edge.id, install.id, { ok: true, scheduled: true });
+    assert.equal(staged.length, 1);
+    assert.equal(staged[0].bundleSha256, distributing.bundleSha256);
     service.recordUpdateApplied(edge.id, rollout.id);
     service.recordUpdateApplied(center.id, rollout.id);
     assert.equal(service.getUpdateRollout(rollout.id).status, 'completed');
+  } finally { database.close(); }
+});
+
+test('相邻链路测速按目标准备、源节点执行，并汇总到端到端通路', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const token = service.createJoinToken(network.id, { parentId: center.id });
+    const edge = service.registerAgent({
+      token: token.token, name: '测速边缘', hasPublicEndpoint: false, wgDataPublicKey: 'm'.repeat(44),
+    }).node;
+    const started = service.createLinkBenchmarks(network.id);
+    assert.deepEqual(started.summary, { total: 1, completed: 0, running: 1, failed: 0 });
+    const prepare = service.claimCommand(center.id);
+    assert.equal(prepare.type, 'prepare-link-benchmark');
+    service.completeCommand(center.id, prepare.id, { ok: true, prepared: true });
+    const execute = service.claimCommand(edge.id);
+    assert.equal(execute.type, 'execute-link-benchmark');
+    assert.equal(execute.payload.expectedNodeId, center.id);
+    service.completeCommand(edge.id, execute.id, {
+      ok: true, latencyMs: 18.25, latencyMinMs: 15.1, latencyP95Ms: 24.2,
+      bandwidthMbps: 96.5, bytes: 2 * 1024 * 1024, durationMs: 173.8,
+      measuredAt: '2026-07-20T08:00:00.000Z',
+    });
+    const summary = service.getBenchmarkSummary(network.id);
+    assert.deepEqual(summary.summary, { total: 1, completed: 1, running: 0, failed: 0 });
+    assert.equal(summary.links[0].benchmark.latencyMs, 18.25);
+    assert.equal(summary.links[0].benchmark.bandwidthMbps, 96.5);
+    const paths = service.getPathOptions(network.id, center.id, edge.id);
+    assert.equal(paths.paths[0].benchmark.status, 'completed');
+    assert.equal(paths.paths[0].benchmark.latencyMs, 18.25);
+    assert.equal(paths.paths[0].benchmark.bandwidthMbps, 96.5);
+  } finally { database.close(); }
+});
+
+test('离线节点延期更新不再卡住全网任务，恢复后继续使用同一缓存制品', () => {
+  const database = new Database(':memory:');
+  const staged = [];
+  const service = new ControlService(database, {
+    publicUrl: 'https://center.example', stageLocalUpdate: (request) => staged.push(request),
+  });
+  try {
+    const network = service.createNetwork({
+      name: '延期更新', dataCidr: '10.92.0.0/24', controlCidr: '10.242.0.0/24', listenPort: 51820, mtu: 1380,
+    });
+    const center = service.listNodes(network.id)[0];
+    const onlineToken = service.createJoinToken(network.id, { parentId: center.id });
+    const online = service.registerAgent({
+      token: onlineToken.token, name: '在线更新节点', hasPublicEndpoint: false, wgDataPublicKey: 'o'.repeat(44),
+    }).node;
+    const offlineToken = service.createJoinToken(network.id, { parentId: center.id });
+    const offline = service.registerAgent({
+      token: offlineToken.token, name: '离线更新节点', hasPublicEndpoint: false, wgDataPublicKey: 'f'.repeat(44),
+    }).node;
+    database.run("UPDATE nodes SET status = 'offline' WHERE id = ?", offline.id);
+    const rollout = service.createUpdateRollout(network.id, center.id);
+    const probe = service.claimCommand(online.id);
+    const bundle = gzipSync(randomBytes(1024));
+    service.completeCommand(online.id, probe.id, {
+      ok: true, installer: '#!/usr/bin/env bash\n# supports --bundle-file\n', bundleBase64: bundle.toString('base64'),
+    });
+    const installOnline = service.claimCommand(online.id);
+    service.completeCommand(online.id, installOnline.id, { ok: true, scheduled: true });
+    assert.equal(staged.length, 1, '在线节点取得制品后才允许协调节点更新');
+    service.recordUpdateApplied(online.id, rollout.id);
+    service.recordUpdateApplied(center.id, rollout.id);
+    const partial = service.getUpdateRollout(rollout.id);
+    assert.equal(partial.status, 'partial');
+    assert.equal(partial.nodes.find((node) => node.nodeId === offline.id).status, 'deferred');
+    service.heartbeat(offline.id, {});
+    const installOffline = service.claimCommand(offline.id);
+    assert.equal(installOffline.type, 'install-update-bundle');
+    assert.equal(installOffline.payload.bundleSha256, partial.bundleSha256);
+    service.completeCommand(offline.id, installOffline.id, { ok: true, scheduled: true });
+    service.recordUpdateApplied(offline.id, rollout.id);
+    assert.equal(service.getUpdateRollout(rollout.id).status, 'completed');
+  } finally { database.close(); }
+});
+
+test('Agent 在领取命令后重启时，过期运行租约会自动回队而不是永久卡住', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const token = service.createJoinToken(network.id, { parentId: center.id });
+    const edge = service.registerAgent({
+      token: token.token, name: '命令续跑节点', hasPublicEndpoint: false, wgDataPublicKey: 'r'.repeat(44),
+    }).node;
+    const queued = service.enqueueCommand(edge.id, 'probe', { reason: 'lease-test' });
+    assert.equal(service.claimCommand(edge.id).id, queued.id);
+    database.run("UPDATE commands SET claimed_at = '2000-01-01T00:00:00.000Z' WHERE id = ?", queued.id);
+    const retried = service.claimCommand(edge.id);
+    assert.equal(retried.id, queued.id);
+    assert.equal(retried.type, 'probe');
   } finally { database.close(); }
 });
 

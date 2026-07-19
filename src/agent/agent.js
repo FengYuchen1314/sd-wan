@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Database } from '../center/database.js';
 import { CoordinatorElection } from '../core/coordinator.js';
+import { executeBenchmark, handleBenchmarkRequest, prepareBenchmark } from '../core/benchmark.js';
 import {
   acceptProbeEnvelope,
   DEFAULT_DATA_PORT,
@@ -144,6 +145,7 @@ let state = loadState();
 const pendingPanelRequests = new Map();
 state.agentInstanceId ||= `agent-${randomBytes(12).toString('hex')}`;
 state.managedChildren ||= {};
+state.pendingBenchmarks ||= {};
 if (args.panelProxyToken || process.env.SDWAN_PANEL_PROXY_TOKEN) {
   state.panelProxyTokenHash = createHash('sha256')
     .update(String(args.panelProxyToken || process.env.SDWAN_PANEL_PROXY_TOKEN))
@@ -801,6 +803,11 @@ async function runCommand(command) {
       result = await fetchUpdateArtifact(command.payload);
     } else if (command.type === 'install-update-bundle') {
       result = stageUpdateArtifact(command.payload);
+    } else if (command.type === 'prepare-link-benchmark') {
+      result = prepareBenchmark(state.pendingBenchmarks, command.payload);
+      atomicJson(stateFile, state);
+    } else if (command.type === 'execute-link-benchmark') {
+      result = await executeBenchmark(command.payload);
     } else {
       throw new Error(`不允许执行命令 ${command.type}`);
     }
@@ -1267,6 +1274,11 @@ const relayServer = createServer(async (req, res) => {
         commandResult,
       }));
     }
+    const requestUrl = new URL(req.url, 'http://pathweaver.local');
+    if (await handleBenchmarkRequest(
+      req, res, requestUrl.pathname, requestUrl, state.pendingBenchmarks,
+      state.nodeId || state.agentInstanceId,
+    )) return;
     const linkProbeMatch = req.url.match(/^\/agent\/v1\/link-probe\/([^/?]+)$/);
     if (req.method === 'POST' && linkProbeMatch) {
       const chunks = [];
@@ -1279,21 +1291,26 @@ const relayServer = createServer(async (req, res) => {
       }
       const accepted = acceptProbeEnvelope(input, state.nodeId || state.agentInstanceId);
       pending.seenProbeIds ||= [];
-      if (pending.seenProbeIds.includes(accepted.probeId)) {
-        res.writeHead(409, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: '重复的链路探测请求已被拒绝' }));
+      pending.probeResponses ||= {};
+      if (pending.probeResponses[accepted.probeId]) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(pending.probeResponses[accepted.probeId]));
       }
       pending.seenProbeIds = [...pending.seenProbeIds.slice(-63), accepted.probeId];
-      atomicJson(stateFile, state);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({
+      const response = {
         ok: true,
         nodeId: state.nodeId,
         probeId: accepted.probeId,
         trace: accepted.trace,
         remainingHops: accepted.remainingHops,
         reachedAt: new Date().toISOString(),
-      }));
+      };
+      pending.probeResponses[accepted.probeId] = response;
+      const retained = new Set(pending.seenProbeIds);
+      for (const id of Object.keys(pending.probeResponses)) if (!retained.has(id)) delete pending.probeResponses[id];
+      atomicJson(stateFile, state);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(response));
     }
     const proxyPathname = new URL(req.url, 'http://pathweaver.local').pathname;
     if (proxyPathname.startsWith('/agent/v1/') || proxyPathname === '/install.sh' || proxyPathname.startsWith('/artifacts/')) {

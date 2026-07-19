@@ -12,6 +12,8 @@ import { ControlService } from './service.js';
 import { WireGuardArtifactStore, wireGuardRuntimeManifest } from './wireguard-artifacts.js';
 import { CoordinatorElection } from '../core/coordinator.js';
 import { verifyPanelPassword } from '../core/password.js';
+import { acceptProbeEnvelope } from '../agent/runtime.js';
+import { executeBenchmark, handleBenchmarkRequest, prepareBenchmark } from '../core/benchmark.js';
 
 const rootDir = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const publicDir = join(rootDir, 'public');
@@ -39,6 +41,9 @@ if (!adminToken && !adminPasswordHash) {
 }
 
 const database = new Database(join(dataDir, 'pathweaver.db'));
+const localPendingLinkProbes = {};
+const localPendingBenchmarks = {};
+let localCommandRunning = false;
 const service = new ControlService(database, {
   publicUrl,
   nodeOfflineAfterMs,
@@ -46,9 +51,12 @@ const service = new ControlService(database, {
   manageLocalCenters: !coordinatorOnly,
   maintainLocalCenters: !coordinatorOnly,
   stageLocalUpdate,
+  storeUpdateArtifact,
+  loadUpdateArtifact,
 });
 const wireGuardArtifacts = new WireGuardArtifactStore(join(dataDir, 'artifacts', 'wireguard'));
 service.ensureDefaultNetwork();
+service.recoverUpdateRollouts();
 
 function stageLocalUpdate({ rolloutId, installer, bundleBase64, bundleSha256 }) {
   if (!/^[0-9a-f-]{36}$/i.test(String(rolloutId || ''))) throw new Error('更新任务 ID 无效');
@@ -63,6 +71,30 @@ function stageLocalUpdate({ rolloutId, installer, bundleBase64, bundleSha256 }) 
   const temporary = `${requestFile}.tmp`;
   writeFileSync(temporary, `${JSON.stringify({ rolloutId, installerFile, bundleFile, bundleSha256 })}\n`, { mode: 0o600 });
   renameSync(temporary, requestFile);
+}
+
+function updateArtifactFiles(rolloutId) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(rolloutId || ''))) throw new Error('更新任务 ID 无效');
+  const directory = join(dataDir, 'update-artifacts', rolloutId);
+  return { directory, installerFile: join(directory, 'install.sh'), bundleFile: join(directory, 'pathweaver.tar.gz') };
+}
+
+function storeUpdateArtifact(rolloutId, artifact) {
+  const files = updateArtifactFiles(rolloutId);
+  mkdirSync(files.directory, { recursive: true, mode: 0o700 });
+  writeFileSync(files.installerFile, artifact.installer, { mode: 0o600 });
+  writeFileSync(files.bundleFile, Buffer.from(artifact.bundleBase64, 'base64'), { mode: 0o600 });
+}
+
+function loadUpdateArtifact(rolloutId) {
+  const files = updateArtifactFiles(rolloutId);
+  const installer = readFileSync(files.installerFile, 'utf8');
+  const bundle = readFileSync(files.bundleFile);
+  return {
+    installer,
+    bundleBase64: bundle.toString('base64'),
+    bundleSha256: createHash('sha256').update(bundle).digest('hex'),
+  };
 }
 
 async function probeGithubUpdateArtifact(request) {
@@ -106,6 +138,11 @@ const centerManagedNodesSweep = setInterval(() => {
   if (!coordinatorOnly) void centerManagedNodes.tick().catch((error) => console.error('center managed-node reconciliation failed:', error));
 }, Math.max(1_000, runtimeSweepIntervalMs));
 centerManagedNodesSweep.unref();
+if (!coordinatorOnly) void processLocalCommands().catch((error) => console.error('local command execution failed:', error));
+const localCommandSweep = setInterval(() => {
+  if (!coordinatorOnly) void processLocalCommands().catch((error) => console.error('local command execution failed:', error));
+}, Math.max(500, Math.min(2_000, runtimeSweepIntervalMs)));
+localCommandSweep.unref();
 const runtimeSweep = setInterval(() => {
   void (async () => {
     try {
@@ -114,6 +151,7 @@ const runtimeSweep = setInterval(() => {
       const beforeRevision = clusterRevision();
       const memberships = clusterMemberships();
       service.reconcileRuntimeState();
+      service.recoverUpdateRollouts();
       if (clusterRevision() > beforeRevision) await replicateSnapshot(memberships);
     } catch (error) {
       console.error(`[${new Date().toISOString()}] runtime state sweep failed:`, error);
@@ -178,6 +216,117 @@ function localNodeId(networkId) {
     } catch {}
   }
   return service.listNodes(networkId).find((node) => node.isCenter)?.id || null;
+}
+
+function tokenMatchesHash(token, expectedHash) {
+  const actual = createHash('sha256').update(String(token || '')).digest();
+  const expected = Buffer.from(String(expectedHash || ''), 'hex');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+async function runLocalCommand(nodeId, command) {
+  if (command.type === 'probe') return { ok: true, nodeId, time: new Date().toISOString() };
+  if (command.type === 'prepare-link-probe') {
+    localPendingLinkProbes[command.payload.validationId] = {
+      nodeId,
+      tokenHash: createHash('sha256').update(command.payload.token).digest('hex'),
+      expiresAt: command.payload.expiresAt,
+      probeResponses: {},
+      seenProbeIds: [],
+    };
+    return { ok: true, prepared: true };
+  }
+  if (command.type === 'execute-link-probe') {
+    const response = await fetch(
+      new URL(`/agent/v1/link-probe/${command.payload.validationId}`, command.payload.remoteUrl),
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: command.payload.token,
+          probeId: command.payload.probeId,
+          trace: [nodeId],
+          remainingHops: Math.max(0, Number(command.payload.maxHops || 16) - 1),
+        }),
+        signal: AbortSignal.timeout(12_000),
+      },
+    );
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || `探测返回 HTTP ${response.status}`);
+    if (result.nodeId !== command.payload.expectedNodeId) throw new Error('目标节点身份与预期不一致');
+    return { ok: true, remoteNodeId: result.nodeId, probeId: result.probeId, trace: result.trace, reachedAt: result.reachedAt };
+  }
+  if (command.type === 'prepare-link-benchmark') {
+    const result = prepareBenchmark(localPendingBenchmarks, command.payload);
+    localPendingBenchmarks[command.payload.itemId].nodeId = nodeId;
+    return result;
+  }
+  if (command.type === 'execute-link-benchmark') {
+    return executeBenchmark(command.payload);
+  }
+  throw new Error(`本机协调节点不支持命令 ${command.type}`);
+}
+
+async function processLocalCommands() {
+  if (localCommandRunning || coordinatorOnly || localIsFollower()) return;
+  localCommandRunning = true;
+  try {
+    for (const network of service.listNetworks()) {
+      const nodeId = localNodeId(network.id);
+      if (!nodeId) continue;
+      const command = service.claimCommand(nodeId);
+      if (!command) continue;
+      let result;
+      try { result = await runLocalCommand(nodeId, command); }
+      catch (error) { result = { ok: false, error: error.message }; }
+      const beforeRevision = clusterRevision();
+      const memberships = clusterMemberships();
+      service.completeCommand(nodeId, command.id, result);
+      if (clusterRevision() > beforeRevision) await replicateSnapshot(memberships);
+    }
+  } finally {
+    localCommandRunning = false;
+  }
+}
+
+async function handleLocalLinkProbe(req, res, pathname) {
+  const match = pathname.match(/^\/agent\/v1\/link-probe\/([^/]+)$/);
+  if (!match || req.method !== 'POST') return false;
+  const input = await readJson(req, 16 * 1024);
+  const validationId = decodeURIComponent(match[1]);
+  let pending = localPendingLinkProbes[validationId];
+  if (!pending) {
+    const row = database.get(
+      'SELECT network_id, upstream_id, downstream_id, validation_token, validation_expires_at FROM topology_links WHERE id = ?',
+      validationId,
+    );
+    const nodeId = row ? localNodeId(row.network_id) : null;
+    if (row?.validation_token && [row.upstream_id, row.downstream_id].includes(nodeId)) {
+      pending = localPendingLinkProbes[validationId] = {
+        nodeId,
+        tokenHash: createHash('sha256').update(row.validation_token).digest('hex'),
+        expiresAt: row.validation_expires_at,
+        probeResponses: {}, seenProbeIds: [],
+      };
+    }
+  }
+  if (!pending || pending.expiresAt <= new Date().toISOString() || !tokenMatchesHash(input.token, pending.tokenHash)) {
+    return send(res, 401, { error: '链路探测凭据无效或已过期' }), true;
+  }
+  const nodeId = pending.nodeId;
+  const accepted = acceptProbeEnvelope(input, nodeId);
+  if (pending.probeResponses[accepted.probeId]) {
+    return send(res, 200, pending.probeResponses[accepted.probeId]), true;
+  }
+  pending.seenProbeIds = [...pending.seenProbeIds.slice(-63), accepted.probeId];
+  const response = {
+    ok: true, nodeId, probeId: accepted.probeId, trace: accepted.trace,
+    remainingHops: accepted.remainingHops, reachedAt: new Date().toISOString(),
+  };
+  pending.probeResponses[accepted.probeId] = response;
+  const retained = new Set(pending.seenProbeIds);
+  for (const id of Object.keys(pending.probeResponses)) if (!retained.has(id)) delete pending.probeResponses[id];
+  return send(res, 200, response), true;
 }
 
 let lastLocalUpdateMarker = '';
@@ -527,6 +676,12 @@ async function handleAdmin(req, res, pathname, url, authenticated = false) {
     return send(res, 202, service.createLinkValidation(params.id, await readJson(req)));
   }
 
+  params = match(pathname, '/api/v1/networks/:id/link-benchmarks');
+  if (req.method === 'GET' && params) return send(res, 200, service.getBenchmarkSummary(params.id));
+  if (req.method === 'POST' && params) {
+    return send(res, 202, service.createLinkBenchmarks(params.id, await readJson(req)));
+  }
+
   params = match(pathname, '/api/v1/networks/:id/path-options');
   if (req.method === 'GET' && params) {
     return send(res, 200, service.getPathOptions(
@@ -853,6 +1008,24 @@ const server = createServer(async (req, res) => {
       });
     }
     if (pathname.startsWith('/peer/v1/')) return await handlePeer(req, res, pathname);
+    if (await handleLocalLinkProbe(req, res, pathname)) return;
+    if (pathname.startsWith('/agent/v1/benchmark/')) {
+      const itemId = decodeURIComponent(pathname.slice('/agent/v1/benchmark/'.length));
+      if (!localPendingBenchmarks[itemId]) {
+        const row = database.get(
+          `SELECT l.network_id, l.benchmark_target_id, l.benchmark_token_hash, l.benchmark_expires_at, l.benchmark_bytes
+           FROM topology_links l WHERE l.id = ?`, itemId,
+        );
+        if (row && row.benchmark_target_id === localNodeId(row.network_id)) {
+          localPendingBenchmarks[itemId] = {
+            nodeId: row.benchmark_target_id, tokenHash: row.benchmark_token_hash,
+            expiresAt: row.benchmark_expires_at, bytes: Number(row.benchmark_bytes || 2 * 1024 * 1024),
+          };
+        }
+      }
+      const nodeId = localPendingBenchmarks[itemId]?.nodeId || service.listNetworks().map((network) => localNodeId(network.id)).find(Boolean);
+      if (await handleBenchmarkRequest(req, res, pathname, url, localPendingBenchmarks, nodeId)) return;
+    }
     if (pathname.startsWith('/api/v1/')) {
       if (req.method === 'GET' || localIsFollower()) return await handleAdmin(req, res, pathname, url);
       return await handleReplicatedMutation(
@@ -884,6 +1057,7 @@ function shutdown() {
   clearInterval(runtimeSweep);
   clearInterval(centerDataPlaneSweep);
   clearInterval(centerManagedNodesSweep);
+  clearInterval(localCommandSweep);
   clearInterval(coordinatorHeartbeatSweep);
   server.close(() => {
     database.close();

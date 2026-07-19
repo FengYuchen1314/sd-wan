@@ -2,6 +2,7 @@ import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:c
 import { containsIPv4, parseCIDR, parseIPv4, usableHost } from '../core/ipv4.js';
 import { enumerateSimplePaths } from '../core/paths.js';
 import { validateAndCompileTopology } from '../core/topology.js';
+import { DEFAULT_BENCHMARK_BYTES } from '../core/benchmark.js';
 
 const now = () => new Date().toISOString();
 const hashSecret = (value) => createHash('sha256').update(String(value)).digest('hex');
@@ -10,6 +11,7 @@ const DEFAULT_DATA_PORT = 19801;
 const PASSIVE_GITHUB_SOURCE = 'https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main';
 const UPDATE_INSTALLER_URL = `${PASSIVE_GITHUB_SOURCE}/scripts/install.sh`;
 const UPDATE_BUNDLE_URL = 'https://github.com/FengYuchen1314/sd-wan/archive/refs/heads/main.tar.gz';
+const COMMAND_LEASE_MS = 90_000;
 const PRIVATE_RANGES = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'].map(parseCIDR);
 
 function rangesOverlap(rangeA, rangeB) {
@@ -344,6 +346,9 @@ export class ControlService {
     this.manageLocalCenters = Boolean(options.manageLocalCenters);
     this.maintainLocalCenters = options.maintainLocalCenters !== false;
     this.stageLocalUpdate = typeof options.stageLocalUpdate === 'function' ? options.stageLocalUpdate : null;
+    this.storeUpdateArtifact = typeof options.storeUpdateArtifact === 'function' ? options.storeUpdateArtifact : null;
+    this.loadUpdateArtifact = typeof options.loadUpdateArtifact === 'function' ? options.loadUpdateArtifact : null;
+    this.updateArtifacts = new Map();
     const offlineAfterMs = Number(options.nodeOfflineAfterMs ?? 20_000);
     this.nodeOfflineAfterMs = Number.isFinite(offlineAfterMs) && offlineAfterMs > 0 ? offlineAfterMs : 20_000;
   }
@@ -365,9 +370,14 @@ export class ControlService {
       timestamp,
     );
     const expiredLinkIds = new Set(expiredLinks.map((link) => link.id));
+    const expiredBenchmarks = this.db.all(
+      `SELECT id FROM topology_links WHERE benchmark_status IN ('preparing', 'testing')
+       AND benchmark_expires_at IS NOT NULL AND benchmark_expires_at <= ?`, timestamp,
+    );
+    const expiredBenchmarkIds = new Set(expiredBenchmarks.map((link) => link.id));
 
     let cancelledCommands = 0;
-    if (staleNodes.length || expiredLinks.length) {
+    if (staleNodes.length || expiredLinks.length || expiredBenchmarks.length) {
       this.db.transaction(() => {
         for (const node of staleNodes) {
           this.db.run("UPDATE nodes SET status = 'offline', updated_at = ? WHERE id = ?", timestamp, node.id);
@@ -401,17 +411,27 @@ export class ControlService {
           this.audit('topology-link.expired', 'topology-link', link.id, { previousStatus: link.validation_status, error });
         }
 
+        for (const benchmark of expiredBenchmarks) {
+          this.db.run(
+            `UPDATE topology_links SET benchmark_status = 'failed', benchmark_error = ?, benchmark_measured_at = ?,
+             benchmark_token_hash = NULL, benchmark_expires_at = NULL WHERE id = ?`,
+            '测速超时：节点未在有效期内完成任务', timestamp, benchmark.id,
+          );
+        }
+
         const queuedCommands = this.db.all(
           `SELECT id, payload_json FROM commands
-           WHERE status IN ('pending', 'running') AND type IN ('prepare-link-probe', 'execute-link-probe')`,
+           WHERE status IN ('pending', 'running') AND type IN (
+             'prepare-link-probe', 'execute-link-probe', 'prepare-link-benchmark', 'execute-link-benchmark'
+           )`,
         );
         for (const command of queuedCommands) {
           let payload;
           try { payload = JSON.parse(command.payload_json); } catch { continue; }
-          if (!expiredLinkIds.has(payload.validationId)) continue;
+          if (!expiredLinkIds.has(payload.validationId) && !expiredBenchmarkIds.has(payload.itemId)) continue;
           this.db.run(
             `UPDATE commands SET status = 'failed', result_json = ?, completed_at = ? WHERE id = ?`,
-            json({ ok: false, error: '连接验证已超时，命令已取消' }), timestamp, command.id,
+            json({ ok: false, error: '连接验证或测速已超时，命令已取消' }), timestamp, command.id,
           );
           cancelledCommands += 1;
         }
@@ -419,7 +439,7 @@ export class ControlService {
     }
 
     const advancedRollouts = this.advanceConfigurationRollouts(timestamp);
-    return { offlineNodes: staleNodes.length, expiredLinks: expiredLinks.length, cancelledCommands, advancedRollouts };
+    return { offlineNodes: staleNodes.length, expiredLinks: expiredLinks.length, expiredBenchmarks: expiredBenchmarks.length, cancelledCommands, advancedRollouts };
   }
 
   audit(action, resourceType, resourceId, detail = {}, actor = 'admin') {
@@ -830,6 +850,19 @@ export class ControlService {
             error: row.validation_probe_error_downstream ?? null,
           },
         },
+        benchmark: row.benchmark_status ? {
+          status: row.benchmark_status,
+          error: row.benchmark_error ?? null,
+          sourceId: row.benchmark_source_id ?? null,
+          targetId: row.benchmark_target_id ?? null,
+          latencyMs: row.benchmark_latency_ms == null ? null : Number(row.benchmark_latency_ms),
+          latencyMinMs: row.benchmark_latency_min_ms == null ? null : Number(row.benchmark_latency_min_ms),
+          latencyP95Ms: row.benchmark_latency_p95_ms == null ? null : Number(row.benchmark_latency_p95_ms),
+          bandwidthMbps: row.benchmark_bandwidth_mbps == null ? null : Number(row.benchmark_bandwidth_mbps),
+          bytes: row.benchmark_bytes == null ? null : Number(row.benchmark_bytes),
+          durationMs: row.benchmark_duration_ms == null ? null : Number(row.benchmark_duration_ms),
+          measuredAt: row.benchmark_measured_at ?? null,
+        } : null,
         validationExpiresAt: row.validation_expires_at,
         validatedAt: row.validated_at,
       });
@@ -867,6 +900,7 @@ export class ControlService {
     if (source.id === target.id) throw new Error('请选择两个不同的节点');
     const nodes = this.listNodes(networkId);
     const links = this.listLinks(networkId, true);
+    const linkById = new Map(links.map((link) => [link.id, link]));
     const result = enumerateSimplePaths({ nodes, links, sourceId: source.id, targetId: target.id });
     const nodeById = new Map(nodes.map((node) => [node.id, node]));
     const [canonicalSourceId, canonicalTargetId] = canonicalNodePair(source.id, target.id);
@@ -887,6 +921,15 @@ export class ControlService {
       target,
       paths: result.paths.map((path) => {
         const failed = path.linkIds.filter((linkId) => failedLinkIds.has(linkId));
+        const benchmarks = path.linkIds.map((linkId) => linkById.get(linkId)?.benchmark).filter(Boolean);
+        const completedBenchmarks = benchmarks.filter((benchmark) => benchmark.status === 'completed');
+        const benchmarkStatus = benchmarks.some((benchmark) => benchmark.status === 'failed')
+          ? 'failed'
+          : benchmarks.some((benchmark) => ['preparing', 'testing'].includes(benchmark.status))
+            ? 'testing'
+            : completedBenchmarks.length === path.linkIds.length && path.linkIds.length
+              ? 'completed'
+              : 'untested';
         return {
           ...path,
           nodes: path.nodeIds.map((nodeId) => {
@@ -897,6 +940,19 @@ export class ControlService {
           weight: selectedWeights.get(path.id) ?? 1,
           available: failed.length === 0,
           failedLinkIds: failed,
+          benchmark: {
+            status: benchmarkStatus,
+            latencyMs: benchmarkStatus === 'completed'
+              ? Number(completedBenchmarks.reduce((total, benchmark) => total + benchmark.latencyMs, 0).toFixed(2))
+              : null,
+            bandwidthMbps: benchmarkStatus === 'completed'
+              ? Math.min(...completedBenchmarks.map((benchmark) => benchmark.bandwidthMbps))
+              : null,
+            measuredAt: benchmarkStatus === 'completed'
+              ? completedBenchmarks.map((benchmark) => benchmark.measuredAt).filter(Boolean).sort().at(0) || null
+              : null,
+            error: benchmarks.find((benchmark) => benchmark.status === 'failed')?.error || null,
+          },
         };
       }),
       truncated: result.truncated,
@@ -1269,6 +1325,8 @@ export class ControlService {
     const downstream = this.getNode(input.nodeBId);
     if (upstream.networkId !== networkId || downstream.networkId !== networkId) throw new Error('所选节点不属于当前节点组');
     if (upstream.id === downstream.id) throw new Error('请选择两个不同节点');
+    const unavailable = [upstream, downstream].find((node) => !node.isCoordinator && node.status !== 'online');
+    if (unavailable) throw new Error(`节点 ${unavailable.name} 当前离线，不能开始直连验证`);
 
     const duplicate = this.db.get(
       `SELECT id, validation_status FROM topology_links WHERE network_id = ?
@@ -1875,6 +1933,264 @@ export class ControlService {
     return { id, nodeId, type, payload, status: 'pending' };
   }
 
+  createLinkBenchmarks(networkId, input = {}) {
+    this.getNetwork(networkId);
+    const activeLinks = this.listLinks(networkId, true);
+    let linkIds;
+    if (input.sourceId && input.targetId) {
+      const details = this.getPathOptions(networkId, input.sourceId, input.targetId);
+      linkIds = [...new Set(details.paths.flatMap((path) => path.linkIds))];
+      if (!linkIds.length) throw new Error('所选节点之间没有可测速的已验证通路');
+    } else {
+      linkIds = activeLinks.map((link) => link.id);
+      if (!linkIds.length) throw new Error('当前拓扑没有可测速的相邻链路');
+    }
+    const activeById = new Map(activeLinks.map((link) => [link.id, link]));
+    const timestamp = now();
+    const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+    const bytes = Math.max(64 * 1024, Math.min(4 * 1024 * 1024, Number(input.bytes) || DEFAULT_BENCHMARK_BYTES));
+    for (const linkId of linkIds) {
+      const link = activeById.get(linkId);
+      if (!link) continue;
+      const sourceId = link.downstreamEndpoint ? link.upstreamId : link.upstreamEndpoint ? link.downstreamId : link.upstreamId;
+      const targetId = sourceId === link.upstreamId ? link.downstreamId : link.upstreamId;
+      const source = this.getNode(sourceId);
+      const target = this.getNode(targetId);
+      const online = (node) => node.isCoordinator || node.status === 'online';
+      if (!online(source) || !online(target)) {
+        this.db.run(
+          `UPDATE topology_links SET benchmark_status = 'failed', benchmark_error = ?,
+           benchmark_source_id = ?, benchmark_target_id = ?, benchmark_measured_at = ? WHERE id = ?`,
+          `节点离线：${!online(source) ? source.name : target.name}`, sourceId, targetId, timestamp, link.id,
+        );
+        continue;
+      }
+      const token = `pwb_${randomBytes(24).toString('base64url')}`;
+      this.db.run(
+        `UPDATE topology_links SET benchmark_status = 'preparing', benchmark_error = NULL,
+         benchmark_source_id = ?, benchmark_target_id = ?, benchmark_token_hash = ?, benchmark_expires_at = ?,
+         benchmark_latency_ms = NULL, benchmark_latency_min_ms = NULL, benchmark_latency_p95_ms = NULL,
+         benchmark_bandwidth_mbps = NULL, benchmark_bytes = ?, benchmark_duration_ms = NULL,
+         benchmark_measured_at = NULL WHERE id = ?`,
+        sourceId, targetId, hashSecret(token), expiresAt, bytes, link.id,
+      );
+      this.enqueueCommand(targetId, 'prepare-link-benchmark', {
+        itemId: link.id, token, expiresAt, bytes,
+      });
+    }
+    this.audit('topology.benchmark', 'network', networkId, { linkIds, sourceId: input.sourceId, targetId: input.targetId, bytes });
+    return this.getBenchmarkSummary(networkId, linkIds);
+  }
+
+  getBenchmarkSummary(networkId, requestedLinkIds = null) {
+    const requested = requestedLinkIds ? new Set(requestedLinkIds) : null;
+    const links = this.listLinks(networkId, true).filter((link) => !requested || requested.has(link.id));
+    return {
+      links: links.map((link) => ({ id: link.id, benchmark: link.benchmark })),
+      summary: {
+        total: links.length,
+        completed: links.filter((link) => link.benchmark?.status === 'completed').length,
+        running: links.filter((link) => ['preparing', 'testing'].includes(link.benchmark?.status)).length,
+        failed: links.filter((link) => link.benchmark?.status === 'failed').length,
+      },
+    };
+  }
+
+  advanceLinkBenchmark(nodeId, commandType, payload, result) {
+    const row = this.db.get('SELECT * FROM topology_links WHERE id = ?', payload.itemId);
+    if (!row) return;
+    if (!payload.token || row.benchmark_token_hash !== hashSecret(payload.token)) return;
+    if (commandType === 'prepare-link-benchmark') {
+      if (row.benchmark_target_id !== nodeId || row.benchmark_status !== 'preparing') return;
+      if (!result.ok) {
+        this.db.run(
+          "UPDATE topology_links SET benchmark_status = 'failed', benchmark_error = ?, benchmark_measured_at = ? WHERE id = ?",
+          result.error || '目标节点无法准备测速', now(), row.id,
+        );
+        return;
+      }
+      const target = this.getNode(row.benchmark_target_id);
+      const command = this.enqueueCommand(row.benchmark_source_id, 'execute-link-benchmark', {
+        itemId: row.id,
+        token: payload.token,
+        bytes: payload.bytes,
+        remoteUrl: `http://${target.dataIp}:${target.controlListenPort || 8790}`,
+        expectedNodeId: target.id,
+      });
+      this.db.run(
+        "UPDATE topology_links SET benchmark_status = 'testing', benchmark_error = NULL WHERE id = ?",
+        row.id,
+      );
+      return command;
+    }
+    if (commandType !== 'execute-link-benchmark' || row.benchmark_source_id !== nodeId) return;
+    if (!result.ok) {
+      this.db.run(
+        "UPDATE topology_links SET benchmark_status = 'failed', benchmark_error = ?, benchmark_measured_at = ? WHERE id = ?",
+        result.error || '链路测速失败', now(), row.id,
+      );
+      return;
+    }
+    const latencyMs = Number(result.latencyMs);
+    const bandwidthMbps = Number(result.bandwidthMbps);
+    if (!Number.isFinite(latencyMs) || latencyMs < 0 || !Number.isFinite(bandwidthMbps) || bandwidthMbps <= 0) {
+      this.db.run(
+        "UPDATE topology_links SET benchmark_status = 'failed', benchmark_error = ?, benchmark_measured_at = ? WHERE id = ?",
+        '节点返回的测速结果无效', now(), row.id,
+      );
+      return;
+    }
+    this.db.run(
+      `UPDATE topology_links SET benchmark_status = 'completed', benchmark_error = NULL,
+       benchmark_latency_ms = ?, benchmark_latency_min_ms = ?, benchmark_latency_p95_ms = ?,
+       benchmark_bandwidth_mbps = ?, benchmark_bytes = ?, benchmark_duration_ms = ?,
+       benchmark_measured_at = ?, benchmark_token_hash = NULL, benchmark_expires_at = NULL WHERE id = ?`,
+      latencyMs, Number(result.latencyMinMs), Number(result.latencyP95Ms), bandwidthMbps,
+      Number(result.bytes), Number(result.durationMs), result.measuredAt || now(), row.id,
+    );
+  }
+
+  saveUpdateArtifact(rolloutId, artifact) {
+    this.updateArtifacts.set(rolloutId, artifact);
+    if (this.storeUpdateArtifact) this.storeUpdateArtifact(rolloutId, artifact);
+  }
+
+  readUpdateArtifact(rolloutId) {
+    const cached = this.updateArtifacts.get(rolloutId);
+    if (cached) return cached;
+    if (!this.loadUpdateArtifact) throw new Error('更新制品缓存不存在，请重新发起全网更新');
+    const artifact = this.loadUpdateArtifact(rolloutId);
+    this.updateArtifacts.set(rolloutId, artifact);
+    return artifact;
+  }
+
+  finalizeUpdateRollout(rolloutId) {
+    const rollout = this.db.get('SELECT * FROM update_rollouts WHERE id = ?', rolloutId);
+    if (!rollout || !['distributing', 'partial', 'completed'].includes(rollout.status)) return;
+    const rows = this.db.all('SELECT status FROM update_rollout_nodes WHERE rollout_id = ?', rolloutId);
+    const blocking = rows.filter((row) => !['completed', 'failed', 'deferred'].includes(row.status));
+    if (blocking.length) return;
+    const failures = rows.filter((row) => row.status === 'failed').length;
+    const deferred = rows.filter((row) => row.status === 'deferred').length;
+    const status = failures || deferred ? 'partial' : 'completed';
+    const details = [failures ? `${failures} 台节点更新失败` : '', deferred ? `${deferred} 台离线节点已延期` : ''].filter(Boolean).join('；');
+    this.db.run(
+      'UPDATE update_rollouts SET status = ?, error = ?, completed_at = ? WHERE id = ?',
+      status, details || null, now(), rolloutId,
+    );
+  }
+
+  maybeStageLocalUpdate(rolloutId) {
+    const rollout = this.db.get('SELECT * FROM update_rollouts WHERE id = ?', rolloutId);
+    if (!rollout || rollout.status !== 'distributing') return;
+    const networkNodes = this.listNodes(rollout.network_id);
+    const localNode = networkNodes.find((node) => node.isCoordinator) || networkNodes.find((node) => node.isCenter);
+    if (!localNode) return;
+    const localRow = this.db.get(
+      'SELECT status FROM update_rollout_nodes WHERE rollout_id = ? AND node_id = ?', rolloutId, localNode.id,
+    );
+    if (!localRow || localRow.status !== 'waiting-local') return;
+    const remoteBlocking = Number(this.db.get(
+      `SELECT COUNT(*) AS count FROM update_rollout_nodes
+       WHERE rollout_id = ? AND node_id != ? AND status IN ('probing', 'source-ready', 'queued', 'installing')`,
+      rolloutId, localNode.id,
+    ).count);
+    if (remoteBlocking) return;
+    if (!this.stageLocalUpdate) {
+      this.db.run(
+        "UPDATE update_rollout_nodes SET status = 'failed', error = ?, updated_at = ? WHERE rollout_id = ? AND node_id = ?",
+        '当前面板没有本机更新执行器', now(), rolloutId, localNode.id,
+      );
+      this.finalizeUpdateRollout(rolloutId);
+      return;
+    }
+    try {
+      const artifact = this.readUpdateArtifact(rolloutId);
+      this.stageLocalUpdate({ rolloutId, nodeId: localNode.id, ...artifact });
+      this.db.run(
+        "UPDATE update_rollout_nodes SET status = 'scheduled', error = NULL, updated_at = ? WHERE rollout_id = ? AND node_id = ?",
+        now(), rolloutId, localNode.id,
+      );
+    } catch (error) {
+      this.db.run(
+        "UPDATE update_rollout_nodes SET status = 'failed', error = ?, updated_at = ? WHERE rollout_id = ? AND node_id = ?",
+        error.message, now(), rolloutId, localNode.id,
+      );
+      this.finalizeUpdateRollout(rolloutId);
+    }
+  }
+
+  recoverUpdateRollouts() {
+    const recovered = [];
+    for (const rollout of this.db.all("SELECT * FROM update_rollouts WHERE status IN ('probing', 'distributing')")) {
+      if (rollout.status === 'probing') {
+        this.db.run(
+          `UPDATE update_rollout_nodes SET status = 'probe-failed', error = ?, updated_at = ?
+           WHERE rollout_id = ? AND status = 'probing' AND node_id IN (
+             SELECT id FROM nodes WHERE status != 'online' AND is_center = 0
+           )`,
+          '节点在 GitHub 探测期间离线', now(), rollout.id,
+        );
+        const remaining = Number(this.db.get(
+          "SELECT COUNT(*) AS count FROM update_rollout_nodes WHERE rollout_id = ? AND status = 'probing'", rollout.id,
+        ).count);
+        if (!remaining) {
+          this.db.run(
+            "UPDATE update_rollouts SET status = 'failed', error = ?, completed_at = ? WHERE id = ?",
+            '所有可用节点均未取得 GitHub 更新制品', now(), rollout.id,
+          );
+        }
+        continue;
+      }
+      try {
+        this.readUpdateArtifact(rollout.id);
+      } catch {
+        let migrated = false;
+        for (const command of this.db.all("SELECT payload_json FROM commands WHERE type = 'install-update-bundle'")) {
+          let payload;
+          try { payload = JSON.parse(command.payload_json); } catch { continue; }
+          if (payload.rolloutId !== rollout.id || !payload.bundleBase64 || !payload.installer) continue;
+          try {
+            this.saveUpdateArtifact(rollout.id, this.validateUpdateArtifact(payload));
+            migrated = true;
+            break;
+          } catch {}
+        }
+        if (!migrated) {
+          this.db.run(
+            "UPDATE update_rollouts SET status = 'failed', error = ?, completed_at = ? WHERE id = ?",
+            '旧更新任务缺少可恢复的制品缓存，请重新点击一键更新', now(), rollout.id,
+          );
+          this.db.run(
+            `UPDATE update_rollout_nodes SET status = 'failed', error = ?, updated_at = ?
+             WHERE rollout_id = ? AND status NOT IN ('completed', 'failed')`,
+            '更新制品缓存已丢失', now(), rollout.id,
+          );
+          continue;
+        }
+      }
+      this.db.run(
+        `UPDATE update_rollout_nodes SET status = 'deferred', error = ?, updated_at = ?
+         WHERE rollout_id = ? AND status = 'queued' AND node_id IN (
+           SELECT id FROM nodes WHERE status != 'online' AND is_center = 0
+         )`,
+        '节点离线，恢复后将继续执行已排队更新', now(), rollout.id,
+      );
+      const localNode = this.listNodes(rollout.network_id).find((node) => node.isCoordinator) ||
+        this.listNodes(rollout.network_id).find((node) => node.isCenter);
+      if (localNode) {
+        this.db.run(
+          "UPDATE update_rollout_nodes SET status = 'waiting-local', error = ?, updated_at = ? WHERE rollout_id = ? AND node_id = ? AND status = 'source-ready'",
+          '等待更新制品先送达其他在线节点', now(), rollout.id, localNode.id,
+        );
+      }
+      this.maybeStageLocalUpdate(rollout.id);
+      this.finalizeUpdateRollout(rollout.id);
+      recovered.push(rollout.id);
+    }
+    return recovered;
+  }
+
   createUpdateRollout(networkId, localNodeId) {
     this.getNetwork(networkId);
     const active = this.db.get(
@@ -1973,6 +2289,7 @@ export class ControlService {
       "UPDATE update_rollout_nodes SET status = 'source-ready', error = NULL, updated_at = ? WHERE rollout_id = ? AND node_id = ?",
       timestamp, rolloutId, nodeId,
     );
+    this.saveUpdateArtifact(rolloutId, artifact);
 
     const networkNodes = this.listNodes(rollout.network_id);
     const localNode = networkNodes.find((node) => node.isCoordinator) || networkNodes.find((node) => node.isCenter);
@@ -1992,32 +2309,25 @@ export class ControlService {
       if (target.isCenter) continue;
       const command = this.enqueueCommand(target.id, 'install-update-bundle', {
         rolloutId,
-        installer: artifact.installer,
-        bundleBase64: artifact.bundleBase64,
         bundleSha256: artifact.bundleSha256,
       });
       this.db.run(
-        "UPDATE update_rollout_nodes SET status = 'queued', command_id = ?, error = NULL, updated_at = ? WHERE rollout_id = ? AND node_id = ?",
-        command.id, timestamp, rolloutId, target.id,
+        'UPDATE update_rollout_nodes SET status = ?, command_id = ?, error = ?, updated_at = ? WHERE rollout_id = ? AND node_id = ?',
+        target.status === 'online' ? 'queued' : 'deferred', command.id,
+        target.status === 'online' ? null : '节点离线，恢复后将继续执行已排队更新',
+        timestamp, rolloutId, target.id,
       );
     }
-    if (localNode && this.stageLocalUpdate) {
-      try {
-        this.stageLocalUpdate({ rolloutId, nodeId: localNode.id, ...artifact });
-        this.db.run(
-          "UPDATE update_rollout_nodes SET status = 'scheduled', error = NULL, updated_at = ? WHERE rollout_id = ? AND node_id = ?",
-          timestamp, rolloutId, localNode.id,
-        );
-      } catch (error) {
-        this.db.run(
-          "UPDATE update_rollout_nodes SET status = 'failed', error = ?, updated_at = ? WHERE rollout_id = ? AND node_id = ?",
-          error.message, timestamp, rolloutId, localNode.id,
-        );
-      }
+    if (localNode) {
+      this.db.run(
+        "UPDATE update_rollout_nodes SET status = 'waiting-local', error = ?, updated_at = ? WHERE rollout_id = ? AND node_id = ?",
+        '等待更新制品先送达其他在线节点', timestamp, rolloutId, localNode.id,
+      );
     }
     this.audit('update-rollout.source', 'update-rollout', rolloutId, {
       sourceNodeId: nodeId, sourceKind, bundleSha256: artifact.bundleSha256,
     });
+    this.maybeStageLocalUpdate(rolloutId);
     return this.getUpdateRollout(rolloutId);
   }
 
@@ -2034,19 +2344,8 @@ export class ControlService {
       'UPDATE update_rollout_nodes SET status = ?, error = ?, updated_at = ? WHERE rollout_id = ? AND node_id = ?',
       error ? 'failed' : 'completed', error, timestamp, rolloutId, nodeId,
     );
-    const unfinished = Number(this.db.get(
-      "SELECT COUNT(*) AS count FROM update_rollout_nodes WHERE rollout_id = ? AND status NOT IN ('completed', 'failed')",
-      rolloutId,
-    ).count);
-    if (!unfinished) {
-      const failures = Number(this.db.get(
-        "SELECT COUNT(*) AS count FROM update_rollout_nodes WHERE rollout_id = ? AND status = 'failed'", rolloutId,
-      ).count);
-      this.db.run(
-        'UPDATE update_rollouts SET status = ?, error = ?, completed_at = ? WHERE id = ?',
-        failures ? 'partial' : 'completed', failures ? `${failures} 台节点更新失败` : null, timestamp, rolloutId,
-      );
-    }
+    this.maybeStageLocalUpdate(rolloutId);
+    this.finalizeUpdateRollout(rolloutId);
     return this.getUpdateRollout(rolloutId);
   }
 
@@ -2088,12 +2387,28 @@ export class ControlService {
   }
 
   claimCommand(nodeId) {
-    return this.db.transaction(() => {
+    const claimed = this.db.transaction(() => {
+      const staleBefore = new Date(Date.now() - COMMAND_LEASE_MS).toISOString();
+      this.db.run(
+        "UPDATE commands SET status = 'pending', claimed_at = NULL WHERE node_id = ? AND status = 'running' AND claimed_at < ?",
+        nodeId, staleBefore,
+      );
       const row = this.db.get("SELECT * FROM commands WHERE node_id = ? AND status = 'pending' ORDER BY created_at LIMIT 1", nodeId);
       if (!row) return null;
       this.db.run("UPDATE commands SET status = 'running', claimed_at = ? WHERE id = ?", now(), row.id);
-      return { id: row.id, type: row.type, payload: JSON.parse(row.payload_json), createdAt: row.created_at };
+      const payload = JSON.parse(row.payload_json);
+      if (row.type === 'install-update-bundle') {
+        this.db.run(
+          "UPDATE update_rollout_nodes SET status = 'installing', error = NULL, updated_at = ? WHERE rollout_id = ? AND node_id = ?",
+          now(), payload.rolloutId, nodeId,
+        );
+      }
+      return { id: row.id, type: row.type, payload, createdAt: row.created_at };
     });
+    if (claimed?.type === 'install-update-bundle') {
+      claimed.payload = { ...claimed.payload, ...this.readUpdateArtifact(claimed.payload.rolloutId) };
+    }
+    return claimed;
   }
 
   completeCommand(nodeId, commandId, input) {
@@ -2112,6 +2427,9 @@ export class ControlService {
       this.advanceLinkValidation(nodeId, row.type, JSON.parse(row.payload_json), input);
     }
     const payload = JSON.parse(row.payload_json);
+    if (row.type === 'prepare-link-benchmark' || row.type === 'execute-link-benchmark') {
+      this.advanceLinkBenchmark(nodeId, row.type, payload, input);
+    }
     if (row.type === 'probe-update-source') {
       this.recordUpdateProbe(payload.rolloutId, nodeId, input);
     } else if (row.type === 'install-update-bundle') {
@@ -2120,6 +2438,8 @@ export class ControlService {
         input.ok ? 'scheduled' : 'failed', input.ok ? null : (input.error || '无法安排本机更新'),
         now(), payload.rolloutId, nodeId,
       );
+      this.maybeStageLocalUpdate(payload.rolloutId);
+      this.finalizeUpdateRollout(payload.rolloutId);
     }
     return { id: commandId, status };
   }

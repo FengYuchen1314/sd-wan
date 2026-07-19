@@ -172,7 +172,7 @@ function renderUpdateSummary(update) {
   if (!update) return '<div class="notice"><strong>尚未执行全网更新</strong><span>点击后，各在线节点并行探测 GitHub；首个成功节点上传一次制品，其他节点无需访问 GitHub。</span></div>';
   const labels = {
     probing: '正在探测 GitHub', distributing: '正在分发', completed: '全部完成',
-    partial: '部分失败', failed: '更新失败',
+    partial: '部分完成', failed: '更新失败',
   };
   const completed = update.nodes.filter((node) => node.status === 'completed').length;
   const failed = update.nodes.filter((node) => node.status === 'failed').length;
@@ -385,6 +385,10 @@ function linkStatusText(link) {
   if (link.validationStatus === 'preparing') return `等待 Agent ${link.validationProgress?.prepared || 0}/2`;
   if (link.validationStatus === 'probing') return `连通性探测 ${link.validationProgress?.probed || 0}/${link.validationProgress?.requested || 1}`;
   if (link.validationStatus === 'failed') return link.validationError?.includes('超时') ? '验证超时' : '验证失败';
+  if (link.benchmark?.status === 'preparing') return '测速准备中';
+  if (link.benchmark?.status === 'testing') return '测速中';
+  if (link.benchmark?.status === 'failed') return '测速失败';
+  if (link.benchmark?.status === 'completed') return `${link.benchmark.latencyMs} ms · ${link.benchmark.bandwidthMbps} Mbps`;
   if (link.validationProgress?.successful === 1) return '单向可用';
   return '';
 }
@@ -425,9 +429,11 @@ function renderTopology() {
   const selected = state.selectedNodeIds.map((id) => state.topology.nodes.find((node) => node.id === id)).filter(Boolean);
   const waiting = state.topology.links.filter((link) => link.validationStatus === 'preparing').length;
   const probing = state.topology.links.filter((link) => link.validationStatus === 'probing').length;
+  const benchmarking = state.topology.links.filter((link) => ['preparing', 'testing'].includes(link.benchmark?.status)).length;
   const validationText = [
     waiting ? `${waiting} 条等待 Agent` : '',
     probing ? `${probing} 条正在探测已填写方向（任一成功即可）` : '',
+    benchmarking ? `${benchmarking} 条正在测速` : '',
   ].filter(Boolean).join(' · ') || '可建立直连或查看端到端路径';
   const selectionText = selected.length === 0
     ? '点击画布中的两个节点'
@@ -438,7 +444,7 @@ function renderTopology() {
     <div class="card-head"><div><h2>可视化拓扑编辑</h2><p>布局随连接关系自动收敛；拖动节点后会固定该节点的位置</p></div><span class="status ${valid ? 'active' : 'failed'}">${valid ? '全网可达' : '需要修复'}</span></div>
     <div class="graph-toolbar">
       <div class="graph-toolbar-main"><span class="selection-count">${selected.length}/2</span><span class="selection-copy"><strong>${escapeHtml(selectionText)}</strong><small>${validationText}</small></span></div>
-      <div class="graph-actions"><button class="button ghost" id="clear-node-selection" ${selected.length ? '' : 'disabled'}>取消选择</button><button class="button ghost" id="connect-selected" ${selected.length === 2 ? '' : 'disabled'}>建立连接</button><button class="button primary" id="detail-selected" ${selected.length === 2 ? '' : 'disabled'}>详细配置</button></div>
+      <div class="graph-actions"><button class="button ghost" id="benchmark-adjacent" ${benchmarking || !state.topology.links.some((link) => link.validationStatus === 'active') ? 'disabled' : ''}>${benchmarking ? '测速进行中' : '一键测速相邻链路'}</button><button class="button ghost" id="clear-node-selection" ${selected.length ? '' : 'disabled'}>取消选择</button><button class="button ghost" id="connect-selected" ${selected.length === 2 ? '' : 'disabled'}>建立连接</button><button class="button primary" id="detail-selected" ${selected.length === 2 ? '' : 'disabled'}>详细配置</button></div>
     </div>
     ${renderTopologyGraph()}
     <div class="graph-legend"><span>已验证通路</span><span class="waiting">等待 Agent</span><span class="probing">按填写方向探测 · 任一成功可用</span><span class="failed">所填方向均失败</span><span class="graph-legend-hint">点击节点进行选择</span></div>
@@ -495,11 +501,18 @@ function renderPathDetail() {
       : !failoverMode && selected
         ? `<strong>运行中 · ${share}%</strong><small>链路恢复后会自动加入</small>`
         : `<strong>${selected && failoverMode ? '默认线路' : `${path.hops} 跳`}</strong><small>${failoverMode && !selected ? `故障候选 · 成本 ${path.totalCost}` : `成本 ${path.totalCost}`}</small>`;
+    const benchmark = path.benchmark?.status === 'completed'
+      ? `<span class="path-benchmark success">${path.benchmark.latencyMs} ms · ${path.benchmark.bandwidthMbps} Mbps</span>`
+      : path.benchmark?.status === 'testing'
+        ? '<span class="path-benchmark running">正在测试各段链路…</span>'
+        : path.benchmark?.status === 'failed'
+          ? `<span class="path-benchmark failed" title="${escapeHtml(path.benchmark.error || '')}">测速失败</span>`
+          : '<span class="path-benchmark">尚未测速</span>';
     return `<label class="path-lane ${selected ? 'selected' : ''} ${unavailable ? 'unavailable' : ''}">
       <input class="path-option" type="${failoverMode ? 'radio' : 'checkbox'}" ${failoverMode ? 'name="defaultPath"' : ''} value="${path.id}" ${selected ? 'checked' : ''}>
       <span class="path-lane-index">P${String(index + 1).padStart(2, '0')}</span>
       <span class="path-chain">${chain}</span>
-      <span class="path-lane-meta">${status}</span>
+      <span class="path-lane-meta">${status}${benchmark}</span>
     </label>`;
   }).join('') : '<div class="empty"><strong>没有可用路径</strong>当前两个节点之间不存在由已验证连接组成的无环路径。</div>';
   const weights = selectedPaths.map((path, index) => {
@@ -508,7 +521,7 @@ function renderPathDetail() {
     return `<label class="path-weight-row ${path.available === false ? 'unavailable' : ''}"><span>P${String(details.paths.indexOf(path) + 1).padStart(2, '0')}</span><input class="path-weight" data-path-id="${path.id}" type="number" min="1" max="1000" value="${weight}"><strong data-weight-share="${path.id}">${path.available === false ? '暂时剔除' : `${share}%`}</strong></label>`;
   }).join('');
   return `<article class="card path-detail-card">
-    <div class="card-head"><div><p class="eyebrow">END-TO-END PATHS</p><h2>${escapeHtml(details.source.name)} ↔ ${escapeHtml(details.target.name)}</h2><p>${details.paths.length} 条无环路径${details.truncated ? ' · 已按安全上限截断' : ''}；每条路径内部不会重复节点</p></div><a class="button ghost" href="#topology">返回主拓扑</a></div>
+    <div class="card-head"><div><p class="eyebrow">END-TO-END PATHS</p><h2>${escapeHtml(details.source.name)} ↔ ${escapeHtml(details.target.name)}</h2><p>${details.paths.length} 条无环路径${details.truncated ? ' · 已按安全上限截断' : ''}；延迟为各段之和，带宽取路径瓶颈</p></div><div class="graph-actions"><button class="button primary small" id="benchmark-paths" ${details.paths.some((path) => path.benchmark?.status === 'testing') || !details.paths.length ? 'disabled' : ''}>${details.paths.some((path) => path.benchmark?.status === 'testing') ? '通路测速中' : '一键测试全部通路'}</button><a class="button ghost" href="#topology">返回主拓扑</a></div></div>
     <div class="path-endpoints"><span><strong>${escapeHtml(details.source.name)}</strong><small>${escapeHtml(details.source.dataIp)}</small></span><span>${details.paths.length} 条路径</span><span><strong>${escapeHtml(details.target.name)}</strong><small>${escapeHtml(details.target.dataIp)}</small></span></div>
     <div class="path-mode-bar segmented"><label><input class="path-mode" type="radio" name="pathMode" value="failover" ${failoverMode ? 'checked' : ''}><span>默认线路与故障切换</span></label><label title="${details.paths.length < 2 ? '至少需要两条无环路径' : ''}"><input class="path-mode" type="radio" name="pathMode" value="weighted" ${failoverMode ? '' : 'checked'} ${details.paths.length < 2 ? 'disabled' : ''}><span>负载均衡</span></label></div>
     <div class="path-lanes">${lanes}</div>
@@ -790,6 +803,11 @@ function bindViewEvents() {
   document.querySelector('#clear-node-selection')?.addEventListener('click', () => { state.selectedNodeIds = []; render(); });
   document.querySelector('#connect-selected')?.addEventListener('click', openConnectionDialog);
   document.querySelector('#detail-selected')?.addEventListener('click', openPathDetail);
+  document.querySelector('#benchmark-adjacent')?.addEventListener('click', () => startLinkBenchmarks());
+  document.querySelector('#benchmark-paths')?.addEventListener('click', () => startLinkBenchmarks({
+    sourceId: state.pathDetail?.source.id,
+    targetId: state.pathDetail?.target.id,
+  }));
   document.querySelectorAll('.path-mode').forEach((radio) => radio.addEventListener('change', () => {
     state.pathMode = radio.value;
     if (state.pathMode === 'failover') {
@@ -869,6 +887,28 @@ async function startNetworkUpdate() {
     await api(`/api/v1/networks/${state.networkId}/update-rollouts`, { method: 'POST', body: '{}' });
     await load();
     toast('已开始探测 GitHub；首个成功节点会把同一更新制品分发到全网');
+  } catch (error) {
+    if (button) button.disabled = false;
+    toast(error.message, 'error');
+  }
+}
+
+async function startLinkBenchmarks(scope = {}) {
+  const button = document.querySelector(scope.sourceId ? '#benchmark-paths' : '#benchmark-adjacent');
+  if (button) button.disabled = true;
+  try {
+    await api(`/api/v1/networks/${state.networkId}/link-benchmarks`, {
+      method: 'POST',
+      body: JSON.stringify(scope),
+    });
+    if (state.view === 'path-detail' && scope.sourceId && scope.targetId) {
+      await loadPathDetail(scope.sourceId, scope.targetId);
+      render();
+      toast('已开始测试这些通路的每一段；总延迟和瓶颈带宽会自动汇总');
+    } else {
+      await load();
+      toast('已开始测试所有相邻链路的延迟与上行带宽');
+    }
   } catch (error) {
     if (button) button.disabled = false;
     toast(error.message, 'error');

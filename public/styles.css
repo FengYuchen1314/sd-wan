@@ -204,6 +204,10 @@ h3 { font-size: 14px; font-weight: 500; }
 .path-lane-meta strong, .path-lane-meta small { display: block; }
 .path-lane-meta strong { color: var(--text); font-size: 10px; font-weight: 500; }
 .path-lane-meta small { margin-top: 4px; color: var(--subtle); font-size: 8px; }
+.path-benchmark { display: block; margin-top: 7px; color: var(--muted); font: 8px ui-monospace, monospace; }
+.path-benchmark.success { color: var(--green); }
+.path-benchmark.running { color: var(--blue); }
+.path-benchmark.failed { color: var(--red); }
 .path-weight-row.unavailable { opacity: .7; }
 .path-weight-row.unavailable strong { color: var(--red); }
 .path-policy-editor { padding: 18px; display: grid; grid-template-columns: minmax(170px, .65fr) minmax(260px, 1.35fr) auto; align-items: center; gap: 20px; border-top: 1px solid var(--line); }
