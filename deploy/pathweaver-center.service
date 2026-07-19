@@ -1,0 +1,26 @@
+[Unit]
+Description=PathWeaver SD-WAN Center
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pathweaver
+Group=pathweaver
+WorkingDirectory=/opt/pathweaver
+ExecStart=/usr/bin/node /opt/pathweaver/src/center/server.js
+Environment=NODE_ENV=production
+Environment=SDWAN_HOST=0.0.0.0
+Environment=SDWAN_PORT=8787
+Environment=SDWAN_DATA_DIR=/var/lib/pathweaver
+EnvironmentFile=/etc/pathweaver/center.env
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/pathweaver
+
+[Install]
+WantedBy=multi-user.target

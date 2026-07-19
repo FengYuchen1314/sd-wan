@@ -1,0 +1,16 @@
+{
+  "name": "pathweaver-sdwan",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted topology-controlled WireGuard SD-WAN",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node src/center/server.js",
+    "start:agent": "node src/agent/agent.js",
+    "dev": "node --watch src/center/server.js",
+    "test": "node --test"
+  }
+}
