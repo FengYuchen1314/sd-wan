@@ -11,6 +11,7 @@ export function createCenterBundle(rootDir) {
       'public',
       'scripts/install.sh',
       'scripts/update.sh',
+      'scripts/apply-update-request.sh',
       'scripts/uninstall.sh',
     ], { cwd: rootDir, maxBuffer: 32 * 1024 * 1024 });
   }

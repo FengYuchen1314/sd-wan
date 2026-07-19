@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { Readable } from 'node:stream';
-import { timingSafeEqual } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { extname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Database } from './database.js';
@@ -45,9 +45,45 @@ const service = new ControlService(database, {
   defaultDataPort,
   manageLocalCenters: !coordinatorOnly,
   maintainLocalCenters: !coordinatorOnly,
+  stageLocalUpdate,
 });
 const wireGuardArtifacts = new WireGuardArtifactStore(join(dataDir, 'artifacts', 'wireguard'));
 service.ensureDefaultNetwork();
+
+function stageLocalUpdate({ rolloutId, installer, bundleBase64, bundleSha256 }) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(rolloutId || ''))) throw new Error('更新任务 ID 无效');
+  const bundle = Buffer.from(String(bundleBase64 || ''), 'base64');
+  const stagingDir = join(dataDir, 'update-staging', rolloutId);
+  mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
+  const installerFile = join(stagingDir, 'install.sh');
+  const bundleFile = join(stagingDir, 'pathweaver.tar.gz');
+  writeFileSync(installerFile, installer, { mode: 0o700 });
+  writeFileSync(bundleFile, bundle, { mode: 0o600 });
+  const requestFile = join(dataDir, 'update-request.json');
+  const temporary = `${requestFile}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify({ rolloutId, installerFile, bundleFile, bundleSha256 })}\n`, { mode: 0o600 });
+  renameSync(temporary, requestFile);
+}
+
+async function probeGithubUpdateArtifact(request) {
+  const fetchChecked = async (url, maxBytes, label) => {
+    const response = await fetch(url, { signal: AbortSignal.timeout(30_000), redirect: 'follow' });
+    if (!response.ok) throw new Error(`${label}返回 HTTP ${response.status}`);
+    const declared = Number(response.headers.get('content-length') || 0);
+    if (declared > maxBytes) throw new Error(`${label}超过大小上限`);
+    const content = Buffer.from(await response.arrayBuffer());
+    if (!content.length || content.length > maxBytes) throw new Error(`${label}大小无效`);
+    return content;
+  };
+  const installer = await fetchChecked(request.installerUrl, 512 * 1024, 'GitHub 安装器');
+  const bundle = await fetchChecked(request.bundleUrl, 16 * 1024 * 1024, 'GitHub 更新制品');
+  return {
+    ok: true,
+    installer: installer.toString('utf8'),
+    bundleBase64: bundle.toString('base64'),
+    bundleSha256: createHash('sha256').update(bundle).digest('hex'),
+  };
+}
 const endpointSemanticMigration = service.ensureEndpointSemanticConfigurations();
 for (const failure of endpointSemanticMigration.errors) {
   console.warn(`WireGuard NAT 拨号方向迁移失败 (${failure.networkId})：${failure.error}`);
@@ -74,6 +110,7 @@ const runtimeSweep = setInterval(() => {
   void (async () => {
     try {
       if (localIsFollower()) return;
+      reconcileLocalUpdateMarker();
       const beforeRevision = clusterRevision();
       const memberships = clusterMemberships();
       service.reconcileRuntimeState();
@@ -141,6 +178,20 @@ function localNodeId(networkId) {
     } catch {}
   }
   return service.listNodes(networkId).find((node) => node.isCenter)?.id || null;
+}
+
+let lastLocalUpdateMarker = '';
+function reconcileLocalUpdateMarker() {
+  let marker;
+  try { marker = JSON.parse(readFileSync(join(dataDir, 'update-applied.json'), 'utf8')); }
+  catch { return; }
+  const markerKey = `${marker.rolloutId || ''}:${marker.ok}:${marker.error || ''}`;
+  if (!marker.rolloutId || markerKey === lastLocalUpdateMarker) return;
+  for (const network of service.listNetworks()) {
+    const nodeId = localNodeId(network.id);
+    if (nodeId) service.recordUpdateApplied(nodeId, marker.rolloutId, marker.ok === false ? marker.error || '本机更新失败' : null);
+  }
+  lastLocalUpdateMarker = markerKey;
 }
 
 function electionFor(networkId) {
@@ -505,6 +556,23 @@ async function handleAdmin(req, res, pathname, url, authenticated = false) {
     return send(res, 200, { configurations: service.listConfigurations(params.id, Number(url.searchParams.get('limit') || 20)) });
   }
 
+  params = match(pathname, '/api/v1/networks/:id/update-rollouts');
+  if (req.method === 'GET' && params) {
+    return send(res, 200, { rollouts: service.listUpdateRollouts(params.id) });
+  }
+  if (req.method === 'POST' && params) {
+    const nodeId = localNodeId(params.id);
+    const rollout = service.createUpdateRollout(params.id, nodeId);
+    const request = service.updateProbeRequest(rollout.id);
+    void probeGithubUpdateArtifact(request)
+      .then((result) => service.recordUpdateProbe(rollout.id, nodeId, result, { local: true }))
+      .catch((error) => service.recordUpdateProbe(rollout.id, nodeId, { ok: false, error: error.message }, { local: true }));
+    return send(res, 202, rollout);
+  }
+
+  params = match(pathname, '/api/v1/update-rollouts/:id');
+  if (req.method === 'GET' && params) return send(res, 200, service.getUpdateRollout(params.id));
+
   params = match(pathname, '/api/v1/nodes/:id');
   if (req.method === 'PATCH' && params) return send(res, 200, service.updateNode(params.id, await readJson(req)));
   if (req.method === 'DELETE' && params) return send(res, 200, service.deleteNode(params.id));
@@ -592,7 +660,7 @@ async function handleAgent(req, res, pathname, url) {
   }
   params = match(pathname, '/agent/v1/commands/:id/complete');
   if (req.method === 'POST' && params) {
-    return send(res, 200, service.completeCommand(node.id, params.id, await readJson(req)));
+    return send(res, 200, service.completeCommand(node.id, params.id, await readJson(req, 24 * 1_048_576)));
   }
   return send(res, 404, { error: 'Agent 接口不存在' });
 }

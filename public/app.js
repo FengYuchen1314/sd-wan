@@ -7,6 +7,7 @@ const state = {
   networkId: localStorage.getItem('pathweaver-network') || '',
   topology: null,
   configurations: [],
+  updateRollouts: [],
   view: (location.hash.slice(1).split('?')[0] || 'overview'),
   topologyDraft: [],
   selectedNodeIds: [],
@@ -97,14 +98,16 @@ async function load() {
   networkSelect.innerHTML = networks.map((network) => `<option value="${network.id}">${escapeHtml(network.name)}</option>`).join('');
   networkSelect.value = state.networkId;
   if (state.networkId) {
-    const [topology, configurations] = await Promise.all([
+    const [topology, configurations, updates] = await Promise.all([
       api(`/api/v1/networks/${state.networkId}/topology`),
       api(`/api/v1/networks/${state.networkId}/configurations`),
+      api(`/api/v1/networks/${state.networkId}/update-rollouts`),
     ]);
     state.topology = topology;
     state.topologyDraft = structuredClone(topology.links);
     state.selectedNodeIds = state.selectedNodeIds.filter((id) => topology.nodes.some((node) => node.id === id));
     state.configurations = configurations.configurations;
+    state.updateRollouts = updates.rollouts;
     if (state.view === 'path-detail') {
       const route = pathDetailRoute();
       if (route.sourceId && route.targetId) await loadPathDetail(route.sourceId, route.targetId, true);
@@ -142,6 +145,7 @@ function renderOverview() {
   const network = currentNetwork();
   const nodes = state.topology?.nodes || [];
   const validation = state.topology?.validation;
+  const update = state.updateRollouts[0];
   return `
     <div class="metric-grid">
       <article class="metric"><label>节点总数</label><strong>${nodes.length}</strong><small>${nodes.filter((node) => node.status === 'online').length} 台在线</small></article>
@@ -155,13 +159,25 @@ function renderOverview() {
         ${nodeTable(nodes.slice(0, 6), false)}
       </article>
       <article class="card">
-        <div class="card-head"><div><h2>面板同步</h2><p>任意节点面板读写同一份版本化配置</p></div><span class="status ${state.panelStatus?.writable ? 'online' : 'failed'}">${state.panelStatus?.writable ? '可写' : '只读'}</span></div>
+        <div class="card-head"><div><h2>软件更新</h2><p>自动寻找可访问 GitHub 的节点，再通过控制面分发同一制品</p></div><button class="button primary small" id="update-all" ${!state.panelStatus?.writable || ['probing', 'distributing'].includes(update?.status) ? 'disabled' : ''}>${['probing', 'distributing'].includes(update?.status) ? '更新进行中' : '一键更新全网'}</button></div>
         <div class="card-body section-stack">
-          <div class="notice"><strong>全节点可管理</strong><span>${escapeHtml(state.panelStatus?.message || '面板配置沿现有无环控制路径实时同步；业务通路变化不会改变管理入口。')}</span></div>
+          ${renderUpdateSummary(update)}
           <div class="metric metric-compact"><label>待推进配置</label><strong>${totals.preparing}</strong><small>${totals.pendingCommands} 条节点命令等待完成</small></div>
         </div>
       </article>
     </div>`;
+}
+
+function renderUpdateSummary(update) {
+  if (!update) return '<div class="notice"><strong>尚未执行全网更新</strong><span>点击后，各在线节点并行探测 GitHub；首个成功节点上传一次制品，其他节点无需访问 GitHub。</span></div>';
+  const labels = {
+    probing: '正在探测 GitHub', distributing: '正在分发', completed: '全部完成',
+    partial: '部分失败', failed: '更新失败',
+  };
+  const completed = update.nodes.filter((node) => node.status === 'completed').length;
+  const failed = update.nodes.filter((node) => node.status === 'failed').length;
+  const source = update.source ? `更新源：${escapeHtml(update.source.name)}` : '正在选择更新源';
+  return `<div class="notice ${['partial', 'failed'].includes(update.status) ? 'warning' : ''}"><strong>${labels[update.status] || escapeHtml(update.status)}</strong><span>${source} · 完成 ${completed}/${update.nodes.length}${failed ? ` · 失败 ${failed}` : ''}${update.bundleSha256 ? ` · SHA256 ${escapeHtml(update.bundleSha256.slice(0, 12))}…` : ''}${update.error ? ` · ${escapeHtml(update.error)}` : ''}</span></div>`;
 }
 
 function nodeTable(nodes, editable = true) {
@@ -177,7 +193,7 @@ function nodeTable(nodes, editable = true) {
       <span class="mono">${escapeHtml(node.dataIp)}${pendingAddresses.has(node.id) && pendingAddresses.get(node.id) !== node.dataIp
         ? `<small class="pending-ip">→ ${escapeHtml(pendingAddresses.get(node.id))}</small>` : ''}</span>
       <span class="mono">${escapeHtml(node.controlIp)}</span>
-      <span class="status ${escapeHtml(node.status)}">${node.status === 'online' ? '在线' : escapeHtml(node.status)}</span>
+      <span><span class="status ${escapeHtml(node.status)}">${node.status === 'online' ? '在线' : escapeHtml(node.status)}</span><small>${node.hasPublicEndpoint ? '公网可拨入' : '仅主动拨出'}</small></span>
       ${editable ? `<button class="button ghost small edit-node" data-id="${node.id}">编辑</button>` : '<span></span>'}
     </div>`).join('')}
   </div>`;
@@ -682,9 +698,11 @@ async function disablePathPolicy() {
 }
 
 function renderJoin() {
-  const nodes = state.topology.nodes.filter((node) => node.canRelay);
   const result = state.joinResult;
   const mode = state.joinMode || result?.mode || 'active';
+  const nodes = state.topology.nodes.filter((node) => node.status === 'online' && (
+    mode === 'passive' || (node.canRelay && node.hasPublicEndpoint)
+  ));
   const selectedParent = nodes.find((node) => node.id === (state.joinParentId || result?.parent?.id)) || nodes[0];
   const parentConnection = controlConnection(selectedParent);
   const parentDataConnection = wireGuardConnection(selectedParent, parentConnection.host);
@@ -692,7 +710,7 @@ function renderJoin() {
     <article class="card"><div class="card-head"><div><h2>生成安装命令</h2><p>${mode === 'passive' ? '选择负责主动连接待认领设备的已入网节点' : '选择新设备实际能够访问的接入节点'}</p></div></div>
       <form class="card-body form-stack" id="join-form">
         <div class="segmented"><label><input type="radio" name="mode" value="active" ${mode === 'active' ? 'checked' : ''}><span>设备主动加入</span></label><label><input type="radio" name="mode" value="passive" ${mode === 'passive' ? 'checked' : ''}><span>已入网节点主动认领</span></label></div>
-        <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '新设备主动拨号父节点'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。' : '控制入口和 WireGuard UDP 入口分别保存到一次性令牌；新设备自己的 NAT 地址和监听端口不会写到父节点 Endpoint。'}</span></div>
+        <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '新设备主动拨号公网父节点'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。' : '安装时会询问新设备是否有公网入口。无公网设备不需要填写 WireGuard 端口，系统仅保留本地随机监听并由它主动拨号父节点。'}</span></div>
         <label>${mode === 'passive' ? '执行认领的已入网节点' : '接入节点'}<select name="parentId">${nodes.map((node) => {
           const connection = controlConnection(node);
           const dataConnection = wireGuardConnection(node, connection.host);
@@ -706,7 +724,7 @@ function renderJoin() {
           <label>父节点 WireGuard UDP 端口<input name="parentDataPort" type="number" min="1" max="65535" required value="${parentDataConnection.port || ''}"></label>
         </div>` : '<div class="notice"><strong>固定 GitHub 安装源</strong><span><a href="https://github.com/FengYuchen1314/sd-wan" target="_blank" rel="noreferrer">FengYuchen1314/sd-wan</a> · main。目标设备下载与其他设备完全相同的节点服务、面板和 Agent。</span></div>'}
         <label>令牌有效时间（分钟）<input name="ttlMinutes" type="number" min="5" max="1440" value="30"></label>
-        <button class="button primary" type="submit">${mode === 'passive' ? '生成 GitHub 节点安装命令' : '生成一次性命令'}</button>
+        <button class="button primary" type="submit" ${nodes.length ? '' : 'disabled'}>${mode === 'passive' ? '生成 GitHub 节点安装命令' : '生成一次性命令'}</button>
       </form>
     </article>
     <article class="card"><div class="card-head"><div><h2>可复制命令</h2><p>令牌仅显示一次，默认使用后立即失效</p></div>${result ? '<button class="button ghost small" id="copy-command">复制命令</button>' : ''}</div>
@@ -758,9 +776,12 @@ function wireGuardConnection(node, fallbackHost = '') {
 }
 
 function renderRollouts() {
-  return `<article class="card"><div class="card-head"><div><h2>配置版本</h2><p>IP 和拓扑变更均通过准备、激活两个阶段发布</p></div></div>
+  const activeUpdate = state.updateRollouts.some((update) => ['probing', 'distributing'].includes(update.status));
+  return `<div class="section-stack"><article class="card"><div class="card-head"><div><h2>软件更新</h2><p>GitHub 探测、制品分发和每台节点的应用结果</p></div><button class="button primary small" id="update-all" ${!state.panelStatus?.writable || activeUpdate ? 'disabled' : ''}>${activeUpdate ? '更新进行中' : '一键更新全网'}</button></div>
+    <div class="card-body section-stack">${state.updateRollouts.length ? state.updateRollouts.map((update) => `${renderUpdateSummary(update)}<div class="command-meta">${update.nodes.map((node) => `<span>${escapeHtml(node.name)}：${escapeHtml(node.status)}</span>`).join('')}</div>`).join('') : renderUpdateSummary(null)}</div>
+  </article><article class="card"><div class="card-head"><div><h2>配置版本</h2><p>IP 和拓扑变更均通过准备、激活两个阶段发布</p></div></div>
     <div class="timeline">${state.configurations.length ? state.configurations.map((version) => `<div class="rollout"><span class="version">v${version.version}</span><span><strong>${escapeHtml(version.reason)}</strong><small class="rollout-id">${escapeHtml(version.id.slice(0, 12))}</small></span><span class="status ${escapeHtml(version.status)}">${escapeHtml(version.status)}</span><span>${formatDate(version.activatedAt || version.createdAt)}</span></div>`).join('') : '<div class="empty">暂无配置版本</div>'}</div>
-  </article>`;
+  </article></div>`;
 }
 
 function bindViewEvents() {
@@ -807,6 +828,7 @@ function bindViewEvents() {
   });
   document.querySelector('#save-path-policy')?.addEventListener('click', savePathPolicy);
   document.querySelector('#disable-path-policy')?.addEventListener('click', disablePathPolicy);
+  document.querySelector('#update-all')?.addEventListener('click', startNetworkUpdate);
   document.querySelector('#join-form')?.addEventListener('submit', createJoinToken);
   document.querySelectorAll('#join-form input[name="mode"]').forEach((radio) => radio.addEventListener('change', () => {
     state.joinMode = radio.value;
@@ -838,6 +860,19 @@ function bindViewEvents() {
       toast(error.message, 'error');
     }
   });
+}
+
+async function startNetworkUpdate() {
+  const button = document.querySelector('#update-all');
+  if (button) button.disabled = true;
+  try {
+    await api(`/api/v1/networks/${state.networkId}/update-rollouts`, { method: 'POST', body: '{}' });
+    await load();
+    toast('已开始探测 GitHub；首个成功节点会把同一更新制品分发到全网');
+  } catch (error) {
+    if (button) button.disabled = false;
+    toast(error.message, 'error');
+  }
 }
 
 async function previewDataCidr(event) {
@@ -881,6 +916,19 @@ function syncConnectionEndpointInputs(form) {
   }
 }
 
+function syncNodePublicFields(form) {
+  const enabled = form.elements.hasPublicEndpoint.checked;
+  form.elements.controlEndpoint.disabled = !enabled;
+  form.elements.dataEndpoint.disabled = !enabled;
+  form.elements.dataEndpoint.required = enabled;
+  form.elements.canRelay.disabled = !enabled;
+  if (!enabled) {
+    form.elements.controlEndpoint.value = '';
+    form.elements.dataEndpoint.value = '';
+    form.elements.canRelay.checked = false;
+  }
+}
+
 function openConnectionDialog() {
   if (state.selectedNodeIds.length !== 2) return;
   const [nodeA, nodeB] = state.selectedNodeIds.map((id) => state.topology.nodes.find((node) => node.id === id));
@@ -890,18 +938,35 @@ function openConnectionDialog() {
       (link.upstreamId === nodeB.id && link.downstreamId === nodeA.id)
     ));
   if (existing) return toast('这两个节点之间已经存在连接或正在验证', 'error');
+  if (!nodeA.hasPublicEndpoint && !nodeB.hasPublicEndpoint) {
+    return toast('两个节点都没有公网入口，不能建立直接连接', 'error');
+  }
   const form = document.querySelector('#connection-form');
   form.elements.nodeAId.value = nodeA.id;
   form.elements.nodeBId.value = nodeB.id;
-  form.elements.nodeAAddress.value = '';
-  form.elements.nodeBAddress.value = '';
+  form.elements.nodeAAddress.value = nodeA.hasPublicEndpoint ? wireGuardConnection(nodeA).host : '';
+  form.elements.nodeBAddress.value = nodeB.hasPublicEndpoint ? wireGuardConnection(nodeB).host : '';
   form.elements.nodeAPort.value = reachablePort(nodeA);
   form.elements.nodeBPort.value = reachablePort(nodeB);
   syncConnectionEndpointInputs(form);
+  for (const [node, suffix] of [[nodeA, 'A'], [nodeB, 'B']]) {
+    const address = form.elements[`node${suffix}Address`];
+    const port = form.elements[`node${suffix}Port`];
+    address.disabled = !node.hasPublicEndpoint;
+    port.disabled = !node.hasPublicEndpoint;
+    address.placeholder = node.hasPublicEndpoint ? '公网 IP 或域名' : '无公网：此侧不发布入口';
+  }
   form.elements.priority.value = 10;
   document.querySelector('#connection-pair').innerHTML = `<strong>${escapeHtml(nodeA.name)}</strong><span>↔</span><strong>${escapeHtml(nodeB.name)}</strong>`;
-  document.querySelector('#node-a-address-label').textContent = `${nodeA.name} 可被 ${nodeB.name} 访问的 IP 或域名（可留空）`;
-  document.querySelector('#node-b-address-label').textContent = `${nodeB.name} 可被 ${nodeA.name} 访问的 IP 或域名（可留空）`;
+  document.querySelector('#node-a-address-label').textContent = nodeA.hasPublicEndpoint
+    ? `${nodeA.name} 的公网 IP 或域名`
+    : `${nodeA.name} 无公网入口（仅主动拨出）`;
+  document.querySelector('#node-b-address-label').textContent = nodeB.hasPublicEndpoint
+    ? `${nodeB.name} 的公网 IP 或域名`
+    : `${nodeB.name} 无公网入口（仅主动拨出）`;
+  document.querySelector('#connection-capability-note').innerHTML = nodeA.hasPublicEndpoint && nodeB.hasPublicEndpoint
+    ? '<strong>两端均可被拨入</strong><span>系统会执行双向探测；任一方向成功即可建链，失败方向会被丢弃。</span>'
+    : `<strong>固定单向拨号</strong><span>${escapeHtml(nodeA.hasPublicEndpoint ? nodeB.name : nodeA.name)} 将主动拨号 ${escapeHtml(nodeA.hasPublicEndpoint ? nodeA.name : nodeB.name)}；NAT 出口端口由 WireGuard 握手动态学习。</span>`;
   form.querySelector('[data-form-error]').textContent = '';
   document.querySelector('#connection-dialog').showModal();
 }
@@ -917,6 +982,8 @@ function openNode(id) {
   form.elements.dataEndpoint.value = node.dataEndpoint || '';
   form.elements.dataListenPort.value = reachablePort(node);
   form.elements.canRelay.checked = node.canRelay;
+  form.elements.hasPublicEndpoint.checked = node.hasPublicEndpoint;
+  syncNodePublicFields(form);
   const deleteButton = document.querySelector('#delete-node');
   deleteButton.disabled = node.isCoordinator;
   deleteButton.textContent = node.isCoordinator ? '协调节点需先迁移' : '删除节点';
@@ -1088,12 +1155,15 @@ document.querySelector('#node-form').addEventListener('submit', async (event) =>
   const form = new FormData(event.currentTarget);
   const error = event.currentTarget.querySelector('[data-form-error]');
   try {
+    const hasPublicEndpoint = event.currentTarget.elements.hasPublicEndpoint.checked;
     const result = await api(`/api/v1/nodes/${form.get('nodeId')}`, {
       method: 'PATCH',
       body: JSON.stringify({
-        name: form.get('name'), dataIp: form.get('dataIp'), controlEndpoint: form.get('controlEndpoint'),
+        name: form.get('name'), dataIp: form.get('dataIp'), hasPublicEndpoint,
+        controlEndpoint: hasPublicEndpoint ? event.currentTarget.elements.controlEndpoint.value : '',
         controlListenPort: Number(form.get('controlListenPort')),
-        dataEndpoint: form.get('dataEndpoint'), dataListenPort: Number(form.get('dataListenPort')),
+        dataEndpoint: hasPublicEndpoint ? event.currentTarget.elements.dataEndpoint.value : '',
+        dataListenPort: Number(form.get('dataListenPort')),
         canRelay: form.get('canRelay') === 'on',
       }),
     });
@@ -1103,6 +1173,9 @@ document.querySelector('#node-form').addEventListener('submit', async (event) =>
   } catch (reason) { error.textContent = reason.message; }
 });
 document.querySelector('#delete-node').addEventListener('click', deleteSelectedNode);
+document.querySelector('#node-form [name="hasPublicEndpoint"]').addEventListener('change', (event) => {
+  syncNodePublicFields(event.currentTarget.form);
+});
 
 for (const input of document.querySelectorAll('#connection-form [name="nodeAAddress"], #connection-form [name="nodeBAddress"]')) {
   input.addEventListener('input', (event) => syncConnectionEndpointInputs(event.currentTarget.form));
@@ -1147,7 +1220,8 @@ setInterval(() => {
 }, 1000);
 
 setInterval(async () => {
-  if (!state.token || !['topology', 'path-detail'].includes(state.view) || state.runtimeRefreshInFlight) return;
+  const updateActive = state.updateRollouts.some((update) => ['probing', 'distributing'].includes(update.status));
+  if (!state.token || (!['topology', 'path-detail'].includes(state.view) && !(updateActive && ['overview', 'rollouts'].includes(state.view))) || state.runtimeRefreshInFlight) return;
   if ((state.view === 'topology' && (state.selectedNodeIds.length || state.graph.drag)) || document.querySelector('dialog[open]')) return;
   if (state.view === 'path-detail' && document.activeElement?.matches('.path-weight')) return;
   state.runtimeRefreshInFlight = true;

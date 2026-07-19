@@ -9,8 +9,10 @@ PANEL_PORT=""
 RELAY_PORT=""
 DATA_PORT=""
 REACHABLE_HOST=""
+PUBLIC_ENDPOINT=""
 PANEL_PASSWORD=""
 UPDATE_ONLY=0
+BUNDLE_FILE=""
 WIREGUARD_TOOLS_VERSION="1.0.20260223"
 WIREGUARD_TOOLS_SHA256="af459827b80bfd31b83b08077f4b5843acb7d18ad9a33a2ef532d3090f291fbf"
 WIREGUARD_RUNTIME_ROOT="/opt/pathweaver-agent/runtime"
@@ -31,6 +33,8 @@ while [[ $# -gt 0 ]]; do
     --relay-port) RELAY_PORT="$2"; shift 2 ;;
     --data-port) DATA_PORT="$2"; shift 2 ;;
     --reachable-host) REACHABLE_HOST="$2"; shift 2 ;;
+    --public-endpoint) PUBLIC_ENDPOINT="$2"; shift 2 ;;
+    --bundle-file) BUNDLE_FILE="$2"; shift 2 ;;
     --panel-password) PANEL_PASSWORD="$2"; shift 2 ;;
     --admin-token) PANEL_PASSWORD="$2"; shift 2 ;;
     --update) UPDATE_ONLY=1; shift ;;
@@ -211,6 +215,26 @@ format_endpoint_host() {
   if [[ "$1" == *:* && "$1" != \[*\] ]]; then printf '[%s]' "$1"; else printf '%s' "$1"; fi
 }
 
+normalize_yes_no() {
+  case "${1,,}" in
+    y|yes|1|true|是|有) printf 'yes\n' ;;
+    n|no|0|false|否|无|'') printf 'no\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+choose_public_endpoint() {
+  local supplied="$1" answer=""
+  while true; do
+    answer="$supplied"
+    if [[ -z "$answer" ]]; then answer="$(ask "本节点是否有可供其他节点主动拨入的公网入口？输入 y 或 n" "n")"; fi
+    if normalize_yes_no "$answer"; then return; fi
+    echo "请输入 y（有公网拨入能力）或 n（无公网，仅主动连接）。" >&2
+    if [[ -z "$TTY_DEVICE" ]]; then exit 2; fi
+    supplied=""
+  done
+}
+
 install_wireguard_build_dependencies() {
   if command -v make >/dev/null 2>&1 && command -v cc >/dev/null 2>&1 &&
      command -v bash >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1 &&
@@ -339,7 +363,20 @@ install_node_bundle() {
   release="/opt/pathweaver/releases/node-$(date +%s)-$$"
   install -d -m 0755 "$release"
   bundle="$(mktemp)"
-  if curl -fsSL "$SOURCE/artifacts/center/pathweaver-center.tar.gz" -o "$bundle" 2>/dev/null; then
+  if [[ -n "$BUNDLE_FILE" ]]; then
+    if [[ ! -r "$BUNDLE_FILE" ]]; then
+      echo "指定的本地更新制品不可读：$BUNDLE_FILE" >&2
+      exit 1
+    fi
+    cp -- "$BUNDLE_FILE" "$bundle"
+    tar -tzf "$bundle" >/dev/null
+    if tar -tzf "$bundle" | grep -qx 'package.json'; then
+      tar -xzf "$bundle" -C "$release"
+    else
+      archive_root="$(tar -tzf "$bundle" | awk -F/ 'NR == 1 { root = $1 } END { print root }')"
+      tar -xzf "$bundle" -C "$release" --strip-components=1 "$archive_root"
+    fi
+  elif curl -fsSL "$SOURCE/artifacts/center/pathweaver-center.tar.gz" -o "$bundle" 2>/dev/null; then
     tar -xzf "$bundle" -C "$release"
   else
     rm -f -- "$bundle"
@@ -364,6 +401,37 @@ services_healthy() {
   for service in "$@"; do
     if ! systemctl is-active --quiet "$service"; then return 1; fi
   done
+}
+
+install_update_dispatcher() {
+  if [[ ! -f /opt/pathweaver/current/scripts/apply-update-request.sh ]]; then
+    echo "当前程序包缺少本机更新调度器。" >&2
+    exit 1
+  fi
+  install -d -m 0755 /usr/local/libexec
+  install -m 0755 /opt/pathweaver/current/scripts/apply-update-request.sh /usr/local/libexec/pathweaver-apply-update
+  cat >/etc/systemd/system/pathweaver-update-apply.service <<'EOF'
+[Unit]
+Description=Apply a staged PathWeaver update
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/pathweaver-apply-update
+EOF
+  cat >/etc/systemd/system/pathweaver-update.path <<'EOF'
+[Unit]
+Description=Watch for PathWeaver control-plane update requests
+
+[Path]
+PathExists=/var/lib/pathweaver/update-request.json
+Unit=pathweaver-update-apply.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now pathweaver-update.path
 }
 
 update_node() {
@@ -392,6 +460,7 @@ update_node() {
   fi
   install -m 0755 "$new_release/scripts/uninstall.sh" /usr/local/sbin/pathweaver-uninstall
   install -m 0755 "$new_release/scripts/update.sh" /usr/local/sbin/pathweaver-update
+  install_update_dispatcher
   if [[ -x "$WIREGUARD_RUNTIME_LINK/bin/wg-quick" ]]; then
     if ! patch_private_wireguard_runtime; then
       ln -sfn "$previous_release" /opt/pathweaver/current
@@ -424,7 +493,7 @@ update_node() {
 }
 
 install_node() {
-  local endpoint_host control_endpoint data_endpoint node_env panel_password_hash panel_proxy_token bootstrap
+  local endpoint_host control_endpoint data_endpoint node_env panel_password_hash panel_proxy_token bootstrap public_endpoint
   bootstrap=0
   if [[ -z "$JOIN_TOKEN" && -z "$CLAIM_TOKEN" && -z "$UPSTREAM" ]]; then bootstrap=1; fi
   if [[ "$bootstrap" -eq 0 && -z "$JOIN_TOKEN" && -z "$CLAIM_TOKEN" ]]; then
@@ -433,9 +502,26 @@ install_node() {
   fi
 
   PANEL_PORT="$(choose_port "本机管理面板 TCP 端口" tcp 19773 "$PANEL_PORT")"
-  if [[ "$bootstrap" -eq 0 ]]; then RELAY_PORT="$(choose_distinct_tcp_port "节点控制中继 TCP 端口" 8790 "$RELAY_PORT" "$PANEL_PORT")"; fi
-  DATA_PORT="$(choose_port "WireGuard UDP 端口" udp 19801 "$DATA_PORT")"
-  REACHABLE_HOST="${REACHABLE_HOST:-$(ask "其他节点可访问本节点的 IP 或域名" "$(detect_reachable_host)")}"
+  if [[ "$bootstrap" -eq 1 || -n "$CLAIM_TOKEN" ]]; then
+    public_endpoint="yes"
+  else
+    public_endpoint="$(choose_public_endpoint "$PUBLIC_ENDPOINT")"
+  fi
+  if [[ "$bootstrap" -eq 0 ]]; then
+    if [[ "$public_endpoint" == "yes" ]]; then
+      RELAY_PORT="$(choose_distinct_tcp_port "节点控制中继 TCP 端口" 8790 "$RELAY_PORT" "$PANEL_PORT")"
+    else
+      RELAY_PORT="${RELAY_PORT:-$(find_available_port tcp 8790)}"
+    fi
+  fi
+  if [[ "$public_endpoint" == "yes" ]]; then
+    DATA_PORT="$(choose_port "WireGuard UDP 公网监听端口" udp 19801 "$DATA_PORT")"
+    REACHABLE_HOST="${REACHABLE_HOST:-$(ask "其他节点可访问本节点的公网 IP 或域名" "$(detect_reachable_host)")}"
+  else
+    DATA_PORT="${DATA_PORT:-$(find_available_port udp 19801)}"
+    REACHABLE_HOST="$(detect_reachable_host)"
+    echo "本节点按无公网模式安装：WireGuard 本地端口已自动选择，不会发布给其他节点。"
+  fi
   endpoint_host="$(format_endpoint_host "$REACHABLE_HOST")"
   choose_panel_password
   panel_password_hash="$(hash_panel_password)"
@@ -449,6 +535,7 @@ install_node() {
   install -d -m 0700 /var/lib/pathweaver-agent
   install -d -m 0750 /etc/pathweaver
   install -d -o pathweaver -g pathweaver -m 0750 /etc/wireguard
+  install_update_dispatcher
   if [[ ! -f /etc/pathweaver/sysctl.previous ]]; then
     cat >/etc/pathweaver/sysctl.previous <<EOF
 IP_FORWARD_PREVIOUS=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
@@ -508,14 +595,20 @@ EOF
     systemctl enable --now pathweaver-node
   else
     panel_proxy_token="$(node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))")"
-    control_endpoint="http://$endpoint_host:$RELAY_PORT"
-    data_endpoint="$endpoint_host:$DATA_PORT"
+    control_endpoint=""
+    data_endpoint=""
+    if [[ "$public_endpoint" == "yes" ]]; then
+      control_endpoint="http://$endpoint_host:$RELAY_PORT"
+      data_endpoint="$endpoint_host:$DATA_PORT"
+    fi
     cat >"$node_env" <<EOF
 SDWAN_PANEL_PASSWORD_HASH=$panel_password_hash
 SDWAN_PANEL_PROXY_TOKEN=$panel_proxy_token
 EOF
     chmod 0600 "$node_env"
-    ARGS=(--relay-port "$RELAY_PORT" --data-port "$DATA_PORT" --control-endpoint "$control_endpoint" --data-endpoint "$data_endpoint" --panel-proxy-token "$panel_proxy_token")
+    ARGS=(--relay-port "$RELAY_PORT" --data-port "$DATA_PORT" --public-endpoint "$public_endpoint" --panel-proxy-token "$panel_proxy_token")
+    if [[ -n "$control_endpoint" ]]; then ARGS+=(--control-endpoint "$control_endpoint"); fi
+    if [[ -n "$data_endpoint" ]]; then ARGS+=(--data-endpoint "$data_endpoint"); fi
     if [[ -n "$UPSTREAM" ]]; then ARGS+=(--upstream "$UPSTREAM"); fi
     if [[ -n "$JOIN_TOKEN" ]]; then ARGS+=(--join-token "$JOIN_TOKEN"); fi
     if [[ -n "$CLAIM_TOKEN" ]]; then ARGS+=(--claim-token "$CLAIM_TOKEN" --listen); fi
@@ -573,7 +666,11 @@ EOF
     systemctl enable --now pathweaver-agent pathweaver-node
   fi
 
-  echo "PathWeaver 节点已启动：面板 http://$endpoint_host:$PANEL_PORT，WireGuard UDP $DATA_PORT。"
+  if [[ "$public_endpoint" == "yes" ]]; then
+    echo "PathWeaver 节点已启动：面板 http://$endpoint_host:$PANEL_PORT，公网 WireGuard UDP $DATA_PORT。"
+  else
+    echo "PathWeaver 节点已启动：面板 http://$endpoint_host:$PANEL_PORT；数据面仅主动拨出，不公开 WireGuard 端口。"
+  fi
   echo "每台设备都使用自己的安装密码登录面板，配置通过现有无环控制路径实时保持一致。"
   if [[ -n "$CLAIM_TOKEN" ]]; then
     echo "待认领节点 IP 或域名：$REACHABLE_HOST"

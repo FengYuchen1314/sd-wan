@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { gzipSync } from 'node:zlib';
 import { Database } from '../src/center/database.js';
 import { ControlService } from '../src/center/service.js';
 
@@ -228,8 +230,13 @@ test('选择边缘父节点时强制携带新设备可达的中继地址', () =>
   try {
     const first = service.createJoinToken(network.id, { parentId: center.id });
     const edge = service.registerAgent({ token: first.token, name: '一级边缘', wgDataPublicKey: 'f'.repeat(44) }).node;
-    assert.throws(() => service.createJoinToken(network.id, { parentId: edge.id }), /尚未配置.*中继地址/);
-    service.updateNode(edge.id, { controlEndpoint: 'http://192.168.8.20:8790', dataEndpoint: '192.168.8.20:51820' });
+    assert.throws(() => service.createJoinToken(network.id, { parentId: edge.id }), /没有公网拨入能力/);
+    service.updateNode(edge.id, {
+      hasPublicEndpoint: true,
+      canRelay: true,
+      controlEndpoint: 'http://192.168.8.20:8790',
+      dataEndpoint: '192.168.8.20:51820',
+    });
     const second = service.createJoinToken(network.id, { parentId: edge.id });
     assert.match(second.command, /curl -fsSL 'http:\/\/192\.168\.8\.20:8790\/install\.sh'/);
     assert.match(second.command, /--source 'http:\/\/192\.168\.8\.20:8790'/);
@@ -418,7 +425,7 @@ test('单向 NAT 直连握手失败时基础拓扑自动回退，恢复后重新
       controlListenPort: 19201,
       dataListenPort: 21201,
       wgDataPublicKey: 'a'.repeat(44),
-      dataEndpoint: '192.0.2.10:21201',
+      hasPublicEndpoint: false,
     }).node;
     const tokenB = service.createJoinToken(network.id, { parentId: center.id });
     const london = service.registerAgent({
@@ -621,9 +628,13 @@ test('新增连接拒绝非法互访地址和重复节点对', () => {
   const { database, service, network, center } = fixture();
   try {
     const token = service.createJoinToken(network.id, { parentId: center.id });
-    const edge = service.registerAgent({ token: token.token, name: '边缘', wgDataPublicKey: 'c'.repeat(44) }).node;
+    const edge = service.registerAgent({
+      token: token.token, name: '边缘', wgDataPublicKey: 'c'.repeat(44), dataEndpoint: '192.168.1.20:19801',
+    }).node;
     const token2 = service.createJoinToken(network.id, { parentId: center.id });
-    const edge2 = service.registerAgent({ token: token2.token, name: '边缘 2', wgDataPublicKey: 'd'.repeat(44) }).node;
+    const edge2 = service.registerAgent({
+      token: token2.token, name: '边缘 2', wgDataPublicKey: 'd'.repeat(44), dataEndpoint: '192.168.1.21:19801',
+    }).node;
     assert.throws(() => service.createLinkValidation(network.id, {
       nodeAId: edge.id, nodeBId: edge2.id,
     }), /至少填写一个/);
@@ -636,13 +647,87 @@ test('新增连接拒绝非法互访地址和重复节点对', () => {
   } finally { database.close(); }
 });
 
+test('无公网节点只主动拨号公网节点，两个无公网节点禁止直连', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const privateTokenA = service.createJoinToken(network.id, { parentId: center.id });
+    const privateA = service.registerAgent({
+      token: privateTokenA.token, name: 'NAT A', hasPublicEndpoint: false, wgDataPublicKey: 'a'.repeat(44),
+    }).node;
+    const privateTokenB = service.createJoinToken(network.id, { parentId: center.id });
+    const privateB = service.registerAgent({
+      token: privateTokenB.token, name: 'NAT B', hasPublicEndpoint: false, wgDataPublicKey: 'b'.repeat(44),
+    }).node;
+    assert.equal(privateA.dataEndpoint, null);
+    assert.throws(() => service.createLinkValidation(network.id, {
+      nodeAId: privateA.id, nodeBId: privateB.id, nodeAAddress: '192.0.2.10',
+    }), /两个都没有公网入口/);
+
+    const publicToken = service.createJoinToken(network.id, { parentId: center.id });
+    const publicNode = service.registerAgent({
+      token: publicToken.token, name: '公网节点', hasPublicEndpoint: true,
+      dataEndpoint: '198.51.100.8:21980', dataListenPort: 21980, wgDataPublicKey: 'c'.repeat(44),
+    }).node;
+    const candidate = service.createLinkValidation(network.id, {
+      nodeAId: privateA.id, nodeBId: publicNode.id, nodeAAddress: '192.0.2.10',
+    });
+    assert.equal(candidate.upstreamEndpoint, null);
+    assert.equal(candidate.downstreamEndpoint, '198.51.100.8:21980');
+    assert.equal(candidate.validationProgress.requested, 1);
+  } finally { database.close(); }
+});
+
+test('全网更新选择首个可访问 GitHub 的节点并把同一摘要制品排队到全部设备', () => {
+  const database = new Database(':memory:');
+  const staged = [];
+  const service = new ControlService(database, {
+    publicUrl: 'https://center.example',
+    stageLocalUpdate: (request) => staged.push(request),
+  });
+  try {
+    const network = service.createNetwork({
+      name: '更新网络', dataCidr: '10.90.0.0/24', controlCidr: '10.240.0.0/24', listenPort: 51820, mtu: 1380,
+    });
+    const center = service.listNodes(network.id)[0];
+    const token = service.createJoinToken(network.id, { parentId: center.id });
+    const edge = service.registerAgent({
+      token: token.token, name: '可访问 GitHub 的节点', hasPublicEndpoint: false, wgDataPublicKey: 'd'.repeat(44),
+    }).node;
+    const rollout = service.createUpdateRollout(network.id, center.id);
+    const probe = service.claimCommand(edge.id);
+    assert.equal(probe.type, 'probe-update-source');
+    const bundle = gzipSync(randomBytes(1024));
+    service.completeCommand(edge.id, probe.id, {
+      ok: true,
+      installer: '#!/usr/bin/env bash\n# supports --bundle-file\n',
+      bundleBase64: bundle.toString('base64'),
+    });
+    const distributing = service.getUpdateRollout(rollout.id);
+    assert.equal(distributing.status, 'distributing');
+    assert.equal(distributing.source.id, edge.id);
+    assert.equal(staged.length, 1);
+    assert.equal(staged[0].bundleSha256, distributing.bundleSha256);
+    const install = service.claimCommand(edge.id);
+    assert.equal(install.type, 'install-update-bundle');
+    assert.equal(install.payload.bundleSha256, distributing.bundleSha256);
+    service.completeCommand(edge.id, install.id, { ok: true, scheduled: true });
+    service.recordUpdateApplied(edge.id, rollout.id);
+    service.recordUpdateApplied(center.id, rollout.id);
+    assert.equal(service.getUpdateRollout(rollout.id).status, 'completed');
+  } finally { database.close(); }
+});
+
 test('连接验证超过有效期后自动失败并取消节点命令', () => {
   const { database, service, network, center } = fixture();
   try {
     const tokenA = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeA = service.registerAgent({ token: tokenA.token, name: '超时节点 A', wgDataPublicKey: 'a'.repeat(44) }).node;
+    const nodeA = service.registerAgent({
+      token: tokenA.token, name: '超时节点 A', wgDataPublicKey: 'a'.repeat(44), dataEndpoint: '192.168.1.20:19801',
+    }).node;
     const tokenB = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeB = service.registerAgent({ token: tokenB.token, name: '超时节点 B', wgDataPublicKey: 'b'.repeat(44) }).node;
+    const nodeB = service.registerAgent({
+      token: tokenB.token, name: '超时节点 B', wgDataPublicKey: 'b'.repeat(44), dataEndpoint: '192.168.1.21:19801',
+    }).node;
     const candidate = service.createLinkValidation(network.id, {
       nodeAId: nodeA.id, nodeBId: nodeB.id,
       nodeAAddress: '192.168.1.20', nodeBAddress: '192.168.1.21', priority: 10,
@@ -684,9 +769,13 @@ test('保存两节点多路径权重并写入版本化节点配置', () => {
   const { database, service, network, center } = fixture();
   try {
     const tokenA = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeA = service.registerAgent({ token: tokenA.token, name: '多路径 A', wgDataPublicKey: 'a'.repeat(44) }).node;
+    const nodeA = service.registerAgent({
+      token: tokenA.token, name: '多路径 A', wgDataPublicKey: 'a'.repeat(44), dataEndpoint: '192.168.10.10:19801',
+    }).node;
     const tokenB = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeB = service.registerAgent({ token: tokenB.token, name: '多路径 B', wgDataPublicKey: 'b'.repeat(44) }).node;
+    const nodeB = service.registerAgent({
+      token: tokenB.token, name: '多路径 B', wgDataPublicKey: 'b'.repeat(44), dataEndpoint: '192.168.10.11:19801',
+    }).node;
     const direct = service.createLinkValidation(network.id, {
       nodeAId: nodeA.id, nodeBId: nodeB.id,
       nodeAAddress: '192.168.10.10', nodeBAddress: '192.168.10.11', priority: 1,

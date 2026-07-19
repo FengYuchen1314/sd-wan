@@ -28,7 +28,7 @@ fi
 
 echo "正在停止 PathWeaver 服务……"
 if command -v systemctl >/dev/null 2>&1; then
-  systemctl disable --now pathweaver-agent.service pathweaver-node.service >/dev/null 2>&1 || true
+  systemctl disable --now pathweaver-agent.service pathweaver-node.service pathweaver-update.path pathweaver-update-apply.service >/dev/null 2>&1 || true
 fi
 
 WIREGUARD_QUICK="/opt/pathweaver-agent/runtime/wireguard-current/bin/wg-quick"
@@ -58,10 +58,11 @@ if command -v ip >/dev/null 2>&1; then
   done < <(ip -o link show type ipip 2>/dev/null | awk -F': ' '{print $2}')
 fi
 
-rm -f -- /etc/systemd/system/pathweaver-agent.service /etc/systemd/system/pathweaver-node.service
+rm -f -- /etc/systemd/system/pathweaver-agent.service /etc/systemd/system/pathweaver-node.service \
+  /etc/systemd/system/pathweaver-update.path /etc/systemd/system/pathweaver-update-apply.service
 if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload
-  systemctl reset-failed pathweaver-agent.service pathweaver-node.service >/dev/null 2>&1 || true
+  systemctl reset-failed pathweaver-agent.service pathweaver-node.service pathweaver-update-apply.service >/dev/null 2>&1 || true
 fi
 
 rm -f -- /etc/sysctl.d/90-pathweaver.conf
@@ -78,6 +79,7 @@ rm -f -- /etc/pathweaver/node.env /etc/pathweaver/sysctl.previous
 rmdir /etc/pathweaver >/dev/null 2>&1 || true
 rm -rf -- /opt/pathweaver /opt/pathweaver-agent
 rm -f -- /usr/local/sbin/pathweaver-update
+rm -f -- /usr/local/libexec/pathweaver-apply-update
 
 if [[ "$PURGE" -eq 1 ]]; then
   rm -rf -- /var/lib/pathweaver /var/lib/pathweaver-agent

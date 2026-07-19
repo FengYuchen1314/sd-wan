@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   name TEXT NOT NULL,
   status TEXT NOT NULL,
   is_center INTEGER NOT NULL DEFAULT 0,
+  has_public_endpoint INTEGER NOT NULL DEFAULT 0,
   can_relay INTEGER NOT NULL DEFAULT 1,
   parent_id TEXT REFERENCES nodes(id),
   control_ip TEXT NOT NULL,
@@ -176,6 +177,32 @@ CREATE TABLE IF NOT EXISTS commands (
 
 CREATE INDEX IF NOT EXISTS commands_pending ON commands(node_id, status, created_at);
 
+CREATE TABLE IF NOT EXISTS update_rollouts (
+  id TEXT PRIMARY KEY,
+  network_id TEXT NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  source_node_id TEXT REFERENCES nodes(id) ON DELETE SET NULL,
+  source_kind TEXT,
+  bundle_sha256 TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS update_rollouts_network
+  ON update_rollouts(network_id, created_at);
+
+CREATE TABLE IF NOT EXISTS update_rollout_nodes (
+  rollout_id TEXT NOT NULL REFERENCES update_rollouts(id) ON DELETE CASCADE,
+  node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  command_id TEXT REFERENCES commands(id) ON DELETE SET NULL,
+  error TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(rollout_id, node_id)
+);
+
 CREATE TABLE IF NOT EXISTS managed_node_proxies (
   node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
   manager_node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
@@ -214,6 +241,8 @@ const SNAPSHOT_TABLES = [
   'node_configs',
   'network_cidr_changes',
   'commands',
+  'update_rollouts',
+  'update_rollout_nodes',
   'managed_node_proxies',
   'audit_log',
 ];
@@ -284,6 +313,11 @@ export class Database {
     }
     if (!nodeColumns.has('data_listen_port')) {
       this.handle.exec('ALTER TABLE nodes ADD COLUMN data_listen_port INTEGER');
+    }
+    if (!nodeColumns.has('has_public_endpoint')) {
+      this.handle.exec('ALTER TABLE nodes ADD COLUMN has_public_endpoint INTEGER NOT NULL DEFAULT 0');
+      this.handle.exec('UPDATE nodes SET has_public_endpoint = 1 WHERE is_center = 1');
+      this.handle.exec('UPDATE nodes SET can_relay = 0 WHERE is_center = 0');
     }
     const proxyColumns = new Set(this.handle.prepare('PRAGMA table_info(managed_node_proxies)').all().map((column) => column.name));
     if (!proxyColumns.has('relay_path_json')) {
@@ -377,7 +411,9 @@ export class Database {
     if (!snapshot || Number(snapshot.schemaVersion) !== 1 || !snapshot.tables) {
       throw new Error('协调快照格式或版本无效');
     }
+    const optionalTables = new Set(['update_rollouts', 'update_rollout_nodes']);
     for (const table of SNAPSHOT_TABLES) {
+      if (optionalTables.has(table) && snapshot.tables[table] === undefined) continue;
       if (!Array.isArray(snapshot.tables[table])) throw new Error(`协调快照缺少数据表 ${table}`);
     }
     this.handle.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
@@ -386,10 +422,13 @@ export class Database {
       for (const table of SNAPSHOT_TABLES) {
         const columns = this.all(`PRAGMA table_info(${table})`).map((column) => column.name);
         const allowed = new Set(columns);
-        for (const snapshotRow of snapshot.tables[table]) {
-          const row = table === 'topology_links' && !Object.hasOwn(snapshotRow, 'endpoint_semantics_version')
+        for (const snapshotRow of snapshot.tables[table] || []) {
+          let row = table === 'topology_links' && !Object.hasOwn(snapshotRow, 'endpoint_semantics_version')
             ? { ...snapshotRow, endpoint_semantics_version: 0 }
             : snapshotRow;
+          if (table === 'nodes' && !Object.hasOwn(row, 'has_public_endpoint')) {
+            row = { ...row, has_public_endpoint: row.is_center ? 1 : 0 };
+          }
           const keys = Object.keys(row);
           if (!keys.length || keys.some((key) => !allowed.has(key))) throw new Error(`协调快照中的 ${table} 字段无效`);
           const placeholders = keys.map(() => '?').join(', ');

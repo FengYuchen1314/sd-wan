@@ -93,6 +93,7 @@
       <div class="form-grid">
         <label class="span-2">节点名称<input name="name" required></label>
         <label class="span-2">业务内网 IP<input name="dataIp" required inputmode="decimal"></label>
+        <label class="toggle-line span-2"><input name="hasPublicEndpoint" type="checkbox"><span>本节点有可供其他节点主动拨入的公网入口</span></label>
         <label>接入中继地址<input name="controlEndpoint" placeholder="http://公网或内网IP:8790"></label>
         <label>控制中继 TCP 端口<input name="controlListenPort" type="number" min="1" max="65535" required></label>
         <label>WireGuard 监听端口<input name="dataListenPort" type="number" min="1" max="65535" required></label>
@@ -118,13 +119,13 @@
         <label><span id="node-b-port-label">节点 B 固定入口端口</span><input name="nodeBPort" type="number" min="1" max="65535" required></label>
         <label class="span-2">路径优先级<input name="priority" type="number" min="0" value="10"><small>数字越小越优先；新直连通常会成为两节点之间的首选路径。</small></label>
       </div>
-      <div class="notice"><strong>NAT 节点不要填写自己的入口</strong><span>填写节点 A 的地址表示节点 B 主动拨号到 A，填写节点 B 的地址表示节点 A 主动拨号到 B。若 IX 只能主动连接海外节点，只填写海外节点的固定地址和端口；IX 一侧保持空白，海外节点会从 WireGuard 认证握手中动态学习 NAT 出口地址和端口。</span></div>
+      <div class="notice" id="connection-capability-note"><strong>按公网能力确定拨号方向</strong><span>无公网节点的一侧不会发布端口，只能主动拨号公网节点。两个无公网节点之间不允许建立直接连接。</span></div>
       <p class="form-error" data-form-error></p>
       <div class="modal-actions"><button class="button ghost" value="cancel">取消</button><button class="button primary" value="default">开始连通性探测</button></div>
     </form>
   </dialog>
 
   <div id="toast-region" class="toast-region" aria-live="assertive"></div>
-  <script type="module" src="/app.js?v=20"></script>
+  <script type="module" src="/app.js?v=21"></script>
 </body>
 </html>

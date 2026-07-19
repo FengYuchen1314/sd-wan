@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Database } from '../center/database.js';
 import { CoordinatorElection } from '../core/coordinator.js';
@@ -44,11 +44,73 @@ function parseArgs(values) {
   return result;
 }
 
+function booleanValue(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  return ['1', 'true', 'yes', 'y', 'on'].includes(String(value).toLowerCase());
+}
+
 function atomicJson(filename, value) {
   const temporary = `${filename}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   chmodSync(temporary, 0o600);
   renameSync(temporary, filename);
+}
+
+function updateMarker() {
+  const filename = resolve(process.env.SDWAN_UPDATE_APPLIED_FILE || (process.platform === 'linux'
+    ? '/var/lib/pathweaver/update-applied.json'
+    : './data/update-applied.json'));
+  try {
+    const marker = JSON.parse(readFileSync(filename, 'utf8'));
+    return marker?.rolloutId ? marker : null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchUpdateArtifact(payload) {
+  const fetchChecked = async (url, maxBytes, label) => {
+    const response = await fetch(url, { signal: AbortSignal.timeout(30_000), redirect: 'follow' });
+    if (!response.ok) throw new Error(`${label}返回 HTTP ${response.status}`);
+    const declared = Number(response.headers.get('content-length') || 0);
+    if (declared > maxBytes) throw new Error(`${label}超过 ${Math.ceil(maxBytes / 1_048_576)} MiB 上限`);
+    const content = Buffer.from(await response.arrayBuffer());
+    if (!content.length || content.length > maxBytes) throw new Error(`${label}大小无效`);
+    return content;
+  };
+  const installer = await fetchChecked(payload.installerUrl, 512 * 1024, 'GitHub 安装器');
+  const bundle = await fetchChecked(payload.bundleUrl, 16 * 1024 * 1024, 'GitHub 更新制品');
+  if (!installer.toString('utf8').startsWith('#!/usr/bin/env bash')) throw new Error('GitHub 安装器内容无效');
+  if (bundle[0] !== 0x1f || bundle[1] !== 0x8b) throw new Error('GitHub 更新制品不是 gzip 包');
+  return {
+    ok: true,
+    installer: installer.toString('utf8'),
+    bundleBase64: bundle.toString('base64'),
+    bundleSha256: createHash('sha256').update(bundle).digest('hex'),
+  };
+}
+
+function stageUpdateArtifact(payload) {
+  const rolloutId = String(payload.rolloutId || '');
+  if (!/^[0-9a-f-]{36}$/i.test(rolloutId)) throw new Error('更新任务 ID 无效');
+  const bundle = Buffer.from(String(payload.bundleBase64 || ''), 'base64');
+  const digest = createHash('sha256').update(bundle).digest('hex');
+  if (digest !== payload.bundleSha256 || bundle[0] !== 0x1f || bundle[1] !== 0x8b) {
+    throw new Error('控制面分发的更新制品摘要无效');
+  }
+  const requestFile = resolve(process.env.SDWAN_UPDATE_REQUEST_FILE || (process.platform === 'linux'
+    ? '/var/lib/pathweaver/update-request.json'
+    : './data/update-request.json'));
+  const stagingRoot = resolve(process.env.SDWAN_UPDATE_STAGING_DIR || join(dirname(requestFile), 'update-staging'));
+  const stagingDir = join(stagingRoot, rolloutId);
+  mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
+  const installerFile = join(stagingDir, 'install.sh');
+  const bundleFile = join(stagingDir, 'pathweaver.tar.gz');
+  writeFileSync(installerFile, String(payload.installer || ''), { mode: 0o700 });
+  writeFileSync(bundleFile, bundle, { mode: 0o600 });
+  mkdirSync(dirname(requestFile), { recursive: true });
+  atomicJson(requestFile, { rolloutId, installerFile, bundleFile, bundleSha256: digest });
+  return { ok: true, scheduled: true, rolloutId, bundleSha256: digest };
 }
 
 function keyPair() {
@@ -87,8 +149,16 @@ if (args.panelProxyToken || process.env.SDWAN_PANEL_PROXY_TOKEN) {
     .update(String(args.panelProxyToken || process.env.SDWAN_PANEL_PROXY_TOKEN))
     .digest('hex');
 }
-state.controlEndpoint ||= args.controlEndpoint || process.env.SDWAN_CONTROL_ENDPOINT || null;
-state.dataEndpoint ||= args.dataEndpoint || process.env.SDWAN_DATA_ENDPOINT || null;
+const publicEndpointSetting = args.publicEndpoint ?? process.env.SDWAN_PUBLIC_ENDPOINT;
+if (publicEndpointSetting !== undefined) state.hasPublicEndpoint = booleanValue(publicEndpointSetting);
+state.hasPublicEndpoint ??= Boolean(state.dataEndpoint || args.dataEndpoint || process.env.SDWAN_DATA_ENDPOINT);
+if (state.hasPublicEndpoint) {
+  state.controlEndpoint ||= args.controlEndpoint || process.env.SDWAN_CONTROL_ENDPOINT || null;
+  state.dataEndpoint ||= args.dataEndpoint || process.env.SDWAN_DATA_ENDPOINT || null;
+} else {
+  state.controlEndpoint = null;
+  state.dataEndpoint = null;
+}
 const explicitRelayPort = args.relayPort ?? process.env.SDWAN_RELAY_PORT;
 if (explicitRelayPort !== undefined && explicitRelayPort !== null && explicitRelayPort !== '') {
   state.controlListenPort = await selectAvailableTcpPort({ preferred: explicitRelayPort, strict: true });
@@ -320,6 +390,7 @@ async function register({ passive = false } = {}) {
       controlListenPort: state.controlListenPort,
       dataEndpoint: state.dataEndpoint,
       dataListenPort: state.dataListenPort,
+      hasPublicEndpoint: state.hasPublicEndpoint,
     }),
   });
   state = {
@@ -328,6 +399,7 @@ async function register({ passive = false } = {}) {
     credential: result.credential,
     joinToken: null,
     networkId: result.node.networkId,
+    hasPublicEndpoint: result.node.hasPublicEndpoint,
   };
   election.nodeId = state.nodeId;
   atomicJson(stateFile, state);
@@ -725,6 +797,10 @@ async function runCommand(command) {
       };
     } else if (command.type === 'probe') {
       result = { ok: true, nodeId: state.nodeId, time: new Date().toISOString() };
+    } else if (command.type === 'probe-update-source') {
+      result = await fetchUpdateArtifact(command.payload);
+    } else if (command.type === 'install-update-bundle') {
+      result = stageUpdateArtifact(command.payload);
     } else {
       throw new Error(`不允许执行命令 ${command.type}`);
     }
@@ -771,6 +847,8 @@ async function syncManagedChild(child) {
       controlListenPort: child.node.controlListenPort,
       dataEndpoint: child.node.dataEndpoint,
       dataListenPort: child.node.dataListenPort,
+      updateAppliedRolloutId: health.updateApplied?.rolloutId,
+      updateError: health.updateApplied?.ok === false ? health.updateApplied.error : null,
       linkHealth: health.linkHealth,
     }),
   });
@@ -836,6 +914,7 @@ async function tick() {
     links: [],
     failedLinkIds: [],
   }));
+  const appliedUpdate = updateMarker();
   const heartbeat = await api('/agent/v1/heartbeat', {
     method: 'POST',
     body: JSON.stringify({
@@ -844,6 +923,8 @@ async function tick() {
       controlListenPort: state.controlListenPort,
       dataEndpoint: state.dataEndpoint,
       dataListenPort: state.dataListenPort,
+      updateAppliedRolloutId: appliedUpdate?.rolloutId,
+      updateError: appliedUpdate?.ok === false ? appliedUpdate.error : null,
       linkHealth,
     }),
   });
@@ -942,6 +1023,7 @@ const relayServer = createServer(async (req, res) => {
         controlListenPort: state.controlListenPort,
         dataListenPort: state.dataListenPort,
         wireGuardRuntime: wireguard.runtimeInfo(),
+        updateApplied: updateMarker(),
         linkHealth,
       }));
     }

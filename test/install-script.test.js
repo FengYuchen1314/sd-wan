@@ -27,7 +27,9 @@ test('统一对等节点安装不再要求选择中心或边缘，并为每台�
   assert.match(installer, /choose_distinct_tcp_port "节点控制中继 TCP 端口" 8790/);
   assert.match(installer, /net\.ipv4\.ip_forward=1/);
   assert.match(installer, /net\.ipv4\.conf\.all\.rp_filter=2/);
-  assert.match(installer, /choose_port "WireGuard UDP 端口" udp 19801/);
+  assert.match(installer, /choose_public_endpoint/);
+  assert.match(installer, /choose_port "WireGuard UDP 公网监听端口" udp 19801/);
+  assert.match(installer, /DATA_PORT="\$\{DATA_PORT:-\$\(find_available_port udp 19801\)\}"/);
   assert.match(installer, /choose_panel_password/);
   assert.match(installer, /read -r -s first/);
   assert.match(installer, /SDWAN_PANEL_PASSWORD_HASH=/);
@@ -76,6 +78,8 @@ test('已安装节点支持无交互原地更新，并在服务异常时自动�
   assert.match(installer, /systemctl restart "\$\{services\[@\]\}"/);
   assert.match(installer, /ln -sfn "\$previous_release" \/opt\/pathweaver\/current/);
   assert.match(installer, /services_healthy/);
+  assert.match(installer, /install_update_dispatcher/);
+  assert.match(installer, /--bundle-file/);
   assert.match(installer, /patch_private_wireguard_runtime/);
   assert.match(installer, /PATHWEAVER_WG_QUICK_NO_AUTO_SU/);
   assert.match(installer, /\^\[\[:space:\]\]\*auto_su\[\[:space:\]\]\*\$/);
