@@ -55,6 +55,8 @@ test('每条连接的双方可达地址覆盖节点默认 Endpoint', () => {
   });
   assert.equal(result.configs.a.data.peers[0].endpoint, '10.0.0.20:51820');
   assert.equal(result.configs.b.data.peers[0].endpoint, '192.168.1.10:51820');
+  assert.equal(result.configs.a.data.peers[0].probeIp, '10.77.0.2');
+  assert.equal(result.configs.b.data.peers[0].probeIp, '10.77.0.1');
 });
 
 test('拒绝孤立节点、自连接和重复 IP', () => {

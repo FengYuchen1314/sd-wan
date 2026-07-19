@@ -160,6 +160,7 @@ export function validateAndCompileTopology({ network, nodes, links }) {
           name: peer.name,
           publicKey: peer.wgDataPublicKey ?? '',
           endpoint: route.endpoint ?? peer.dataEndpoint ?? null,
+          probeIp: peer.dataIp,
           allowedIps: route.allowedIps.sort(),
           persistentKeepalive: 25,
         };

@@ -1,11 +1,37 @@
 import { execFile } from 'node:child_process';
 import { X_OK } from 'node:constants';
 import { createHash } from 'node:crypto';
+import { createSocket } from 'node:dgram';
 import { accessSync, chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+
+function sendWireGuardWarmup(address) {
+  return new Promise((resolve) => {
+    const socket = createSocket('udp4');
+    let settled = false;
+    let timeout;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try { socket.close(); } catch {}
+      resolve();
+    };
+    timeout = setTimeout(finish, 1_000);
+    socket.once('error', finish);
+    socket.send(Buffer.from('pathweaver-warmup'), 9, address, finish);
+  });
+}
+
+export function dataPlaneWarmupTargets(config) {
+  return [...new Set((config?.data?.peers ?? [])
+    .filter((peer) => peer.endpoint)
+    .map((peer) => String(peer.probeIp || peer.allowedIps?.find((cidr) => cidr.endsWith('/32')) || '').replace(/\/32$/, ''))
+    .filter((address) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(address)))];
+}
 
 function tunnelName(policyId, pathId, targetNodeId) {
   const suffix = createHash('sha256').update(`${policyId}:${pathId}:${targetNodeId}`).digest('hex').slice(0, 11);
@@ -119,7 +145,7 @@ export function renderWireGuardConfig(config, privateKey) {
     if (!peer.publicKey) throw new Error(`Peer ${peer.name || peer.nodeId} 缺少 WireGuard 公钥`);
     lines.push('', '[Peer]', `# ${peer.name || peer.nodeId}`, `PublicKey = ${peer.publicKey}`);
     if (peer.endpoint) lines.push(`Endpoint = ${peer.endpoint}`);
-    lines.push(`AllowedIPs = ${peer.allowedIps.join(', ')}`);
+    if (peer.allowedIps?.length) lines.push(`AllowedIPs = ${peer.allowedIps.join(', ')}`);
     if (peer.persistentKeepalive) lines.push(`PersistentKeepalive = ${peer.persistentKeepalive}`);
   }
   return `${lines.join('\n')}\n`;
@@ -147,6 +173,7 @@ export class WireGuardManager {
     this.linkHealthCache = null;
     this.linkHealthCheckedAt = 0;
     this.activeMultipathPlan = { aliases: [], tunnels: [], routes: [] };
+    this.warmupSender = options.warmupSender ?? sendWireGuardWarmup;
   }
 
   runtimeInfo() {
@@ -179,6 +206,12 @@ export class WireGuardManager {
 
   runSystem(command, args, timeout = 10_000) {
     return execFileAsync(command, args, { timeout, env: this.commandEnvironment });
+  }
+
+  async warmDataPlane(config) {
+    const targets = dataPlaneWarmupTargets(config);
+    await Promise.allSettled(targets.map((address) => this.warmupSender(address)));
+    return targets;
   }
 
   async ignoreMissing(operation) {
@@ -307,6 +340,7 @@ export class WireGuardManager {
       try {
         await this.runWgQuick(['up', target], 20_000);
         this.activeMultipathPlan = await this.applyMultipathPlan(nextConfig);
+        await this.warmDataPlane(nextConfig);
       } catch (error) {
         await this.cleanupMultipathPlan(nextPlan).catch(() => {});
         const backup = `${previous}.previous`;

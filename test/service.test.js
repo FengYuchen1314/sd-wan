@@ -304,6 +304,79 @@ test('只填写一个可达地址时仅探测该方向，成功后建立单向�
   } finally { database.close(); }
 });
 
+test('单向 NAT 直连握手失败时基础拓扑自动回退，恢复后重新启用直连', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
+    const ix = service.registerAgent({
+      token: tokenA.token,
+      name: '上海 IX',
+      controlListenPort: 19201,
+      dataListenPort: 21201,
+      wgDataPublicKey: 'a'.repeat(44),
+      dataEndpoint: '192.0.2.10:21201',
+    }).node;
+    const tokenB = service.createJoinToken(network.id, { parentId: center.id });
+    const london = service.registerAgent({
+      token: tokenB.token,
+      name: '伦敦节点',
+      controlListenPort: 19202,
+      dataListenPort: 21202,
+      wgDataPublicKey: 'b'.repeat(44),
+      dataEndpoint: '198.51.100.20:21202',
+    }).node;
+    const direct = service.createLinkValidation(network.id, {
+      nodeAId: ix.id,
+      nodeBId: london.id,
+      nodeBAddress: '198.51.100.20',
+      priority: 1,
+    });
+    for (const node of [ix, london]) {
+      const prepare = service.claimCommand(node.id);
+      service.completeCommand(node.id, prepare.id, { ok: true });
+    }
+    const probe = service.claimCommand(ix.id);
+    assert.equal(probe.payload.remoteUrl, 'http://198.51.100.20:19202');
+    assert.equal(service.claimCommand(london.id), null);
+    service.completeCommand(ix.id, probe.id, { ok: true, remoteNodeId: london.id });
+
+    const activeVersion = service.listConfigurations(network.id)[0];
+    const activeConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', activeVersion.id, ix.id,
+    ).config_json);
+    assert.equal(activeConfig.routes.find((route) => route.targetNodeId === london.id).viaNodeId, london.id);
+    const activePeer = activeConfig.data.peers.find((peer) => peer.nodeId === london.id);
+    assert.equal(activePeer.endpoint, '198.51.100.20:21202');
+    assert.equal(activePeer.persistentKeepalive, 25);
+    assert.equal(activePeer.probeIp, london.dataIp);
+
+    const failed = service.heartbeat(ix.id, {
+      linkHealth: { available: true, links: [{ linkId: direct.id, status: 'unreachable' }] },
+    });
+    assert.ok(failed.versionId);
+    assert.match(service.getConfiguration(failed.versionId).reason, /基础拓扑自动绕开/);
+    const fallbackConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', failed.versionId, ix.id,
+    ).config_json);
+    assert.equal(fallbackConfig.routes.find((route) => route.targetNodeId === london.id).viaNodeId, center.id);
+    const healthProbePeer = fallbackConfig.data.peers.find((peer) => peer.nodeId === london.id);
+    assert.equal(healthProbePeer.healthProbeOnly, true);
+    assert.deepEqual(healthProbePeer.allowedIps, []);
+    assert.equal(healthProbePeer.endpoint, '198.51.100.20:21202');
+    assert.ok(fallbackConfig.data.links.some((link) => link.linkId === direct.id));
+
+    const recovered = service.heartbeat(ix.id, {
+      linkHealth: { available: true, links: [{ linkId: direct.id, status: 'reachable' }] },
+    });
+    assert.ok(recovered.versionId);
+    assert.match(service.getConfiguration(recovered.versionId).reason, /重新启用链路/);
+    const recoveredConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', recovered.versionId, ix.id,
+    ).config_json);
+    assert.equal(recoveredConfig.routes.find((route) => route.targetNodeId === london.id).viaNodeId, london.id);
+  } finally { database.close(); }
+});
+
 test('新节点端口由本机安装决定，注册后保存并用于配置和手动连接', () => {
   const { database, service, network, center } = fixture();
   try {

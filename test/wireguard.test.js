@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildMultipathPlan, detectLocalNetworkConflicts, renderWireGuardConfig, WireGuardManager } from '../src/agent/wireguard.js';
+import { buildMultipathPlan, dataPlaneWarmupTargets, detectLocalNetworkConflicts, renderWireGuardConfig, WireGuardManager } from '../src/agent/wireguard.js';
 
 test('渲染精确 AllowedIPs 的 WireGuard 数据配置', () => {
   const rendered = renderWireGuardConfig({
@@ -35,6 +35,34 @@ test('拒绝缺少公钥的 Peer 配置', () => {
     address: '10.77.0.2/32', listenPort: 51820, mtu: 1380,
     peers: [{ nodeId: 'bad', publicKey: '', allowedIps: ['10.77.0.1/32'] }],
   }, 'b'.repeat(44)), /缺少 WireGuard 公钥/);
+});
+
+test('单向 Endpoint 激活后立即发送业务网段预热包以建立 NAT 映射', async () => {
+  const sent = [];
+  const config = {
+    data: {
+      peers: [
+        { nodeId: 'london', endpoint: '198.51.100.20:19801', probeIp: '10.77.0.8', allowedIps: ['10.77.0.8/32'] },
+        { nodeId: 'shanghai', endpoint: '', probeIp: '10.77.0.9', allowedIps: ['10.77.0.9/32'] },
+      ],
+    },
+  };
+  assert.deepEqual(dataPlaneWarmupTargets(config), ['10.77.0.8']);
+  const manager = new WireGuardManager({
+    dataDir: '.',
+    privateKey: 'b'.repeat(44),
+    applyNetwork: false,
+    warmupSender: async (address) => { sent.push(address); },
+  });
+  assert.deepEqual(await manager.warmDataPlane(config), ['10.77.0.8']);
+  assert.deepEqual(sent, ['10.77.0.8']);
+
+  const probeOnly = renderWireGuardConfig({
+    address: '10.77.0.2/32', listenPort: 19801, mtu: 1380,
+    peers: [{ nodeId: 'probe', publicKey: 'a'.repeat(44), endpoint: '198.51.100.20:19801', allowedIps: [], persistentKeepalive: 25 }],
+  }, 'b'.repeat(44));
+  assert.doesNotMatch(probeOnly, /AllowedIPs\s*=/);
+  assert.match(probeOnly, /PersistentKeepalive = 25/);
 });
 
 test('Agent 只接受带 PathWeaver 清单的私有 WireGuard 运行时', () => {

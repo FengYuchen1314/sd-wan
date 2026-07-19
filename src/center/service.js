@@ -244,6 +244,7 @@ function applyPreferredPath(compiled, state, pathNodeIds) {
         name: nextHop.name,
         publicKey: nextHop.wgDataPublicKey ?? '',
         endpoint: endpoint || nextHop.dataEndpoint || null,
+        probeIp: nextHop.dataIp,
         allowedIps: [],
         persistentKeepalive: 25,
       };
@@ -254,6 +255,40 @@ function applyPreferredPath(compiled, state, pathNodeIds) {
     config.data.peers.sort((left, right) => String(left.nodeId).localeCompare(String(right.nodeId)));
     const route = config.routes.find((item) => item.targetNodeId === destinationId);
     if (route) route.viaNodeId = nextHopId;
+  }
+}
+
+function attachFailedLinkHealthPeers(compiled, state, failedLinkIds) {
+  const nodeById = new Map(state.nodes.map((node) => [node.id, node]));
+  for (const link of state.links.filter((item) => failedLinkIds.has(item.id))) {
+    for (const [sourceId, peerId, explicitEndpoint] of [
+      [link.upstreamId, link.downstreamId, link.downstreamEndpoint],
+      [link.downstreamId, link.upstreamId, link.upstreamEndpoint],
+    ]) {
+      const config = compiled.configs[sourceId];
+      const peerNode = nodeById.get(peerId);
+      if (!config || !peerNode) continue;
+      if (!config.data.peers.some((peer) => peer.nodeId === peerId)) {
+        config.data.peers.push({
+          nodeId: peerId,
+          name: peerNode.name,
+          publicKey: peerNode.wgDataPublicKey ?? '',
+          endpoint: explicitEndpoint ?? peerNode.dataEndpoint ?? null,
+          probeIp: peerNode.dataIp,
+          allowedIps: [],
+          persistentKeepalive: 25,
+          healthProbeOnly: true,
+        });
+        config.data.peers.sort((left, right) => String(left.nodeId).localeCompare(String(right.nodeId)));
+      }
+      if (!config.data.links.some((item) => item.linkId === link.id)) {
+        config.data.links.push({
+          linkId: link.id,
+          peerNodeId: peerId,
+          peerPublicKey: peerNode.wgDataPublicKey ?? '',
+        });
+      }
+    }
   }
 }
 
@@ -1381,7 +1416,20 @@ export class ControlService {
 
   createVersionInTransaction(networkId, reason, precompiled = null) {
     const state = this.loadState(networkId);
-    const compiled = precompiled ?? validateAndCompileTopology(state);
+    const failedLinkIds = this.failedLinkIds(networkId);
+    let compiled = precompiled;
+    if (!compiled && failedLinkIds.size) {
+      try {
+        compiled = validateAndCompileTopology({
+          ...state,
+          links: state.links.filter((link) => !failedLinkIds.has(link.id)),
+        });
+        attachFailedLinkHealthPeers(compiled, state, failedLinkIds);
+      } catch {
+        compiled = null;
+      }
+    }
+    compiled ??= validateAndCompileTopology(state);
     const pathPolicies = this.listPathPolicies(networkId);
     const nodeById = new Map(state.nodes.map((node) => [node.id, node]));
     const nextAlias = createMultipathAliasAllocator(state.network, state.nodes);
@@ -1409,7 +1457,6 @@ export class ControlService {
       };
     }
     for (const config of Object.values(compiled.configs)) config.multipathPolicies = [];
-    const failedLinkIds = this.failedLinkIds(networkId);
     const claimedWeightedRoutes = new Map();
     for (const policy of pathPolicies) {
       const availablePathIds = new Set(policy.paths.filter((path) =>
@@ -1570,7 +1617,7 @@ export class ControlService {
   }
 
   recordLinkHealthAndUpdatePolicies(node, linkHealth, timestamp) {
-    const empty = { rotated: [], weightedChanges: [] };
+    const empty = { rotated: [], weightedChanges: [], availabilityChanged: false, failedLinkIds: [] };
     if (!linkHealth?.available || !Array.isArray(linkHealth.links)) return empty;
     const beforeFailedLinkIds = this.failedLinkIds(node.networkId);
     const incident = new Set(this.listLinks(node.networkId, true).filter((link) =>
@@ -1585,6 +1632,8 @@ export class ControlService {
       );
     }
     const failedLinkIds = this.failedLinkIds(node.networkId);
+    const availabilityChanged = beforeFailedLinkIds.size !== failedLinkIds.size ||
+      [...beforeFailedLinkIds].some((linkId) => !failedLinkIds.has(linkId));
     const policies = this.listPathPolicies(node.networkId);
     const weightedChanges = [];
     for (const policy of policies.filter((item) => item.mode === 'weighted')) {
@@ -1611,7 +1660,7 @@ export class ControlService {
       this.db.run('UPDATE path_policies SET paths_json = ?, updated_at = ? WHERE id = ?', json(reordered), timestamp, policy.id);
       rotated.push({ policyId: policy.id, fromPathId: current.pathId, toPathId: replacement.pathId });
     }
-    return { rotated, weightedChanges };
+    return { rotated, weightedChanges, availabilityChanged, failedLinkIds: [...failedLinkIds] };
   }
 
   heartbeat(nodeId, input = {}) {
@@ -1630,9 +1679,12 @@ export class ControlService {
         controlListenPort, dataListenPort, timestamp, nodeId,
       );
       const policyHealth = this.recordLinkHealthAndUpdatePolicies(node, input.linkHealth, timestamp);
-      if (portChanged || policyHealth.rotated.length || policyHealth.weightedChanges.length) {
+      if (portChanged || policyHealth.availabilityChanged || policyHealth.rotated.length || policyHealth.weightedChanges.length) {
         const reasons = [
           portChanged ? `节点 ${node.name} 更新 WireGuard 端口` : '',
+          policyHealth.availabilityChanged ? (policyHealth.failedLinkIds.length
+            ? '检测到数据面握手故障，基础拓扑自动绕开不可达链路'
+            : '数据面握手恢复，基础拓扑重新启用链路') : '',
           policyHealth.rotated.length ? `检测到线路故障，自动切换 ${policyHealth.rotated.length} 项默认路径` : '',
           policyHealth.weightedChanges.length ? `检测到链路状态变化，更新 ${policyHealth.weightedChanges.length} 项负载均衡成员` : '',
         ].filter(Boolean);
@@ -1640,6 +1692,9 @@ export class ControlService {
         if (policyHealth.rotated.length) this.audit('path-policy.failover', 'network', node.networkId, { nodeId, rotated: policyHealth.rotated, versionId }, `node:${nodeId}`);
         if (policyHealth.weightedChanges.length) this.audit('path-policy.weighted-health', 'network', node.networkId, {
           nodeId, changes: policyHealth.weightedChanges, versionId,
+        }, `node:${nodeId}`);
+        if (policyHealth.availabilityChanged) this.audit('topology-link.health', 'network', node.networkId, {
+          nodeId, failedLinkIds: policyHealth.failedLinkIds, versionId,
         }, `node:${nodeId}`);
       }
       if (portChanged) {
