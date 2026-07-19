@@ -1,8 +1,12 @@
 import { createHash, generateKeyPairSync, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { Database } from '../center/database.js';
+import { CoordinatorElection } from '../core/coordinator.js';
 import {
   acceptProbeEnvelope,
   DEFAULT_DATA_PORT,
@@ -17,8 +21,11 @@ import { WireGuardManager } from './wireguard.js';
 const args = parseArgs(process.argv.slice(2));
 const dataDir = resolve(process.env.SDWAN_AGENT_DATA_DIR || (process.platform === 'linux' ? '/var/lib/pathweaver-agent' : './data/agent'));
 const stateFile = join(dataDir, 'state.json');
+const replicaFile = join(dataDir, 'coordinator-replica.json');
+const coordinatorServerFile = fileURLToPath(new URL('../center/server.js', import.meta.url));
 const applyNetwork = process.env.SDWAN_APPLY_NETWORK === '1' && process.platform === 'linux';
 const pollInterval = Number(process.env.SDWAN_POLL_INTERVAL || 5000);
+const coordinatorLeaseMs = Math.max(1_000, Number(process.env.SDWAN_COORDINATOR_LEASE_MS || 12_000));
 mkdirSync(dataDir, { recursive: true });
 
 function parseArgs(values) {
@@ -99,11 +106,55 @@ if (explicitDataPort !== undefined && explicitDataPort !== null && explicitDataP
 }
 atomicJson(stateFile, state);
 const listenAddress = process.env.SDWAN_AGENT_LISTEN || `0.0.0.0:${state.controlListenPort}`;
+let replica = null;
+try { replica = existsSync(replicaFile) ? JSON.parse(readFileSync(replicaFile, 'utf8')) : null; } catch {}
+const election = new CoordinatorElection({
+  nodeId: state.nodeId || state.agentInstanceId,
+  ...(state.coordinatorElection || {}),
+  snapshotRevision: Math.max(
+    Number(state.coordinatorElection?.snapshotRevision || 0),
+    Number(replica?.revision || 0),
+  ),
+});
+let coordinatorProcess = null;
+let localCoordinatorUrl = null;
+let consecutiveControlFailures = 0;
 
 function safeEqualHash(token, expectedHash) {
   const actual = createHash('sha256').update(String(token ?? '')).digest();
   const expected = Buffer.from(String(expectedHash ?? ''), 'hex');
   return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function safeEqualText(left, right) {
+  const actual = Buffer.from(String(left ?? ''));
+  const expected = Buffer.from(String(right ?? ''));
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function persistElection() {
+  state.coordinatorElection = election.snapshot();
+  atomicJson(stateFile, state);
+}
+
+function applyClusterDescriptor(cluster, { renewLease = false } = {}) {
+  if (!cluster?.coordinatorNodeId) return;
+  state.controlCluster = {
+    ...state.controlCluster,
+    ...cluster,
+    voterIds: Array.isArray(cluster.voterIds) ? cluster.voterIds : (state.controlCluster?.voterIds || []),
+  };
+  election.nodeId = state.nodeId || state.agentInstanceId;
+  election.observeCluster(cluster);
+  if (renewLease) {
+    election.noteLeader({
+      term: cluster.term,
+      leaderId: cluster.coordinatorNodeId,
+      revision: cluster.revision,
+      leaseMs: coordinatorLeaseMs,
+    });
+  }
+  persistElection();
 }
 
 function bearerToken(req) {
@@ -172,15 +223,34 @@ function encodeControlRoute(route) {
 
 function controlCandidates() {
   const candidates = [];
-  for (const route of shuffled(state.controlRoutes || [])) {
-    if (!Array.isArray(route.hops) || !route.hops.length || route.hops.length > MAX_PROBE_HOPS) continue;
-    if (new Set(route.nodeIds || []).size !== (route.nodeIds || []).length) continue;
-    const [first, ...remaining] = route.hops;
-    try {
-      const firstUrl = normalizeControlUrl(first.url);
-      if (state.controlForwarders?.[first.nodeId] !== firstUrl) continue;
-      candidates.push({ id: route.id, baseUrl: firstUrl, remaining });
-    } catch {}
+  const leaderId = election.leaderId || state.controlCluster?.coordinatorNodeId;
+  const targetIds = [leaderId, ...shuffled(state.controlCluster?.voterIds || []).filter((id) => id !== leaderId)].filter(Boolean);
+  for (const targetId of targetIds) {
+    if (targetId === state.nodeId && localCoordinatorUrl) {
+      candidates.push({ id: `local-${targetId}`, targetId, baseUrl: localCoordinatorUrl, remaining: [] });
+    }
+    for (const route of shuffled(state.controlRoutesByTarget?.[targetId] || [])) {
+      if (!Array.isArray(route.hops) || !route.hops.length || route.hops.length > MAX_PROBE_HOPS) continue;
+      if (new Set(route.nodeIds || []).size !== (route.nodeIds || []).length) continue;
+      const [first, ...remaining] = route.hops;
+      try {
+        const firstUrl = normalizeControlUrl(first.url);
+        if (state.controlForwarders?.[first.nodeId] !== firstUrl) continue;
+        candidates.push({ id: route.id, targetId, baseUrl: firstUrl, remaining });
+      } catch {}
+    }
+  }
+  if (!state.controlCluster) {
+    for (const route of shuffled(state.controlRoutes || [])) {
+      if (!Array.isArray(route.hops) || !route.hops.length || route.hops.length > MAX_PROBE_HOPS) continue;
+      if (new Set(route.nodeIds || []).size !== (route.nodeIds || []).length) continue;
+      const [first, ...remaining] = route.hops;
+      try {
+        const firstUrl = normalizeControlUrl(first.url);
+        if (state.controlForwarders?.[first.nodeId] !== firstUrl) continue;
+        candidates.push({ id: route.id, baseUrl: firstUrl, remaining });
+      } catch {}
+    }
   }
   if (state.upstream) {
     const fallback = normalizeControlUrl(state.upstream);
@@ -217,6 +287,15 @@ async function api(pathname, options = {}) {
         if (response.status < 500) throw Object.assign(new Error(body?.error || `上游返回 HTTP ${response.status}`), { terminal: true });
         throw new Error(body?.error || `控制路径返回 HTTP ${response.status}`);
       }
+      if (state.controlCluster && candidate.targetId === (election.leaderId || state.controlCluster.coordinatorNodeId)) {
+        election.noteLeader({
+          term: state.controlCluster.term,
+          leaderId: candidate.targetId,
+          revision: Math.max(Number(state.controlCluster.revision || 0), Number(replica?.revision || 0)),
+          leaseMs: coordinatorLeaseMs,
+        });
+        persistElection();
+      }
       return body;
     } catch (error) {
       if (error.terminal) throw error;
@@ -250,6 +329,7 @@ async function register({ passive = false } = {}) {
     joinToken: null,
     networkId: result.node.networkId,
   };
+  election.nodeId = state.nodeId;
   atomicJson(stateFile, state);
   console.log(`节点 ${result.node.name} 已注册，业务地址 ${result.node.dataIp}`);
 }
@@ -260,12 +340,22 @@ const wireguard = new WireGuardManager({
   applyNetwork,
 });
 
+function applyDesiredControlConfig(config) {
+  state.controlRoutes = Array.isArray(config?.control?.routes) ? config.control.routes : [];
+  state.controlRoutesByTarget = config?.control?.routesByTarget || {};
+  state.controlForwarders = Object.fromEntries(Object.entries(config?.control?.forwarders || {}).map(
+    ([nodeId, url]) => [nodeId, normalizeControlUrl(url)],
+  ));
+  applyClusterDescriptor(config?.control?.cluster);
+}
+
 async function applyDesiredConfig(desired) {
   if (!desired) return null;
   if (desired.phase === 'prepare' && state.preparedVersion !== desired.version) {
     try {
       await wireguard.prepare(desired.version, desired.config);
       state.preparedVersion = desired.version;
+      applyDesiredControlConfig(desired.config);
       atomicJson(stateFile, state);
       return { versionId: desired.versionId, phase: 'prepared' };
     } catch (error) {
@@ -278,10 +368,7 @@ async function applyDesiredConfig(desired) {
       await wireguard.activate(desired.version);
       state.currentVersion = desired.version;
       state.preparedVersion = desired.version;
-      state.controlRoutes = Array.isArray(desired.config?.control?.routes) ? desired.config.control.routes : [];
-      state.controlForwarders = Object.fromEntries(Object.entries(desired.config?.control?.forwarders || {}).map(
-        ([nodeId, url]) => [nodeId, normalizeControlUrl(url)],
-      ));
+      applyDesiredControlConfig(desired.config);
       atomicJson(stateFile, state);
       return { versionId: desired.versionId, phase: 'activated' };
     } catch (error) {
@@ -299,6 +386,196 @@ async function syncConfig() {
       method: 'POST', body: JSON.stringify({ phase: report.phase, error: report.error }),
     });
   }
+}
+
+function installReplica(nextReplica) {
+  if (!nextReplica || Number(nextReplica.schemaVersion) !== 1) throw new Error('协调快照格式无效');
+  if (Number(nextReplica.revision || 0) < Number(replica?.revision || 0)) return false;
+  atomicJson(replicaFile, nextReplica);
+  replica = nextReplica;
+  election.snapshotRevision = Math.max(election.snapshotRevision, Number(nextReplica.revision || 0));
+  persistElection();
+  return true;
+}
+
+async function syncReplica() {
+  const response = await api('/agent/v1/replica-snapshot');
+  if (response?.snapshot) installReplica(response.snapshot);
+}
+
+async function requestPeer(targetId, pathname, payload, timeout = 5_000) {
+  const secret = state.controlCluster?.electionSecret;
+  if (!secret) throw new Error('缺少协调选举凭据');
+  const routes = shuffled(state.controlRoutesByTarget?.[targetId] || []);
+  const failures = [];
+  for (const route of routes) {
+    if (!Array.isArray(route.hops) || !route.hops.length || route.hops.length > MAX_PROBE_HOPS) continue;
+    const [first, ...remaining] = route.hops;
+    try {
+      const firstUrl = normalizeControlUrl(first.url);
+      if (state.controlForwarders?.[first.nodeId] !== firstUrl) continue;
+      const response = await fetch(new URL(pathname, `${firstUrl}/`), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${secret}`,
+          'X-PathWeaver-Relay-Trace': state.nodeId || state.agentInstanceId,
+          ...(remaining.length ? { 'X-PathWeaver-Control-Route': encodeControlRoute(remaining) } : {}),
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(timeout),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || `节点返回 HTTP ${response.status}`);
+      return body;
+    } catch (error) {
+      failures.push(`${route.id}: ${error.message}`);
+    }
+  }
+  throw new Error(`到选民 ${targetId} 的无环路径均不可用：${failures.join('；')}`);
+}
+
+async function waitForCoordinator(url, child) {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    if (child.exitCode !== null) throw new Error(`本机协调服务提前退出：${child.exitCode}`);
+    try {
+      const response = await fetch(new URL('/healthz', `${url}/`), { signal: AbortSignal.timeout(500) });
+      if (response.ok) return;
+    } catch {}
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  throw new Error('本机协调服务启动超时');
+}
+
+async function stopLocalCoordinator() {
+  const child = coordinatorProcess;
+  coordinatorProcess = null;
+  localCoordinatorUrl = null;
+  if (child?.exitCode === null) child.kill('SIGTERM');
+}
+
+async function startLocalCoordinator(term) {
+  if (!replica) throw new Error('本机还没有可用于接管的协调快照');
+  if (coordinatorProcess?.exitCode === null && localCoordinatorUrl) return;
+  const coordinatorDir = join(dataDir, 'coordinator');
+  mkdirSync(coordinatorDir, { recursive: true });
+  const database = new Database(join(coordinatorDir, 'pathweaver.db'));
+  try { database.importSnapshot(replica); } finally { database.close(); }
+  state.coordinatorPort = await selectAvailableTcpPort({ preferred: state.coordinatorPort || 19774 });
+  persistElection();
+  const internalToken = randomBytes(32).toString('base64url');
+  const url = `http://127.0.0.1:${state.coordinatorPort}`;
+  const child = spawn(process.execPath, [coordinatorServerFile], {
+    cwd: resolve(fileURLToPath(new URL('../..', import.meta.url))),
+    stdio: ['ignore', 'inherit', 'inherit'],
+    env: {
+      ...process.env,
+      NODE_ENV: 'production',
+      SDWAN_HOST: '127.0.0.1',
+      SDWAN_PORT: String(state.coordinatorPort),
+      SDWAN_PUBLIC_URL: state.controlEndpoint || `http://127.0.0.1:${state.controlListenPort}`,
+      SDWAN_DATA_DIR: coordinatorDir,
+      SDWAN_ADMIN_TOKEN: internalToken,
+      SDWAN_COORDINATOR_ONLY: '1',
+      SDWAN_EXTERNAL_COORDINATOR: '1',
+      SDWAN_PROMOTE_NODE_ID: state.nodeId,
+      SDWAN_COORDINATOR_TERM: String(term),
+      SDWAN_APPLY_NETWORK: '0',
+    },
+  });
+  coordinatorProcess = child;
+  child.once('exit', () => {
+    if (coordinatorProcess === child) {
+      coordinatorProcess = null;
+      localCoordinatorUrl = null;
+    }
+  });
+  await waitForCoordinator(url, child);
+  localCoordinatorUrl = url;
+  await syncReplica();
+}
+
+async function broadcastCoordinatorHeartbeat() {
+  if (!state.controlCluster || election.leaderId !== state.nodeId || !localCoordinatorUrl) return;
+  const voterIds = state.controlCluster.voterIds || [];
+  const quorum = election.quorum(voterIds.length);
+  let acknowledgements = voterIds.includes(state.nodeId) ? 1 : 0;
+  const heartbeat = {
+    networkId: state.controlCluster.networkId,
+    term: election.term,
+    leaderId: state.nodeId,
+    revision: Math.max(election.snapshotRevision, Number(replica?.revision || 0)),
+    leaseMs: coordinatorLeaseMs,
+  };
+  const responses = await Promise.all(voterIds.filter((id) => id !== state.nodeId).map((id) =>
+    requestPeer(id, '/peer/v1/election/heartbeat', heartbeat).catch(() => null)));
+  for (const response of responses) {
+    if (response?.accepted) acknowledgements += 1;
+    if (Number(response?.term || 0) > election.term && response?.leaderId) {
+      election.noteLeader({
+        term: response.term,
+        leaderId: response.leaderId,
+        revision: response.revision,
+      });
+    }
+  }
+  if (acknowledgements >= quorum) {
+    election.noteLeader(heartbeat);
+    persistElection();
+  } else if (election.leaseUntil <= Date.now()) {
+    await stopLocalCoordinator();
+  }
+}
+
+async function maybeElectCoordinator() {
+  const voterIds = state.controlCluster?.voterIds || [];
+  if (!state.nodeId || !replica || !voterIds.includes(state.nodeId) || election.leaseUntil > Date.now()) return false;
+  await new Promise((resolveWait) => setTimeout(resolveWait, randomInt(200, 1_200)));
+  if (election.leaseUntil > Date.now()) return false;
+  const request = election.beginElection();
+  persistElection();
+  let votes = 1;
+  let leasedLeader = null;
+  const responses = await Promise.all(voterIds.filter((id) => id !== state.nodeId).map((id) =>
+    requestPeer(id, '/peer/v1/election/request-vote', {
+      networkId: state.controlCluster.networkId,
+      ...request,
+    }).catch(() => null)));
+  for (const response of responses) {
+    if (response?.granted && Number(response.term) === election.term) votes += 1;
+    if (response?.reason === 'leader-lease-active' && response?.leaderId) leasedLeader = response;
+    if (Number(response?.term || 0) > election.term && response?.leaderId) {
+      election.noteLeader({ term: response.term, leaderId: response.leaderId, revision: response.revision });
+    }
+  }
+  if (leasedLeader) {
+    election.followLease({
+      term: leasedLeader.term,
+      leaderId: leasedLeader.leaderId,
+      revision: leasedLeader.revision,
+      leaseMs: coordinatorLeaseMs,
+    });
+    state.controlCluster.coordinatorNodeId = leasedLeader.leaderId;
+    state.controlCluster.term = Number(leasedLeader.term);
+    persistElection();
+    return false;
+  }
+  if (votes < election.quorum(voterIds.length)) {
+    persistElection();
+    return false;
+  }
+  election.noteLeader({
+    term: election.term,
+    leaderId: state.nodeId,
+    revision: Number(replica.revision || 0),
+    leaseMs: coordinatorLeaseMs,
+  });
+  state.controlCluster.coordinatorNodeId = state.nodeId;
+  state.controlCluster.term = election.term;
+  persistElection();
+  await startLocalCoordinator(election.term);
+  await broadcastCoordinatorHeartbeat();
+  return true;
 }
 
 async function requestManagedTarget(child, pathname, options = {}) {
@@ -547,7 +824,7 @@ async function tick() {
     links: [],
     failedLinkIds: [],
   }));
-  await api('/agent/v1/heartbeat', {
+  const heartbeat = await api('/agent/v1/heartbeat', {
     method: 'POST',
     body: JSON.stringify({
       agentVersion: '0.1.0',
@@ -558,11 +835,29 @@ async function tick() {
       linkHealth,
     }),
   });
+  applyClusterDescriptor(heartbeat?.cluster, { renewLease: true });
   await syncConfig();
+  await syncReplica().catch((error) => console.error('协调快照同步失败：', error.message));
   const command = await api('/agent/v1/commands/next');
   if (command) await executeCommand(command);
   for (const child of Object.values(state.managedChildren)) {
     await syncManagedChild(child).catch((error) => console.error(`被认领节点 ${child.nodeId} 同步失败：`, error.message));
+  }
+}
+
+async function agentCycle() {
+  try {
+    await tick();
+    consecutiveControlFailures = 0;
+  } catch (error) {
+    consecutiveControlFailures += 1;
+    console.error('同步失败：', error.message);
+    if (consecutiveControlFailures >= 2) await maybeElectCoordinator().catch((electionError) => {
+      console.error('协调选举失败：', electionError.message);
+    });
+  }
+  if (election.leaderId === state.nodeId && localCoordinatorUrl) {
+    await broadcastCoordinatorHeartbeat().catch((error) => console.error('协调租约续期失败：', error.message));
   }
 }
 
@@ -585,6 +880,15 @@ async function proxy(req, res) {
     }
     targetUrl = allowedUrl;
     remaining.splice(0, remaining.length, ...rest);
+  } else if (state.controlCluster) {
+    if (election.leaderId === state.nodeId) {
+      targetUrl = localCoordinatorUrl;
+    } else {
+      const leader = controlCandidates().find((candidate) =>
+        candidate.targetId === (election.leaderId || state.controlCluster.coordinatorNodeId));
+      targetUrl = leader?.baseUrl || null;
+      if (leader?.remaining?.length) remaining.splice(0, remaining.length, ...leader.remaining);
+    }
   }
   if (!targetUrl) {
     res.writeHead(503, { 'Content-Type': 'application/json' });
@@ -628,6 +932,78 @@ const relayServer = createServer(async (req, res) => {
         wireGuardRuntime: wireguard.runtimeInfo(),
         linkHealth,
       }));
+    }
+    const coordinatorPeerPath = [
+      '/peer/v1/election/request-vote',
+      '/peer/v1/election/heartbeat',
+      '/peer/v1/replica/install',
+      '/peer/v1/coordinator-panel',
+    ].includes(req.url);
+    if (coordinatorPeerPath && decodeControlRoute(req.headers['x-pathweaver-control-route']).length) {
+      return await proxy(req, res);
+    }
+    if (coordinatorPeerPath) {
+      if (!state.controlCluster?.electionSecret || !safeEqualText(bearerToken(req), state.controlCluster.electionSecret)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: '协调节点间凭据无效' }));
+      }
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const input = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      if (input.networkId !== state.controlCluster.networkId) throw new Error('协调请求所属节点组不匹配');
+      if (req.url === '/peer/v1/election/request-vote') {
+        const result = election.requestVote(input);
+        if (result.granted && localCoordinatorUrl) await stopLocalCoordinator();
+        persistElection();
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify({
+          ...result,
+          leaderId: election.leaderId,
+          revision: election.snapshotRevision,
+        }));
+      }
+      if (req.url === '/peer/v1/election/heartbeat') {
+        const result = election.noteLeader(input);
+        if (result.accepted) {
+          state.controlCluster.coordinatorNodeId = input.leaderId;
+          state.controlCluster.term = Number(input.term);
+          state.controlCluster.revision = Math.max(Number(state.controlCluster.revision || 0), Number(input.revision || 0));
+          if (input.leaderId !== state.nodeId && localCoordinatorUrl) await stopLocalCoordinator();
+          persistElection();
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify({
+          ...result,
+          leaderId: election.leaderId,
+          revision: election.snapshotRevision,
+        }));
+      }
+      if (req.url === '/peer/v1/replica/install') {
+        installReplica(input.snapshot);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify({ ok: true, revision: election.snapshotRevision }));
+      }
+      if (req.url === '/peer/v1/coordinator-panel') {
+        if (election.leaderId !== state.nodeId || !localCoordinatorUrl) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: '请求未到达当前配置协调节点' }));
+        }
+        const upstream = await fetch(new URL('/peer/v1/coordinator-panel', `${localCoordinatorUrl}/`), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: req.headers.authorization,
+          },
+          body: JSON.stringify(input),
+          signal: AbortSignal.timeout(30_000),
+        });
+        const body = Buffer.from(await upstream.arrayBuffer());
+        res.writeHead(upstream.status, {
+          'Content-Type': upstream.headers.get('content-type') || 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+        });
+        return res.end(body);
+      }
     }
     if (req.method === 'POST' && req.url === '/peer/v1/panel-proxy') {
       requireLocalPanel(req);
@@ -843,6 +1219,15 @@ relayServer.listen(Number(listenPortText || 8790), listenHost || '0.0.0.0', asyn
   } catch (error) {
     console.error('首次注册失败，将继续重试：', error.message);
   }
-  setInterval(() => tick().catch((error) => console.error('同步失败：', error.message)), pollInterval);
-  tick().catch((error) => console.error('首次同步失败：', error.message));
+  const cycle = setInterval(() => void agentCycle(), pollInterval);
+  cycle.unref();
+  void agentCycle();
 });
+
+function shutdown() {
+  if (coordinatorProcess?.exitCode === null) coordinatorProcess.kill('SIGTERM');
+  relayServer.close(() => process.exit(0));
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

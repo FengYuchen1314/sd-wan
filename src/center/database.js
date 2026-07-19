@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
@@ -11,6 +12,16 @@ CREATE TABLE IF NOT EXISTS networks (
   listen_port INTEGER NOT NULL,
   mtu INTEGER NOT NULL,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cluster_state (
+  network_id TEXT PRIMARY KEY REFERENCES networks(id) ON DELETE CASCADE,
+  coordinator_node_id TEXT NOT NULL,
+  term INTEGER NOT NULL DEFAULT 1,
+  revision INTEGER NOT NULL DEFAULT 0,
+  election_secret TEXT NOT NULL,
+  voted_for TEXT,
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS nodes (
@@ -187,6 +198,23 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 `;
 
+const SNAPSHOT_TABLES = [
+  'networks',
+  'nodes',
+  'cluster_state',
+  'local_node_keys',
+  'topology_links',
+  'path_policies',
+  'link_health_reports',
+  'join_tokens',
+  'config_versions',
+  'node_configs',
+  'network_cidr_changes',
+  'commands',
+  'managed_node_proxies',
+  'audit_log',
+];
+
 export class Database {
   constructor(filename) {
     if (filename !== ':memory:') mkdirSync(dirname(filename), { recursive: true });
@@ -228,6 +256,21 @@ export class Database {
     if (!proxyColumns.has('relay_path_json')) {
       this.handle.exec("ALTER TABLE managed_node_proxies ADD COLUMN relay_path_json TEXT NOT NULL DEFAULT '[]'");
     }
+    const timestamp = new Date().toISOString();
+    const revision = Number(this.get('SELECT COALESCE(MAX(id), 0) AS revision FROM audit_log')?.revision || 0);
+    for (const network of this.all('SELECT id FROM networks')) {
+      const coordinator = this.get(
+        'SELECT id FROM nodes WHERE network_id = ? ORDER BY is_center DESC, created_at LIMIT 1',
+        network.id,
+      );
+      if (!coordinator) continue;
+      this.run(
+        `INSERT INTO cluster_state(network_id, coordinator_node_id, term, revision, election_secret, voted_for, updated_at)
+         VALUES (?, ?, 1, ?, ?, NULL, ?)
+         ON CONFLICT(network_id) DO NOTHING`,
+        network.id, coordinator.id, revision, randomBytes(32).toString('base64url'), timestamp,
+      );
+    }
     this.handle.exec(`
       UPDATE nodes
       SET control_listen_port = 8790
@@ -266,6 +309,55 @@ export class Database {
       this.handle.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  exportSnapshot() {
+    const tables = Object.fromEntries(SNAPSHOT_TABLES.map((table) => [
+      table,
+      this.all(`SELECT * FROM ${table}`),
+    ]));
+    const revision = Math.max(0, ...tables.cluster_state.map((row) => Number(row.revision || 0)));
+    return {
+      schemaVersion: 1,
+      revision,
+      createdAt: new Date().toISOString(),
+      tables,
+    };
+  }
+
+  importSnapshot(snapshot) {
+    if (!snapshot || Number(snapshot.schemaVersion) !== 1 || !snapshot.tables) {
+      throw new Error('协调快照格式或版本无效');
+    }
+    for (const table of SNAPSHOT_TABLES) {
+      if (!Array.isArray(snapshot.tables[table])) throw new Error(`协调快照缺少数据表 ${table}`);
+    }
+    this.handle.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
+    try {
+      for (const table of [...SNAPSHOT_TABLES].reverse()) this.handle.exec(`DELETE FROM ${table}`);
+      for (const table of SNAPSHOT_TABLES) {
+        const columns = this.all(`PRAGMA table_info(${table})`).map((column) => column.name);
+        const allowed = new Set(columns);
+        for (const row of snapshot.tables[table]) {
+          const keys = Object.keys(row);
+          if (!keys.length || keys.some((key) => !allowed.has(key))) throw new Error(`协调快照中的 ${table} 字段无效`);
+          const placeholders = keys.map(() => '?').join(', ');
+          this.run(
+            `INSERT INTO ${table}(${keys.join(', ')}) VALUES (${placeholders})`,
+            ...keys.map((key) => row[key]),
+          );
+        }
+      }
+      const violations = this.all('PRAGMA foreign_key_check');
+      if (violations.length) throw new Error(`协调快照存在 ${violations.length} 项外键错误`);
+      this.handle.exec('COMMIT');
+    } catch (error) {
+      this.handle.exec('ROLLBACK');
+      throw error;
+    } finally {
+      this.handle.exec('PRAGMA foreign_keys = ON;');
+    }
+    return { revision: Number(snapshot.revision || 0) };
   }
 
   close() {

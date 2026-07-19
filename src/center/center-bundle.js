@@ -10,6 +10,7 @@ export function createCenterBundle(rootDir) {
       'src',
       'public',
       'scripts/install.sh',
+      'scripts/uninstall.sh',
     ], { cwd: rootDir, maxBuffer: 32 * 1024 * 1024 });
   }
   return cachedBundle;

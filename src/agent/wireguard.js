@@ -1,10 +1,67 @@
 import { execFile } from 'node:child_process';
 import { X_OK } from 'node:constants';
+import { createHash } from 'node:crypto';
 import { accessSync, chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+
+function tunnelName(policyId, pathId, targetNodeId) {
+  const suffix = createHash('sha256').update(`${policyId}:${pathId}:${targetNodeId}`).digest('hex').slice(0, 11);
+  return `pwm${suffix}`;
+}
+
+function normalizedKernelWeights(paths) {
+  const maximum = Math.max(...paths.map((path) => Number(path.effectiveWeight || 0)), 1);
+  return paths.map((path) => ({
+    ...path,
+    kernelWeight: maximum <= 256
+      ? Number(path.effectiveWeight)
+      : Math.max(1, Math.round((Number(path.effectiveWeight) / maximum) * 256)),
+  }));
+}
+
+export function buildMultipathPlan(config) {
+  const interfaceName = String(config?.data?.interfaceName || '');
+  const mtu = Number(config?.data?.mtu || 1380);
+  if (!interfaceName) throw new Error('多路径配置缺少 WireGuard 接口名称');
+  const policies = Array.isArray(config?.multipathPolicies) ? config.multipathPolicies : [];
+  const aliases = new Set();
+  const tunnels = [];
+  const routes = new Map();
+  for (const policy of policies.filter((item) => item.mode === 'weighted')) {
+    const activePaths = normalizedKernelWeights((policy.paths ?? []).filter((path) =>
+      path.available !== false && Number(path.effectiveWeight) > 0));
+    for (const path of activePaths) {
+      if (!path.localTunnelIp || !path.remoteTunnelIp) throw new Error(`加权路径 ${path.pathId} 缺少隧道地址`);
+      const name = tunnelName(policy.policyId, path.pathId, policy.targetNodeId);
+      aliases.add(String(path.localTunnelIp));
+      tunnels.push({
+        name,
+        policyId: policy.policyId,
+        pathId: path.pathId,
+        targetNodeId: policy.targetNodeId,
+        interfaceName,
+        local: String(path.localTunnelIp),
+        remote: String(path.remoteTunnelIp),
+        mtu: Math.max(576, mtu - 20),
+        weight: path.kernelWeight,
+      });
+      for (const destination of policy.routeCidrs ?? []) {
+        const members = routes.get(destination) ?? [];
+        members.push({ name, weight: path.kernelWeight, pathId: path.pathId });
+        routes.set(destination, members);
+      }
+    }
+  }
+  return {
+    interfaceName,
+    aliases: [...aliases].sort(),
+    tunnels,
+    routes: [...routes.entries()].map(([destination, members]) => ({ destination, members })),
+  };
+}
 
 function parseIPv4Cidr(value) {
   const [address, prefixText] = String(value || '').split('/');
@@ -88,6 +145,7 @@ export class WireGuardManager {
     this.linkHealthProbeIntervalMs = Math.max(1_000, Number(options.linkHealthProbeIntervalMs ?? 20_000));
     this.linkHealthCache = null;
     this.linkHealthCheckedAt = 0;
+    this.activeMultipathPlan = { aliases: [], tunnels: [], routes: [] };
   }
 
   runtimeInfo() {
@@ -112,6 +170,65 @@ export class WireGuardManager {
 
   runWgQuick(args, timeout) {
     return execFileAsync(this.wgQuickPath, args, { timeout, env: this.commandEnvironment });
+  }
+
+  runIp(args, timeout = 10_000) {
+    return execFileAsync('ip', args, { timeout, env: this.commandEnvironment });
+  }
+
+  runSystem(command, args, timeout = 10_000) {
+    return execFileAsync(command, args, { timeout, env: this.commandEnvironment });
+  }
+
+  async ignoreMissing(operation) {
+    try { await operation; } catch (error) {
+      const detail = `${error.message || ''}\n${error.stderr || ''}`;
+      if (!/Cannot find device|No such (?:process|file or directory)|Cannot assign requested address|not found/i.test(detail)) throw error;
+    }
+  }
+
+  async cleanupMultipathPlan(plan = this.activeMultipathPlan) {
+    for (const route of plan?.routes ?? []) {
+      await this.ignoreMissing(this.runIp(['route', 'del', route.destination]));
+    }
+    for (const tunnel of plan?.tunnels ?? []) {
+      await this.ignoreMissing(this.runIp(['link', 'delete', 'dev', tunnel.name]));
+    }
+    for (const alias of plan?.aliases ?? []) {
+      await this.ignoreMissing(this.runIp(['address', 'del', `${alias}/32`, 'dev', 'lo']));
+    }
+  }
+
+  async applyMultipathPlan(config) {
+    const plan = buildMultipathPlan(config);
+    if (!this.applyNetwork) return plan;
+    await this.runSystem('sysctl', ['-w', 'net.ipv4.ip_forward=1']);
+    await this.runSystem('sysctl', ['-w', 'net.ipv4.conf.all.rp_filter=2']);
+    for (const alias of plan.aliases) {
+      await this.runIp(['address', 'replace', `${alias}/32`, 'dev', 'lo']);
+    }
+    for (const tunnel of plan.tunnels) {
+      await this.ignoreMissing(this.runIp(['link', 'delete', 'dev', tunnel.name]));
+      await this.runIp([
+        'tunnel', 'add', tunnel.name, 'mode', 'ipip',
+        'local', tunnel.local, 'remote', tunnel.remote,
+        'dev', tunnel.interfaceName, 'ttl', '64', 'nopmtudisc',
+      ]);
+      await this.runIp(['link', 'set', 'dev', tunnel.name, 'mtu', String(tunnel.mtu), 'up']);
+    }
+    for (const route of plan.routes) {
+      if (!route.members.length) continue;
+      const args = ['route', 'replace', route.destination, 'proto', 'static', 'scope', 'link'];
+      if (route.members.length === 1) {
+        args.push('dev', route.members[0].name);
+      } else {
+        for (const member of route.members) {
+          args.push('nexthop', 'dev', member.name, 'weight', String(member.weight));
+        }
+      }
+      await this.runIp(args);
+    }
+    return plan;
   }
 
   async assertDataCidrAvailable(dataConfig) {
@@ -145,6 +262,7 @@ export class WireGuardManager {
       throw new Error('配置缺少数据面接口或 Peer');
     }
     const rendered = renderWireGuardConfig(config.data, this.privateKey);
+    buildMultipathPlan(config);
     const interfaceName = config.data.interfaceName;
     const filename = this.stagedFile(version, interfaceName);
     this.preparedInterfaces.set(Number(version), interfaceName);
@@ -169,10 +287,15 @@ export class WireGuardManager {
     copyFileSync(staged, previous);
     chmodSync(previous, 0o600);
 
+    const previousConfig = this.activeConfig ? structuredClone(this.activeConfig) : null;
+    const previousPlan = this.activeMultipathPlan;
+    const nextConfig = this.preparedConfigs.get(Number(version));
+    const nextPlan = buildMultipathPlan(nextConfig);
     if (this.applyNetwork) {
       this.assertPrivateRuntime();
       const target = join(this.wireguardDir, `${interfaceName}.conf`);
       mkdirSync(this.wireguardDir, { recursive: true });
+      await this.cleanupMultipathPlan(previousPlan);
       if (existsSync(target)) {
         try {
           await this.runWgQuick(['down', target], 20_000);
@@ -184,20 +307,34 @@ export class WireGuardManager {
       chmodSync(target, 0o600);
       try {
         await this.runWgQuick(['up', target], 20_000);
+        this.activeMultipathPlan = await this.applyMultipathPlan(nextConfig);
       } catch (error) {
+        await this.cleanupMultipathPlan(nextPlan).catch(() => {});
         const backup = `${previous}.previous`;
         if (existsSync(backup)) {
+          await this.runWgQuick(['down', target], 20_000).catch(() => {});
           copyFileSync(backup, target);
           await this.runWgQuick(['up', target], 20_000).catch(() => {});
+          if (previousConfig) {
+            this.activeMultipathPlan = await this.applyMultipathPlan(previousConfig).catch(() => previousPlan);
+          }
         }
         throw error;
       }
+    } else {
+      this.activeMultipathPlan = nextPlan;
     }
     this.activeConfig = this.preparedConfigs.get(Number(version)) ?? null;
     this.activatedAt = Date.now();
     this.linkHealthCache = null;
     this.linkHealthCheckedAt = 0;
-    return { version, activeFile: previous, dryRun: !this.applyNetwork };
+    return {
+      version,
+      activeFile: previous,
+      dryRun: !this.applyNetwork,
+      multipathTunnels: this.activeMultipathPlan.tunnels.length,
+      multipathRoutes: this.activeMultipathPlan.routes.length,
+    };
   }
 
   async linkHealth({ staleAfterMs = 180_000, graceMs = 90_000, force = false } = {}) {

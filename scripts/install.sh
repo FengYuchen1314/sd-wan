@@ -33,12 +33,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "请使用 root 运行，或通过 sudo 执行安装命令。" >&2
+  exit 1
+fi
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "当前安装器要求使用 systemd 的 Linux 发行版。" >&2
+  exit 1
+fi
+if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+  echo "安装前需要 curl 和 tar。" >&2
+  exit 1
+fi
 if ! command -v node >/dev/null 2>&1; then
   echo "Node.js 22.5+ is required. Install it before running this command." >&2
   exit 1
 fi
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-if [[ "$NODE_MAJOR" -lt 22 ]]; then
+IFS=. read -r NODE_MAJOR NODE_MINOR NODE_PATCH <<<"$(node -p 'process.versions.node')"
+if (( NODE_MAJOR < 22 || (NODE_MAJOR == 22 && NODE_MINOR < 5) )); then
   echo "Node.js 22.5+ is required; found $(node --version)." >&2
   exit 1
 fi
@@ -100,6 +112,18 @@ choose_port() {
     else
       echo "$label $candidate 已被占用，请重新输入。" >&2
     fi
+    if [[ -z "$TTY_DEVICE" ]]; then exit 2; fi
+    candidate=""
+  done
+}
+
+choose_distinct_tcp_port() {
+  local label="$1" start="$2" supplied="$3" reserved="$4" selected candidate="$supplied"
+  if [[ "$start" == "$reserved" ]]; then start=$((start + 1)); fi
+  while true; do
+    selected="$(choose_port "$label" tcp "$start" "$candidate")"
+    if [[ "$selected" != "$reserved" ]]; then printf '%s\n' "$selected"; return; fi
+    echo "$label 不能与本机管理面板共用 TCP 端口 $reserved，请重新输入。" >&2
     if [[ -z "$TTY_DEVICE" ]]; then exit 2; fi
     candidate=""
   done
@@ -240,7 +264,7 @@ install_node() {
   fi
 
   PANEL_PORT="$(choose_port "本机管理面板 TCP 端口" tcp 19773 "$PANEL_PORT")"
-  if [[ "$bootstrap" -eq 0 ]]; then RELAY_PORT="$(choose_port "节点控制中继 TCP 端口" tcp 8790 "$RELAY_PORT")"; fi
+  if [[ "$bootstrap" -eq 0 ]]; then RELAY_PORT="$(choose_distinct_tcp_port "节点控制中继 TCP 端口" 8790 "$RELAY_PORT" "$PANEL_PORT")"; fi
   DATA_PORT="$(choose_port "WireGuard UDP 端口" udp 19801 "$DATA_PORT")"
   REACHABLE_HOST="${REACHABLE_HOST:-$(ask "其他节点可访问本节点的 IP 或域名" "$(detect_reachable_host)")}"
   endpoint_host="$(format_endpoint_host "$REACHABLE_HOST")"
@@ -249,11 +273,26 @@ install_node() {
 
   install_private_wireguard_runtime
   install_node_bundle
+  install -m 0755 /opt/pathweaver/current/scripts/uninstall.sh /usr/local/sbin/pathweaver-uninstall
   if ! id pathweaver >/dev/null 2>&1; then useradd --system --home /var/lib/pathweaver --shell /usr/sbin/nologin pathweaver; fi
   install -d -o pathweaver -g pathweaver -m 0750 /var/lib/pathweaver
   install -d -m 0700 /var/lib/pathweaver-agent
   install -d -m 0750 /etc/pathweaver
   install -d -o pathweaver -g pathweaver -m 0750 /etc/wireguard
+  if [[ ! -f /etc/pathweaver/sysctl.previous ]]; then
+    cat >/etc/pathweaver/sysctl.previous <<EOF
+IP_FORWARD_PREVIOUS=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
+RP_FILTER_ALL_PREVIOUS=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo 0)
+RP_FILTER_DEFAULT_PREVIOUS=$(sysctl -n net.ipv4.conf.default.rp_filter 2>/dev/null || echo 0)
+EOF
+    chmod 0600 /etc/pathweaver/sysctl.previous
+  fi
+  cat >/etc/sysctl.d/90-pathweaver.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
+EOF
+  sysctl --system >/dev/null
   node_env=/etc/pathweaver/node.env
 
   if [[ "$bootstrap" -eq 1 ]]; then

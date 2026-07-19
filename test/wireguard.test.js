@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { detectLocalNetworkConflicts, renderWireGuardConfig, WireGuardManager } from '../src/agent/wireguard.js';
+import { buildMultipathPlan, detectLocalNetworkConflicts, renderWireGuardConfig, WireGuardManager } from '../src/agent/wireguard.js';
 
 test('渲染精确 AllowedIPs 的 WireGuard 数据配置', () => {
   const rendered = renderWireGuardConfig({
@@ -88,4 +88,51 @@ test('WireGuard 链路健康探测按 20 秒复用结果', async () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('加权多路径策略编译为独立 IPIP 隧道和 Linux ECMP 路由', () => {
+  const plan = buildMultipathPlan({
+    data: { interfaceName: 'pw-data', mtu: 1380 },
+    multipathPolicies: [{
+      policyId: 'policy-a', targetNodeId: 'node-b', mode: 'weighted', routeCidrs: ['10.77.0.4/32', '10.77.0.8/32'],
+      paths: [
+        { pathId: 'path-1', available: true, effectiveWeight: 1000, localTunnelIp: '10.254.0.20', remoteTunnelIp: '10.254.0.21' },
+        { pathId: 'path-2', available: true, effectiveWeight: 250, localTunnelIp: '10.254.0.22', remoteTunnelIp: '10.254.0.23' },
+        { pathId: 'path-3', available: false, effectiveWeight: 0, localTunnelIp: '10.254.0.24', remoteTunnelIp: '10.254.0.25' },
+      ],
+    }],
+  });
+  assert.equal(plan.tunnels.length, 2);
+  assert.deepEqual(plan.tunnels.map((tunnel) => tunnel.weight), [256, 64]);
+  assert.equal(plan.routes.length, 2);
+  assert.ok(plan.routes.every((route) => route.members.length === 2));
+  assert.equal(new Set(plan.tunnels.map((tunnel) => tunnel.name)).size, 2);
+  assert.ok(plan.tunnels.every((tunnel) => tunnel.name.length <= 15 && tunnel.mtu === 1360));
+});
+
+test('Linux 激活器实际创建路径隧道并安装加权 nexthop', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pathweaver-ecmp-'));
+  try {
+    const manager = new WireGuardManager({ dataDir: root, privateKey: 'b'.repeat(44), applyNetwork: true });
+    const calls = [];
+    manager.runSystem = async (command, args) => { calls.push([command, ...args]); return { stdout: '', stderr: '' }; };
+    manager.runIp = async (args) => { calls.push(['ip', ...args]); return { stdout: '', stderr: '' }; };
+    const plan = await manager.applyMultipathPlan({
+      data: { interfaceName: 'pw-data', mtu: 1380 },
+      multipathPolicies: [{
+        policyId: 'policy-live', targetNodeId: 'node-z', mode: 'weighted', routeCidrs: ['10.77.0.9/32'],
+        paths: [
+          { pathId: 'one', available: true, effectiveWeight: 3, localTunnelIp: '10.254.0.30', remoteTunnelIp: '10.254.0.31' },
+          { pathId: 'two', available: true, effectiveWeight: 1, localTunnelIp: '10.254.0.32', remoteTunnelIp: '10.254.0.33' },
+        ],
+      }],
+    });
+    assert.equal(plan.tunnels.length, 2);
+    assert.ok(calls.some((call) => call.join(' ') === 'sysctl -w net.ipv4.ip_forward=1'));
+    assert.equal(calls.filter((call) => call[0] === 'ip' && call[1] === 'tunnel' && call[2] === 'add').length, 2);
+    const route = calls.find((call) => call[0] === 'ip' && call[1] === 'route' && call[2] === 'replace');
+    assert.ok(route);
+    assert.equal(route.filter((part) => part === 'nexthop').length, 2);
+    assert.deepEqual(route.filter((part, index) => route[index - 1] === 'weight'), ['3', '1']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

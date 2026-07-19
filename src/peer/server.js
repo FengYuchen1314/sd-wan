@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { readFileSync, statSync } from 'node:fs';
-import { extname, join, normalize, resolve } from 'node:path';
+import { extname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { verifyPanelPassword } from '../core/password.js';
 
@@ -66,7 +66,8 @@ async function readBody(req) {
 function serveStatic(pathname, res) {
   const requested = pathname === '/' ? 'index.html' : pathname.replace(/^\//, '');
   const filename = resolve(publicDir, normalize(requested));
-  if (!filename.startsWith(publicDir)) return false;
+  const relativeName = relative(publicDir, filename);
+  if (relativeName.startsWith('..') || isAbsolute(relativeName)) return false;
   try {
     if (!statSync(filename).isFile()) return false;
     const content = readFileSync(filename);
@@ -110,9 +111,9 @@ const server = createServer(async (req, res) => {
       requireAdmin(req);
       return send(res, 200, {
         synchronized: true,
-        syncMode: 'live-control-proxy',
+        syncMode: 'quorum-replicated-control-proxy',
         panelPort: port,
-        message: '本面板通过当前无环控制路径读取和修改全网配置',
+        message: '本面板通过无环控制路径访问当前协调节点；成功写入已同步到选民多数派',
       });
     }
     if (url.pathname.startsWith('/api/v1/')) return await proxyAdmin(req, res);

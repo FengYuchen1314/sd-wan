@@ -35,7 +35,7 @@ const titles = {
   nodes: ['NODE ADDRESSING', '节点与地址'],
   topology: ['ROUTE CONSTRAINTS', '数据拓扑'],
   'path-detail': ['PATH POLICY', '路径详情'],
-  join: ['EDGE ENROLLMENT', '接入新节点'],
+  join: ['PEER ENROLLMENT', '接入新节点'],
   rollouts: ['CONFIG ROLLOUTS', '配置发布'],
 };
 
@@ -138,7 +138,7 @@ function renderOverview() {
     <div class="metric-grid">
       <article class="metric"><label>节点总数</label><strong>${nodes.length}</strong><small>${nodes.filter((node) => node.status === 'online').length} 台在线</small></article>
       <article class="metric"><label>数据连接</label><strong>${state.topology?.links.length || 0}</strong><small>仅允许声明的 WireGuard 邻接</small></article>
-      <article class="metric"><label>业务网段</label><strong class="mono" style="font-size:22px">${escapeHtml(network?.dataCidr || '—')}</strong><small>地址可逐节点手动分配</small></article>
+      <article class="metric"><label>业务网段</label><strong class="mono metric-cidr">${escapeHtml(network?.dataCidr || '—')}</strong><small>地址可逐节点手动分配</small></article>
       <article class="metric"><label>全网可达</label><strong class="good">${validation?.fullyReachable ? 'YES' : 'NO'}</strong><small>${validation?.fullyReachable ? '拓扑校验已通过' : escapeHtml(validation?.error || '等待校验')}</small></article>
     </div>
     <div class="split">
@@ -150,7 +150,7 @@ function renderOverview() {
         <div class="card-head"><div><h2>面板同步</h2><p>任意节点面板读写同一份版本化配置</p></div><span class="status online">已同步</span></div>
         <div class="card-body section-stack">
           <div class="notice"><strong>全节点可管理</strong><span>${escapeHtml(state.panelStatus?.message || '面板配置沿现有无环控制路径实时同步；业务通路变化不会改变管理入口。')}</span></div>
-          <div class="metric" style="min-height:108px"><label>待推进配置</label><strong>${totals.preparing}</strong><small>${totals.pendingCommands} 条节点命令等待完成</small></div>
+          <div class="metric metric-compact"><label>待推进配置</label><strong>${totals.preparing}</strong><small>${totals.pendingCommands} 条节点命令等待完成</small></div>
         </div>
       </article>
     </div>`;
@@ -241,13 +241,13 @@ function ensureGraphLayout(nodes, links) {
   const centerY = graphWorld.height / 2 - graphWorld.nodeHeight / 2;
   const radius = Math.min(260, 95 + nodes.length * 22);
   const sortedNodes = [...nodes].sort((nodeA, nodeB) =>
-    Number(nodeB.isCenter) - Number(nodeA.isCenter) || nodeA.id.localeCompare(nodeB.id));
+    Number(nodeB.isCoordinator) - Number(nodeA.isCoordinator) || nodeA.id.localeCompare(nodeB.id));
   sortedNodes.forEach((node, index) => {
     const previous = state.graph.positions.get(node.id);
     const angle = (Math.PI * 2 * index) / Math.max(1, sortedNodes.length) - Math.PI / 2;
     positions.set(node.id, previous ?? {
-      x: node.isCenter ? centerX : centerX + Math.cos(angle) * radius,
-      y: node.isCenter ? centerY : centerY + Math.sin(angle) * radius,
+      x: node.isCoordinator ? centerX : centerX + Math.cos(angle) * radius,
+      y: node.isCoordinator ? centerY : centerY + Math.sin(angle) * radius,
     });
     velocities.set(node.id, { x: 0, y: 0 });
   });
@@ -357,9 +357,11 @@ function renderTopologyGraph() {
     const position = layout.positions.get(node.id);
     const selected = state.selectedNodeIds.includes(node.id);
     const parent = node.parentId ? nodeById.get(node.parentId) : null;
-    const offline = !node.isCenter && node.status !== 'online';
-    const routeMeta = parent ? `初始上游 · ${escapeHtml(parent.name)}` : '控制根节点';
-    return `<foreignObject data-node-container="${node.id}" x="${position.x}" y="${position.y}" width="${graphWorld.nodeWidth}" height="${graphWorld.nodeHeight}"><button class="graph-node svg-node ${node.isCenter ? 'center' : ''} ${offline ? 'offline' : ''}" data-node-id="${node.id}" aria-pressed="${selected}">
+    const offline = !node.isCoordinator && node.status !== 'online';
+    const routeMeta = node.isCoordinator
+      ? '当前协调节点'
+      : parent ? `初始上游 · ${escapeHtml(parent.name)}` : '无初始上游';
+    return `<foreignObject data-node-container="${node.id}" x="${position.x}" y="${position.y}" width="${graphWorld.nodeWidth}" height="${graphWorld.nodeHeight}"><button class="graph-node svg-node ${node.isCoordinator ? 'center' : ''} ${offline ? 'offline' : ''}" data-node-id="${node.id}" aria-pressed="${selected}">
       <span class="graph-node-head"><strong>${escapeHtml(node.name)}</strong><span class="graph-node-index">${String(index + 1).padStart(2, '0')}</span></span>
       <span class="graph-node-address">${escapeHtml(node.dataIp)}</span>
       <span class="graph-node-meta">${offline ? 'Agent 离线 · ' : ''}${routeMeta}</span>
@@ -390,7 +392,7 @@ function renderTopology() {
       <div class="graph-actions"><button class="button ghost" id="clear-node-selection" ${selected.length ? '' : 'disabled'}>取消选择</button><button class="button ghost" id="connect-selected" ${selected.length === 2 ? '' : 'disabled'}>建立连接</button><button class="button primary" id="detail-selected" ${selected.length === 2 ? '' : 'disabled'}>详细配置</button></div>
     </div>
     ${renderTopologyGraph()}
-    <div class="graph-legend"><span>已验证通路</span><span class="waiting">等待 Agent</span><span class="probing">双向探测 · 单向成功可用</span><span class="failed">两个方向均失败</span><span style="margin-left:auto">点击节点进行选择</span></div>
+    <div class="graph-legend"><span>已验证通路</span><span class="waiting">等待 Agent</span><span class="probing">双向探测 · 单向成功可用</span><span class="failed">两个方向均失败</span><span class="graph-legend-hint">点击节点进行选择</span></div>
   </article>`;
 }
 
@@ -459,7 +461,7 @@ function renderPathDetail() {
   return `<article class="card path-detail-card">
     <div class="card-head"><div><p class="eyebrow">END-TO-END PATHS</p><h2>${escapeHtml(details.source.name)} ↔ ${escapeHtml(details.target.name)}</h2><p>${details.paths.length} 条无环路径${details.truncated ? ' · 已按安全上限截断' : ''}；每条路径内部不会重复节点</p></div><a class="button ghost" href="#topology">返回主拓扑</a></div>
     <div class="path-endpoints"><span><strong>${escapeHtml(details.source.name)}</strong><small>${escapeHtml(details.source.dataIp)}</small></span><span>${details.paths.length} 条路径</span><span><strong>${escapeHtml(details.target.name)}</strong><small>${escapeHtml(details.target.dataIp)}</small></span></div>
-    <div class="path-mode-bar segmented"><label><input class="path-mode" type="radio" name="pathMode" value="failover" ${failoverMode ? 'checked' : ''}><span>默认线路与故障切换</span></label><label><input class="path-mode" type="radio" name="pathMode" value="weighted" ${failoverMode ? '' : 'checked'}><span>负载均衡</span></label></div>
+    <div class="path-mode-bar segmented"><label><input class="path-mode" type="radio" name="pathMode" value="failover" ${failoverMode ? 'checked' : ''}><span>默认线路与故障切换</span></label><label title="${details.paths.length < 2 ? '至少需要两条无环路径' : ''}"><input class="path-mode" type="radio" name="pathMode" value="weighted" ${failoverMode ? '' : 'checked'} ${details.paths.length < 2 ? 'disabled' : ''}><span>负载均衡</span></label></div>
     <div class="path-lanes">${lanes}</div>
     <div class="path-policy-editor">
       <div><strong>${failoverMode ? '主备线路' : '负载均衡'}</strong><small>${failoverMode ? '流量优先走所选默认线路；不可达时按成本依次尝试其他无环路径。' : '故障路径保留原权重但暂时不参与分流；每 20 秒复检，恢复后自动按原权重加入。'}</small></div>
@@ -657,7 +659,7 @@ function renderJoin() {
       <form class="card-body form-stack" id="join-form">
         <div class="segmented"><label><input type="radio" name="mode" value="active" ${mode === 'active' ? 'checked' : ''}><span>设备主动加入</span></label><label><input type="radio" name="mode" value="passive" ${mode === 'passive' ? 'checked' : ''}><span>已入网节点主动认领</span></label></div>
         <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '这里只配置接入节点入口'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。' : '所有设备安装同一套节点服务和完整面板；面板端口、登录密码、控制中继端口与 WireGuard 端口均在新设备本机交互设置。'}</span></div>
-        <label>${mode === 'passive' ? '执行认领的已入网节点' : '控制父节点'}<select name="parentId">${nodes.map((node) => {
+        <label>${mode === 'passive' ? '执行认领的已入网节点' : '接入节点'}<select name="parentId">${nodes.map((node) => {
           const connection = controlConnection(node);
           return `<option value="${node.id}" data-host="${escapeHtml(connection.host)}" data-port="${connection.port}" data-protocol="${connection.protocol}" ${node.id === selectedParent?.id ? 'selected' : ''}>${escapeHtml(node.name)} · ${escapeHtml(node.controlIp)}</option>`;
         }).join('')}</select></label>
@@ -665,9 +667,9 @@ function renderJoin() {
           <label>接入协议<select name="parentProtocol"><option value="http" ${parentConnection.protocol === 'http' ? 'selected' : ''}>HTTP</option><option value="https" ${parentConnection.protocol === 'https' ? 'selected' : ''}>HTTPS</option></select></label>
           <label>父节点控制端口<input name="parentPort" type="number" min="1" max="65535" required value="${parentConnection.port || ''}"></label>
           <label class="span-2">新设备能访问的父节点 IP 或域名<input name="parentHost" required value="${escapeHtml(parentConnection.host)}" placeholder="选择父节点后自动填充，也可覆盖"></label>
-        </div>` : '<div class="notice"><strong>固定 GitHub 安装源</strong><span><a href="https://github.com/FengYuchen1314/sd-wan" target="_blank" rel="noreferrer">FengYuchen1314/sd-wan</a> · main。仓库上传完成后，目标设备从 raw.githubusercontent.com 下载统一脚本和基础 Agent。</span></div>'}
+        </div>` : '<div class="notice"><strong>固定 GitHub 安装源</strong><span><a href="https://github.com/FengYuchen1314/sd-wan" target="_blank" rel="noreferrer">FengYuchen1314/sd-wan</a> · main。目标设备下载与其他设备完全相同的节点服务、面板和 Agent。</span></div>'}
         <label>令牌有效时间（分钟）<input name="ttlMinutes" type="number" min="5" max="1440" value="30"></label>
-        <button class="button primary" type="submit">${mode === 'passive' ? '生成 GitHub 基础安装命令' : '生成一次性命令'}</button>
+        <button class="button primary" type="submit">${mode === 'passive' ? '生成 GitHub 节点安装命令' : '生成一次性命令'}</button>
       </form>
     </article>
     <article class="card"><div class="card-head"><div><h2>可复制命令</h2><p>令牌仅显示一次，默认使用后立即失效</p></div>${result ? '<button class="button ghost small" id="copy-command">复制命令</button>' : ''}</div>
@@ -677,7 +679,7 @@ function renderJoin() {
         ${result?.mode === 'passive' ? `<form id="adopt-form" class="form-stack">
           <div class="form-grid"><label>待认领节点 IP 或域名<input name="targetHost" required placeholder="安装脚本最后显示的地址"></label><label>待认领节点控制端口<input name="targetPort" type="number" min="1" max="65535" required placeholder="由目标节点安装时选择"></label></div>
           <button class="button primary" type="submit">命令 ${escapeHtml(result.parent.name)} 主动连接</button>
-          <p class="muted" style="margin:0">认领指令会沿控制树送到 ${escapeHtml(result.parent.name)}，由它连接目标并成为控制父节点。</p>
+          <p class="muted flush">认领指令会沿控制树送到 ${escapeHtml(result.parent.name)}，由它连接目标并成为控制父节点。</p>
         </form>` : ''}
       </div>
     </article>
@@ -701,7 +703,7 @@ function controlConnection(node) {
 
 function renderRollouts() {
   return `<article class="card"><div class="card-head"><div><h2>配置版本</h2><p>IP 和拓扑变更均通过准备、激活两个阶段发布</p></div></div>
-    <div class="timeline">${state.configurations.length ? state.configurations.map((version) => `<div class="rollout"><span class="version">v${version.version}</span><span><strong>${escapeHtml(version.reason)}</strong><small style="display:block;color:var(--subtle);margin-top:4px">${escapeHtml(version.id.slice(0, 12))}</small></span><span class="status ${escapeHtml(version.status)}">${escapeHtml(version.status)}</span><span>${formatDate(version.activatedAt || version.createdAt)}</span></div>`).join('') : '<div class="empty">暂无配置版本</div>'}</div>
+    <div class="timeline">${state.configurations.length ? state.configurations.map((version) => `<div class="rollout"><span class="version">v${version.version}</span><span><strong>${escapeHtml(version.reason)}</strong><small class="rollout-id">${escapeHtml(version.id.slice(0, 12))}</small></span><span class="status ${escapeHtml(version.status)}">${escapeHtml(version.status)}</span><span>${formatDate(version.activatedAt || version.createdAt)}</span></div>`).join('') : '<div class="empty">暂无配置版本</div>'}</div>
   </article>`;
 }
 
@@ -844,8 +846,8 @@ function openNode(id) {
   form.elements.dataListenPort.value = reachablePort(node);
   form.elements.canRelay.checked = node.canRelay;
   const deleteButton = document.querySelector('#delete-node');
-  deleteButton.disabled = node.isCenter;
-  deleteButton.textContent = node.isCenter ? '协调节点需先迁移' : '删除节点';
+  deleteButton.disabled = node.isCoordinator;
+  deleteButton.textContent = node.isCoordinator ? '协调节点需先迁移' : '删除节点';
   form.querySelector('[data-form-error]').textContent = '';
   document.querySelector('#node-dialog').showModal();
 }

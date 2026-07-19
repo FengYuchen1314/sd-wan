@@ -12,7 +12,7 @@ function fixture() {
   return { database, service, network, center: service.listNodes(network.id)[0] };
 }
 
-test('创建网络时生成中心节点与首个 active 配置', () => {
+test('创建网络时生成初始协调节点与首个 active 配置', () => {
   const { database, service, network, center } = fixture();
   try {
     assert.equal(center.isCenter, true);
@@ -24,11 +24,25 @@ test('创建网络时生成中心节点与首个 active 配置', () => {
   } finally { database.close(); }
 });
 
+test('初始节点使用 IPv6 公网地址时生成合法的 WireGuard Endpoint', () => {
+  const database = new Database(':memory:');
+  const service = new ControlService(database, { publicUrl: 'https://[2001:db8::10]:19773' });
+  try {
+    const network = service.createNetwork({
+      name: 'IPv6 入口', dataCidr: '10.80.0.0/24', controlCidr: '10.250.0.0/24', listenPort: 19801, mtu: 1380,
+    });
+    const center = service.listNodes(network.id)[0];
+    assert.equal(center.controlEndpoint, 'https://[2001:db8::10]:19773');
+    assert.equal(center.dataEndpoint, '[2001:db8::10]:19801');
+  } finally { database.close(); }
+});
+
 test('一次性令牌注册节点并自动加入所选父节点', () => {
   const { database, service, network, center } = fixture();
   try {
     const enrollment = service.createJoinToken(network.id, { parentId: center.id, ttlMinutes: 30 });
     assert.match(enrollment.command, /--join-token/);
+    assert.doesNotMatch(enrollment.command, /--role|--panel-password|--admin-token/);
     const result = service.registerAgent({
       token: enrollment.token,
       name: '上海边缘-02',
@@ -410,7 +424,18 @@ test('保存两节点多路径权重并写入版本化节点配置', () => {
     const config = JSON.parse(row.config_json);
     assert.equal(config.multipathPolicies.length, 1);
     assert.equal(config.multipathPolicies[0].targetNodeId, nodeB.id);
+    assert.deepEqual(config.multipathPolicies[0].routeCidrs, [`${nodeB.dataIp}/32`]);
+    assert.ok(config.multipathPolicies[0].paths.every((path) => path.localTunnelIp && path.remoteTunnelIp));
     assert.deepEqual(config.multipathPolicies[0].paths.map((path) => path.share), [0.75, 0.25]);
+
+    const relayedPath = config.multipathPolicies[0].paths.find((path) => path.nodeIds.includes(center.id));
+    const centerRow = database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', saved.version.id, center.id,
+    );
+    const centerConfig = JSON.parse(centerRow.config_json);
+    const aliasesAtCenter = centerConfig.data.peers.flatMap((peer) => peer.allowedIps);
+    assert.ok(aliasesAtCenter.includes(`${relayedPath.remoteTunnelIp}/32`));
+    assert.ok(aliasesAtCenter.includes(`${relayedPath.localTunnelIp}/32`));
 
     const directPath = options.paths.find((path) => path.linkIds.includes(direct.id));
     assert.ok(directPath);

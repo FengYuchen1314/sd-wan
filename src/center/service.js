@@ -42,9 +42,10 @@ function endpointDetails(endpoint) {
   if (!endpoint) return null;
   try {
     const parsed = new URL(endpoint);
+    const hostname = parsed.hostname;
     return {
       protocol: parsed.protocol.replace(':', ''),
-      host: parsed.hostname.includes(':') ? `[${parsed.hostname}]` : parsed.hostname,
+      host: hostname.startsWith('[') ? hostname : hostname.includes(':') ? `[${hostname}]` : hostname,
       port: Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80)),
     };
   } catch {
@@ -159,11 +160,11 @@ function linkForPair(links, nodeAId, nodeBId) {
     (link.upstreamId === nodeBId && link.downstreamId === nodeAId));
 }
 
-function compileControlPlans(nodes, links) {
-  const center = nodes.find((node) => node.isCenter);
+function compileControlPlans(nodes, links, coordinatorId, voterIds = []) {
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const plans = {};
-  if (!center) return plans;
+  const targets = [...new Set([coordinatorId, ...voterIds].filter((id) => nodeById.has(id)))];
+  if (!targets.length) return plans;
 
   for (const source of nodes) {
     const forwarders = {};
@@ -177,33 +178,44 @@ function compileControlPlans(nodes, links) {
       if (url) forwarders[peerId] = url;
     }
 
-    if (source.id === center.id) {
-      plans[source.id] = { maxHops: 16, forwarders, routes: [], truncated: false };
-      continue;
+    const routesByTarget = {};
+    let truncated = false;
+    for (const targetId of targets) {
+      if (source.id === targetId) {
+        routesByTarget[targetId] = [];
+        continue;
+      }
+      const enumerated = enumerateSimplePaths({
+        nodes,
+        links,
+        sourceId: source.id,
+        targetId,
+        maxPaths: 64,
+        searchLimit: 4096,
+      });
+      truncated ||= enumerated.truncated;
+      routesByTarget[targetId] = enumerated.paths
+        .filter((path) => path.linkIds.length <= 16)
+        .map((path) => {
+          const hops = path.nodeIds.slice(1).map((nodeId, index) => {
+            const previousNodeId = path.nodeIds[index];
+            const link = linkForPair(links, previousNodeId, nodeId);
+            const node = nodeById.get(nodeId);
+            const url = link && node ? controlHopUrl(node, link, nodeId) : null;
+            return url ? { nodeId, url } : null;
+          });
+          if (hops.some((hop) => !hop)) return null;
+          return { id: path.id, nodeIds: path.nodeIds, hops };
+        })
+        .filter(Boolean);
     }
-    const enumerated = enumerateSimplePaths({
-      nodes,
-      links,
-      sourceId: source.id,
-      targetId: center.id,
-      maxPaths: 64,
-      searchLimit: 4096,
-    });
-    const routes = enumerated.paths
-      .filter((path) => path.linkIds.length <= 16)
-      .map((path) => {
-        const hops = path.nodeIds.slice(1).map((nodeId, index) => {
-          const previousNodeId = path.nodeIds[index];
-          const link = linkForPair(links, previousNodeId, nodeId);
-          const node = nodeById.get(nodeId);
-          const url = link && node ? controlHopUrl(node, link, nodeId) : null;
-          return url ? { nodeId, url } : null;
-        });
-        if (hops.some((hop) => !hop)) return null;
-        return { id: path.id, nodeIds: path.nodeIds, hops };
-      })
-      .filter(Boolean);
-    plans[source.id] = { maxHops: 16, forwarders, routes, truncated: enumerated.truncated };
+    plans[source.id] = {
+      maxHops: 16,
+      forwarders,
+      routes: routesByTarget[coordinatorId] ?? [],
+      routesByTarget,
+      truncated,
+    };
   }
   return plans;
 }
@@ -245,12 +257,50 @@ function applyPreferredPath(compiled, state, pathNodeIds) {
   }
 }
 
+function createMultipathAliasAllocator(network, nodes) {
+  const range = parseCIDR(network.controlCidr);
+  const used = new Set(nodes.map((node) => node.controlIp));
+  const capacity = range.broadcast - range.network - 1;
+  let cursor = 1;
+  return () => {
+    while (cursor <= capacity) {
+      const candidate = usableHost(range, cursor);
+      cursor += 1;
+      if (used.has(candidate)) continue;
+      used.add(candidate);
+      return candidate;
+    }
+    throw new Error(`控制网段 ${network.controlCidr} 没有足够地址承载多路径隧道，请扩大控制网段`);
+  };
+}
+
+function addPeerAllowedIp(config, peerNodeId, cidr) {
+  const peer = config?.data?.peers?.find((item) => item.nodeId === peerNodeId);
+  if (!peer) throw new Error(`多路径隧道缺少到相邻节点 ${peerNodeId} 的 WireGuard Peer`);
+  if (!peer.allowedIps.includes(cidr)) peer.allowedIps.push(cidr);
+  peer.allowedIps.sort();
+}
+
+function routeCidrsThrough(compiled, nodeById, sourceId, waypointId) {
+  const destinations = [];
+  for (const [key, nodeIds] of Object.entries(compiled.paths)) {
+    const separator = key.indexOf(':');
+    if (separator < 0 || key.slice(0, separator) !== sourceId) continue;
+    const targetId = key.slice(separator + 1);
+    if (nodeIds.indexOf(waypointId) <= 0) continue;
+    const target = nodeById.get(targetId);
+    if (target) destinations.push(`${target.dataIp}/32`);
+  }
+  return [...new Set(destinations)].sort();
+}
+
 export class ControlService {
   constructor(database, options = {}) {
     this.db = database;
     this.publicUrl = String(options.publicUrl ?? 'http://127.0.0.1:19773').replace(/\/$/, '');
     this.defaultDataPort = normalizePort(options.defaultDataPort, '默认 WireGuard 端口', DEFAULT_DATA_PORT);
     this.manageLocalCenters = Boolean(options.manageLocalCenters);
+    this.maintainLocalCenters = options.maintainLocalCenters !== false;
     const offlineAfterMs = Number(options.nodeOfflineAfterMs ?? 20_000);
     this.nodeOfflineAfterMs = Number.isFinite(offlineAfterMs) && offlineAfterMs > 0 ? offlineAfterMs : 20_000;
   }
@@ -326,16 +376,20 @@ export class ControlService {
   }
 
   audit(action, resourceType, resourceId, detail = {}, actor = 'admin') {
-    this.db.run(
+    const result = this.db.run(
       'INSERT INTO audit_log(actor, action, resource_type, resource_id, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?)',
       actor, action, resourceType, resourceId ?? null, json(detail), now(),
+    );
+    this.db.run(
+      'UPDATE cluster_state SET revision = MAX(revision, ?), updated_at = ?',
+      Number(result.lastInsertRowid || 0), now(),
     );
   }
 
   ensureDefaultNetwork() {
     const existing = this.db.get('SELECT id FROM networks ORDER BY created_at LIMIT 1');
     if (existing) {
-      this.ensureCenterKeys();
+      if (this.maintainLocalCenters) this.ensureCenterKeys();
       return existing.id;
     }
     return this.createNetwork({
@@ -406,7 +460,7 @@ export class ControlService {
     const centerDataKeys = wireGuardKeyPair();
     let centerDataEndpoint = null;
     try {
-      centerDataEndpoint = `${new URL(this.publicUrl).hostname}:${listenPort}`;
+      centerDataEndpoint = `${endpointDetails(this.publicUrl)?.host}:${listenPort}`;
     } catch {}
     this.db.transaction(() => {
       this.db.run(
@@ -425,6 +479,11 @@ export class ControlService {
       this.db.run(
         'INSERT INTO local_node_keys(node_id, control_private_key, data_private_key, created_at) VALUES (?, ?, ?, ?)',
         centerId, centerControlKeys.privateKey, centerDataKeys.privateKey, timestamp,
+      );
+      this.db.run(
+        `INSERT INTO cluster_state(network_id, coordinator_node_id, term, revision, election_secret, voted_for, updated_at)
+         VALUES (?, ?, 1, 0, ?, NULL, ?)`,
+        id, centerId, randomBytes(32).toString('base64url'), timestamp,
       );
       this.createVersionInTransaction(id, '创建节点组');
       this.audit('network.create', 'network', id, { name, dataCidr: data.cidr, controlCidr: control.cidr });
@@ -577,13 +636,16 @@ export class ControlService {
   }
 
   listNodes(networkId) {
-    return this.db.all('SELECT * FROM nodes WHERE network_id = ? ORDER BY is_center DESC, created_at', networkId).map(nodeFromRow);
+    const coordinatorId = this.db.get('SELECT coordinator_node_id FROM cluster_state WHERE network_id = ?', networkId)?.coordinator_node_id;
+    return this.db.all('SELECT * FROM nodes WHERE network_id = ? ORDER BY is_center DESC, created_at', networkId)
+      .map((row) => ({ ...nodeFromRow(row), isCoordinator: row.id === coordinatorId }));
   }
 
   getNode(id) {
     const row = this.db.get('SELECT * FROM nodes WHERE id = ?', id);
     if (!row) throw new Error('节点不存在');
-    return nodeFromRow(row);
+    const coordinatorId = this.db.get('SELECT coordinator_node_id FROM cluster_state WHERE network_id = ?', row.network_id)?.coordinator_node_id;
+    return { ...nodeFromRow(row), isCoordinator: row.id === coordinatorId };
   }
 
   listLinks(networkId, activeOnly = false) {
@@ -884,7 +946,7 @@ export class ControlService {
 
   inspectNodeDeletion(nodeId) {
     const node = this.getNode(nodeId);
-    if (node.isCenter) {
+    if (node.isCoordinator) {
       return { canDelete: false, node, reason: '当前配置协调节点不能直接删除；请先完成协调权迁移。' };
     }
     const network = this.getNetwork(node.networkId);
@@ -936,7 +998,8 @@ export class ControlService {
     const impact = this.inspectNodeDeletion(nodeId);
     if (!impact.canDelete) throw new Error(impact.reason);
     const node = impact.node;
-    const center = this.listNodes(node.networkId).find((item) => item.isCenter);
+    const center = this.listNodes(node.networkId).find((item) => item.isCoordinator) ||
+      this.listNodes(node.networkId).find((item) => item.isCenter);
     let versionId;
     this.db.transaction(() => {
       if (center) this.db.run('UPDATE nodes SET parent_id = ? WHERE parent_id = ?', center.id, nodeId);
@@ -1149,16 +1212,110 @@ export class ControlService {
     ).map((row) => ({ node: nodeFromRow(row), dataPrivateKey: row.data_private_key }));
   }
 
+  getClusterState(networkId) {
+    const row = this.db.get('SELECT * FROM cluster_state WHERE network_id = ?', networkId);
+    if (!row) throw new Error('节点组缺少协调状态');
+    return {
+      networkId: row.network_id,
+      coordinatorNodeId: row.coordinator_node_id,
+      term: Number(row.term),
+      revision: Number(row.revision),
+      electionSecret: row.election_secret,
+      votedFor: row.voted_for,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  clusterVoterIds(networkId) {
+    return this.db.all(
+      `SELECT n.id FROM nodes n
+       LEFT JOIN managed_node_proxies m ON m.node_id = n.id
+       WHERE n.network_id = ? AND n.can_relay = 1 AND m.node_id IS NULL
+       ORDER BY n.created_at, n.id`,
+      networkId,
+    ).map((row) => row.id);
+  }
+
+  getClusterRuntime(networkId, sourceNodeId = null) {
+    const state = this.loadState(networkId);
+    const cluster = this.getClusterState(networkId);
+    const voterIds = this.clusterVoterIds(networkId);
+    const plans = compileControlPlans(state.nodes, state.links, cluster.coordinatorNodeId, voterIds);
+    return {
+      cluster,
+      voterIds,
+      voters: voterIds.map((id) => state.nodes.find((node) => node.id === id)).filter(Boolean),
+      control: plans[sourceNodeId || cluster.coordinatorNodeId] ?? { maxHops: 16, forwarders: {}, routesByTarget: {} },
+    };
+  }
+
+  promoteCoordinator(nodeId, term) {
+    const node = this.getNode(nodeId);
+    const nextTerm = Number(term);
+    if (!Number.isInteger(nextTerm) || nextTerm < 1) throw new Error('协调任期无效');
+    let versionId = null;
+    this.db.transaction(() => {
+      const current = this.getClusterState(node.networkId);
+      if (nextTerm === current.term && current.coordinatorNodeId === nodeId) return;
+      if (nextTerm < current.term || (nextTerm === current.term && current.coordinatorNodeId !== nodeId)) {
+        throw new Error('拒绝以过期任期接管配置协调权');
+      }
+      this.db.run(
+        `UPDATE cluster_state SET coordinator_node_id = ?, term = ?, voted_for = ?, updated_at = ?
+         WHERE network_id = ?`,
+        nodeId, nextTerm, nodeId, now(), node.networkId,
+      );
+      versionId = this.createVersionInTransaction(node.networkId, `协调节点自动迁移到 ${node.name}`);
+      this.audit('coordinator.promote', 'network', node.networkId, { nodeId, term: nextTerm, versionId }, `node:${nodeId}`);
+    });
+    return { cluster: this.getClusterState(node.networkId), versionId };
+  }
+
+  observeCoordinator(networkId, { coordinatorNodeId, term, revision = 0 }) {
+    const current = this.getClusterState(networkId);
+    const nextTerm = Number(term || 0);
+    if (nextTerm < current.term) return current;
+    if (nextTerm === current.term && current.coordinatorNodeId !== coordinatorNodeId) return current;
+    this.db.run(
+      `UPDATE cluster_state SET coordinator_node_id = ?, term = ?, revision = MAX(revision, ?),
+       voted_for = NULL, updated_at = ? WHERE network_id = ?`,
+      coordinatorNodeId, nextTerm, Number(revision || 0), now(), networkId,
+    );
+    return this.getClusterState(networkId);
+  }
+
   createVersionInTransaction(networkId, reason, precompiled = null) {
     const state = this.loadState(networkId);
     const compiled = precompiled ?? validateAndCompileTopology(state);
     const pathPolicies = this.listPathPolicies(networkId);
-    const controlPlans = compileControlPlans(state.nodes, state.links);
+    const nodeById = new Map(state.nodes.map((node) => [node.id, node]));
+    const nextAlias = createMultipathAliasAllocator(state.network, state.nodes);
+    const aliasAssignments = new Map();
+    for (const policy of pathPolicies.filter((item) => item.mode === 'weighted')) {
+      for (const path of policy.paths) {
+        aliasAssignments.set(`${policy.id}:${path.pathId}`, {
+          source: nextAlias(),
+          target: nextAlias(),
+        });
+      }
+    }
+    const cluster = this.getClusterState(networkId);
+    const voterIds = this.clusterVoterIds(networkId);
+    const controlPlans = compileControlPlans(state.nodes, state.links, cluster.coordinatorNodeId, voterIds);
     for (const [nodeId, config] of Object.entries(compiled.configs)) {
-      config.control = controlPlans[nodeId] ?? { maxHops: 16, forwarders: {}, routes: [], truncated: false };
+      config.control = controlPlans[nodeId] ?? { maxHops: 16, forwarders: {}, routes: [], routesByTarget: {}, truncated: false };
+      config.control.cluster = {
+        networkId,
+        coordinatorNodeId: cluster.coordinatorNodeId,
+        term: cluster.term,
+        revision: cluster.revision,
+        electionSecret: cluster.electionSecret,
+        voterIds,
+      };
     }
     for (const config of Object.values(compiled.configs)) config.multipathPolicies = [];
     const failedLinkIds = this.failedLinkIds(networkId);
+    const claimedWeightedRoutes = new Map();
     for (const policy of pathPolicies) {
       const availablePathIds = new Set(policy.paths.filter((path) =>
         !(path.linkIds ?? []).some((linkId) => failedLinkIds.has(linkId))).map((path) => path.pathId));
@@ -1166,12 +1323,35 @@ export class ControlService {
         ? policy.paths.filter((path) => availablePathIds.has(path.pathId))
           .reduce((total, path) => total + Number(path.weight), 0)
         : 0;
+      if (policy.mode === 'weighted') {
+        for (const path of policy.paths) {
+          const aliases = aliasAssignments.get(`${policy.id}:${path.pathId}`);
+          const forwardNodes = path.nodeIds;
+          for (let index = 0; index < forwardNodes.length - 1; index += 1) {
+            addPeerAllowedIp(compiled.configs[forwardNodes[index]], forwardNodes[index + 1], `${aliases.target}/32`);
+          }
+          for (let index = forwardNodes.length - 1; index > 0; index -= 1) {
+            addPeerAllowedIp(compiled.configs[forwardNodes[index]], forwardNodes[index - 1], `${aliases.source}/32`);
+          }
+        }
+      }
       for (const [sourceId, targetId, reverse] of [
         [policy.sourceId, policy.targetId, false],
         [policy.targetId, policy.sourceId, true],
       ]) {
         const config = compiled.configs[sourceId];
         if (!config) continue;
+        const routeCidrs = policy.mode === 'weighted'
+          ? routeCidrsThrough(compiled, nodeById, sourceId, targetId)
+          : [];
+        for (const destination of routeCidrs) {
+          const key = `${sourceId}:${destination}`;
+          const owner = claimedWeightedRoutes.get(key);
+          if (owner && owner !== policy.id) {
+            throw new Error(`加权策略冲突：节点 ${nodeById.get(sourceId)?.name || sourceId} 的目的地址 ${destination} 同时被多个策略接管`);
+          }
+          claimedWeightedRoutes.set(key, policy.id);
+        }
         config.multipathPolicies.push({
           policyId: policy.id,
           targetNodeId: targetId,
@@ -1179,11 +1359,13 @@ export class ControlService {
           switchOnFailure: true,
           selection: policy.mode === 'weighted' ? 'weighted-random' : 'ordered-failover',
           healthProbeIntervalSeconds: 20,
+          routeCidrs,
           activePathIds: policy.paths.filter((path) => availablePathIds.has(path.pathId)).map((path) => path.pathId),
           paths: policy.paths.map((path, index) => {
             const nodeIds = reverse ? [...path.nodeIds].reverse() : [...path.nodeIds];
             const linkIds = reverse ? [...path.linkIds].reverse() : [...path.linkIds];
             const available = availablePathIds.has(path.pathId);
+            const aliases = aliasAssignments.get(`${policy.id}:${path.pathId}`);
             return {
               pathId: path.pathId,
               weight: Number(path.weight),
@@ -1197,6 +1379,8 @@ export class ControlService {
                 ? Number((Number(path.weight) / totalWeight).toFixed(4))
                 : policy.mode === 'weighted' ? 0 : null,
               nextHopId: nodeIds[1],
+              localTunnelIp: reverse ? aliases?.target : aliases?.source,
+              remoteTunnelIp: reverse ? aliases?.source : aliases?.target,
               nodeIds,
               linkIds,
             };
@@ -1363,7 +1547,20 @@ export class ControlService {
         this.audit('agent.data-port', 'node', nodeId, { before: node.dataListenPort, after: dataListenPort, versionId }, `node:${nodeId}`);
       }
     });
-    return { acknowledgedAt: timestamp, controlListenPort, dataListenPort, versionId };
+    const cluster = this.getClusterState(node.networkId);
+    return {
+      acknowledgedAt: timestamp,
+      controlListenPort,
+      dataListenPort,
+      versionId,
+      cluster: {
+        networkId: cluster.networkId,
+        coordinatorNodeId: cluster.coordinatorNodeId,
+        term: cluster.term,
+        revision: cluster.revision,
+        voterIds: this.clusterVoterIds(node.networkId),
+      },
+    };
   }
 
   getDesiredConfig(nodeId, currentVersion = 0) {

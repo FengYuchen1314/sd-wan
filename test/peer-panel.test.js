@@ -75,7 +75,7 @@ test('每个节点的本机面板校验安装密码并通过 Agent 实时访问�
     const status = await fetch(`${panelUrl}/api/v1/panel-status`, {
       headers: { Authorization: 'Bearer node-panel-password' },
     });
-    assert.equal((await status.json()).syncMode, 'live-control-proxy');
+    assert.equal((await status.json()).syncMode, 'quorum-replicated-control-proxy');
   } finally {
     const exitPromise = child.exitCode === null ? once(child, 'exit') : Promise.resolve();
     child.kill();
