@@ -7,7 +7,6 @@ const state = {
   networkId: localStorage.getItem('pathweaver-network') || '',
   topology: null,
   configurations: [],
-  updateRollouts: [],
   view: (location.hash.slice(1).split('?')[0] || 'overview'),
   topologyDraft: [],
   selectedNodeIds: [],
@@ -51,6 +50,97 @@ function escapeHtml(value) {
 function formatDate(value) {
   if (!value) return '—';
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(value));
+}
+
+const LATENCY_STALE_MS = 30 * 60 * 1000;
+
+function formatLatency(value) {
+  if (value == null || !Number.isFinite(Number(value))) return '—';
+  const ms = Number(value);
+  return ms < 10 ? `${ms.toFixed(1)} ms` : `${Math.round(ms)} ms`;
+}
+
+function latencyQuality(ms) {
+  if (ms == null || !Number.isFinite(Number(ms))) return 'unknown';
+  if (ms <= 30) return 'excellent';
+  if (ms <= 80) return 'good';
+  if (ms <= 150) return 'fair';
+  return 'poor';
+}
+
+function isLatencyStale(measuredAt) {
+  if (!measuredAt) return true;
+  return Date.now() - new Date(measuredAt).getTime() > LATENCY_STALE_MS;
+}
+
+function latencyAgeLabel(measuredAt) {
+  if (!measuredAt) return '尚未探测';
+  const minutes = Math.floor((Date.now() - new Date(measuredAt).getTime()) / 60_000);
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return formatDate(measuredAt);
+}
+
+function latencyProbeLabel(benchmark) {
+  if (!benchmark) return null;
+  if (benchmark.status === 'preparing') return '准备探测';
+  if (benchmark.status === 'testing') return '探测中';
+  if (benchmark.status === 'failed') return '探测失败';
+  return null;
+}
+
+function latencyDisplay(benchmark) {
+  if (!benchmark || benchmark.status !== 'completed') return null;
+  const avg = Number(benchmark.latencyMs);
+  const min = Number(benchmark.latencyMinMs ?? avg);
+  const p95 = Number(benchmark.latencyP95Ms ?? avg);
+  if (!Number.isFinite(avg)) return null;
+  if (Math.abs(p95 - min) < 0.5) return formatLatency(avg);
+  const minText = min < 10 ? min.toFixed(1) : String(Math.round(min));
+  const p95Text = p95 < 10 ? p95.toFixed(1) : String(Math.round(p95));
+  return `${formatLatency(avg)} (${minText}–${p95Text} ms)`;
+}
+
+function pathLatencyStats(path, linkById) {
+  const linkIds = path.linkIds || [];
+  const segments = linkIds.map((linkId) => linkById.get(linkId)?.benchmark).filter((benchmark) => benchmark?.status === 'completed');
+  if (!segments.length || segments.length !== linkIds.length) return null;
+  const sum = (key) => Number(segments.reduce((total, benchmark) => total + Number(benchmark[key] ?? benchmark.latencyMs), 0).toFixed(2));
+  return {
+    typical: sum('latencyMs'),
+    best: sum('latencyMinMs'),
+    upper: sum('latencyP95Ms'),
+    measuredAt: segments.map((benchmark) => benchmark.measuredAt).filter(Boolean).sort().at(-1) || null,
+    segments,
+  };
+}
+
+function pathLatencySummary(stats) {
+  if (!stats) return null;
+  if (Math.abs(stats.upper - stats.best) < 0.5) return formatLatency(stats.typical);
+  const bestText = stats.best < 10 ? stats.best.toFixed(1) : String(Math.round(stats.best));
+  const upperText = stats.upper < 10 ? stats.upper.toFixed(1) : String(Math.round(stats.upper));
+  return `${formatLatency(stats.typical)} (${bestText}–${upperText} ms)`;
+}
+
+function summarizeLinkLatencies(links) {
+  const active = links.filter((link) => link.validationStatus === 'active');
+  const completed = active.filter((link) => link.benchmark?.status === 'completed');
+  const running = active.filter((link) => latencyProbeLabel(link.benchmark));
+  const failed = active.filter((link) => link.benchmark?.status === 'failed');
+  const stale = completed.filter((link) => isLatencyStale(link.benchmark.measuredAt));
+  const latencies = completed.map((link) => Number(link.benchmark.latencyMs)).filter(Number.isFinite);
+  return {
+    total: active.length,
+    completed: completed.length,
+    running: running.length,
+    failed: failed.length,
+    stale: stale.length,
+    untested: active.length - completed.length - running.length - failed.length,
+    average: latencies.length ? Number((latencies.reduce((sum, value) => sum + value, 0) / latencies.length).toFixed(1)) : null,
+  };
 }
 
 async function api(path, options = {}) {
@@ -105,16 +195,14 @@ async function load() {
   networkSelect.innerHTML = networks.map((network) => `<option value="${network.id}">${escapeHtml(network.name)}</option>`).join('');
   networkSelect.value = state.networkId;
   if (state.networkId) {
-    const [topology, configurations, updates] = await Promise.all([
+    const [topology, configurations] = await Promise.all([
       api(`/api/v1/networks/${state.networkId}/topology`),
       api(`/api/v1/networks/${state.networkId}/configurations`),
-      api(`/api/v1/networks/${state.networkId}/update-rollouts`),
     ]);
     state.topology = topology;
     state.topologyDraft = structuredClone(topology.links);
     state.selectedNodeIds = state.selectedNodeIds.filter((id) => topology.nodes.some((node) => node.id === id));
     state.configurations = configurations.configurations;
-    state.updateRollouts = updates.rollouts;
     if (state.view === 'path-detail') {
       const route = pathDetailRoute();
       if (route.sourceId && route.targetId) await loadPathDetail(route.sourceId, route.targetId, true);
@@ -152,11 +240,12 @@ function renderOverview() {
   const network = currentNetwork();
   const nodes = state.topology?.nodes || [];
   const validation = state.topology?.validation;
-  const update = state.updateRollouts[0];
+  const links = state.topology?.links || [];
+  const latencySummary = summarizeLinkLatencies(links);
   return `
     <div class="metric-grid">
       <article class="metric"><label>节点总数</label><strong>${nodes.length}</strong><small>${nodes.filter((node) => node.status === 'online').length} 台在线</small></article>
-      <article class="metric"><label>数据连接</label><strong>${state.topology?.links.length || 0}</strong><small>仅允许声明的 WireGuard 邻接</small></article>
+      <article class="metric"><label>数据连接</label><strong>${links.length}</strong><small>${latencySummary.completed} 条已探测延迟</small></article>
       <article class="metric"><label>业务网段</label><strong class="mono metric-cidr">${escapeHtml(network?.dataCidr || '—')}</strong><small>地址可逐节点手动分配</small></article>
       <article class="metric"><label>全网可达</label><strong class="good">${validation?.fullyReachable ? 'YES' : 'NO'}</strong><small>${validation?.fullyReachable ? '拓扑校验已通过' : escapeHtml(validation?.error || '等待校验')}</small></article>
     </div>
@@ -166,42 +255,39 @@ function renderOverview() {
         ${nodeTable(nodes.slice(0, 6), false)}
       </article>
       <article class="card">
-        <div class="card-head"><div><h2>软件更新</h2><p>自动寻找可访问 GitHub 的节点，再通过控制面分发同一制品</p></div><button class="button primary small" id="update-all" ${!state.panelStatus?.writable || ['probing', 'distributing'].includes(update?.status) ? 'disabled' : ''}>${['probing', 'distributing'].includes(update?.status) ? '更新进行中' : '一键更新全网'}</button></div>
+        <div class="card-head"><div><h2>链路延迟概览</h2><p>5 次往返采样，展示典型值与波动区间</p></div><a class="button ghost small" href="#topology">打开拓扑</a></div>
         <div class="card-body section-stack">
-          ${renderUpdateSummary(update)}
+          ${renderLatencyOverview(latencySummary, links)}
           <div class="metric metric-compact"><label>待推进配置</label><strong>${totals.preparing}</strong><small>${totals.pendingCommands} 条节点命令等待完成</small></div>
         </div>
       </article>
     </div>`;
 }
 
-function updateNodeStatusLabel(status) {
-  return ({
-    probing: '探测 GitHub',
-    'probe-failed': '探测失败',
-    'source-ready': '已取得制品',
-    queued: '等待领取',
-    installing: '领取制品中',
-    scheduled: '已暂存待应用',
-    'waiting-local': '等待最后更新本机',
-    completed: '已完成',
-    failed: '失败',
-    deferred: '已延期',
-    waiting: '等待中',
-  })[status] || status;
-}
-
-function renderUpdateSummary(update) {
-  if (!update) return '<div class="notice"><strong>尚未执行全网更新</strong><span>点击后，各在线节点并行探测 GitHub；首个成功节点上传一次制品，其他节点无需访问 GitHub。</span></div>';
-  const labels = {
-    probing: '正在探测 GitHub', distributing: '正在分发', completed: '全部完成',
-    partial: '部分完成', failed: '更新失败',
-  };
-  const completed = update.nodes.filter((node) => node.status === 'completed').length;
-  const pendingApply = update.nodes.filter((node) => ['scheduled', 'waiting-local'].includes(node.status)).length;
-  const failed = update.nodes.filter((node) => ['failed', 'probe-failed'].includes(node.status)).length;
-  const source = update.source ? `更新源：${escapeHtml(update.source.name)}` : '正在选择更新源';
-  return `<div class="notice ${['partial', 'failed'].includes(update.status) ? 'warning' : ''}"><strong>${labels[update.status] || escapeHtml(update.status)}</strong><span>${source} · 完成 ${completed}/${update.nodes.length}${pendingApply ? ` · 待应用 ${pendingApply}` : ''}${failed ? ` · 失败 ${failed}` : ''}${update.bundleSha256 ? ` · SHA256 ${escapeHtml(update.bundleSha256.slice(0, 12))}…` : ''}${update.error ? ` · ${escapeHtml(update.error)}` : ''}</span></div>`;
+function renderLatencyOverview(summary, links) {
+  if (!summary.total) {
+    return '<div class="notice"><strong>尚无已验证链路</strong><span>建立并验证节点连接后，可在数据拓扑页发起延迟探测。</span></div>';
+  }
+  const parts = [
+    `${summary.completed}/${summary.total} 已探测`,
+    summary.running ? `${summary.running} 进行中` : '',
+    summary.failed ? `${summary.failed} 失败` : '',
+    summary.stale ? `${summary.stale} 结果过期` : '',
+    summary.untested ? `${summary.untested} 未探测` : '',
+  ].filter(Boolean).join(' · ');
+  const average = summary.average == null ? '—' : formatLatency(summary.average);
+  const recent = links
+    .filter((link) => link.validationStatus === 'active' && link.benchmark?.status === 'completed')
+    .sort((linkA, linkB) => new Date(linkB.benchmark.measuredAt) - new Date(linkA.benchmark.measuredAt))
+    .slice(0, 4);
+  const rows = recent.length ? recent.map((link) => {
+    const upstream = state.topology.nodes.find((node) => node.id === link.upstreamId);
+    const downstream = state.topology.nodes.find((node) => node.id === link.downstreamId);
+    const label = `${upstream?.name || '—'} ↔ ${downstream?.name || '—'}`;
+    const stale = isLatencyStale(link.benchmark.measuredAt);
+    return `<div class="latency-overview-row ${stale ? 'stale' : ''}"><span>${escapeHtml(label)}</span><strong class="latency-${latencyQuality(link.benchmark.latencyMs)}">${escapeHtml(latencyDisplay(link.benchmark))}</strong><small>${escapeHtml(latencyAgeLabel(link.benchmark.measuredAt))}</small></div>`;
+  }).join('') : '<div class="muted">尚未完成任何相邻链路探测。</div>';
+  return `<div class="notice"><strong>相邻链路平均 ${average}</strong><span>${parts}。每条链路独立采样 5 次 RTT，界面优先展示典型延迟与最小–最大波动区间。</span></div><div class="latency-overview-list">${rows}</div>`;
 }
 
 function nodeTable(nodes, editable = true) {
@@ -409,12 +495,17 @@ function linkStatusText(link) {
   if (link.validationStatus === 'preparing') return `等待 Agent ${link.validationProgress?.prepared || 0}/2`;
   if (link.validationStatus === 'probing') return `连通性探测 ${link.validationProgress?.probed || 0}/${link.validationProgress?.requested || 1}`;
   if (link.validationStatus === 'failed') return link.validationError?.includes('超时') ? '验证超时' : '验证失败';
-  if (link.benchmark?.status === 'preparing') return '测速准备中';
-  if (link.benchmark?.status === 'testing') return '测速中';
-  if (link.benchmark?.status === 'failed') return '测速失败';
-  if (link.benchmark?.status === 'completed') return `${link.benchmark.latencyMs} ms · ${link.benchmark.bandwidthMbps} Mbps`;
+  const probe = latencyProbeLabel(link.benchmark);
+  if (probe) return probe;
+  if (link.benchmark?.status === 'completed') return latencyDisplay(link.benchmark);
   if (link.validationProgress?.successful === 1) return '单向可用';
   return '';
+}
+
+function linkLatencyClass(link) {
+  if (link.benchmark?.status !== 'completed') return '';
+  const stale = isLatencyStale(link.benchmark.measuredAt);
+  return `latency-${latencyQuality(link.benchmark.latencyMs)}${stale ? ' stale' : ''}`;
 }
 
 function renderTopologyGraph() {
@@ -428,7 +519,8 @@ function renderTopologyGraph() {
     const path = graphPath(from, to);
     const status = link.validationStatus || 'active';
     const label = linkStatusText(link);
-    return `<path class="graph-edge ${escapeHtml(status)}" data-link-id="${link.id}" data-from="${link.upstreamId}" data-to="${link.downstreamId}" d="${path.d}"></path>${label ? `<text class="graph-edge-label" data-link-label="${link.id}" data-from="${link.upstreamId}" data-to="${link.downstreamId}" x="${path.labelX}" y="${path.labelY}">${escapeHtml(label)}</text>` : ''}`;
+    const latencyClass = linkLatencyClass(link);
+    return `<path class="graph-edge ${escapeHtml(status)} ${latencyClass}" data-link-id="${link.id}" data-from="${link.upstreamId}" data-to="${link.downstreamId}" d="${path.d}"></path>${label ? `<text class="graph-edge-label ${latencyClass}" data-link-label="${link.id}" data-from="${link.upstreamId}" data-to="${link.downstreamId}" x="${path.labelX}" y="${path.labelY}">${escapeHtml(label)}</text>` : ''}`;
   }).join('');
   const nodeMarkup = nodes.map((node, index) => {
     const position = layout.positions.get(node.id);
@@ -448,30 +540,70 @@ function renderTopologyGraph() {
   return `<div class="graph-surface" id="topology-graph"><div class="graph-gesture-hint">Ctrl + 滚轮缩放 · 拖动画布平移 · 拖动节点调整位置</div><svg class="topology-svg" viewBox="0 0 ${graphWorld.width} ${graphWorld.height}" role="img" aria-label="可缩放、可拖动的节点数据连接拓扑"><g id="graph-world" transform="translate(${viewport.x} ${viewport.y}) scale(${viewport.scale})">${edges}${nodeMarkup}</g></svg></div>`;
 }
 
+function renderLatencyLinkTable(links, nodes) {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const activeLinks = links.filter((link) => link.validationStatus === 'active');
+  if (!activeLinks.length) {
+    return '<div class="empty compact"><strong>尚无已验证链路</strong>建立连接并完成验证后，可在此查看各段延迟。</div>';
+  }
+  const sorted = [...activeLinks].sort((linkA, linkB) => {
+    const latencyA = linkA.benchmark?.status === 'completed' ? Number(linkA.benchmark.latencyMs) : Infinity;
+    const latencyB = linkB.benchmark?.status === 'completed' ? Number(linkB.benchmark.latencyMs) : Infinity;
+    return latencyA - latencyB;
+  });
+  return `<div class="latency-link-table">
+    <div class="latency-link-row header"><span>链路</span><span>状态</span><span>典型延迟</span><span>更新时间</span></div>
+    ${sorted.map((link) => {
+      const upstream = nodeById.get(link.upstreamId);
+      const downstream = nodeById.get(link.downstreamId);
+      const probe = latencyProbeLabel(link.benchmark);
+      const status = probe
+        ? `<span class="latency-status running">${probe}</span>`
+        : link.benchmark?.status === 'failed'
+          ? `<span class="latency-status failed" title="${escapeHtml(link.benchmark.error || '')}">失败</span>`
+          : link.benchmark?.status === 'completed'
+            ? `<span class="latency-status done">已完成</span>`
+            : '<span class="latency-status idle">未探测</span>';
+      const latency = link.benchmark?.status === 'completed'
+        ? `<strong class="latency-${latencyQuality(link.benchmark.latencyMs)}">${escapeHtml(latencyDisplay(link.benchmark))}</strong>`
+        : '<span class="muted">—</span>';
+      const age = link.benchmark?.status === 'completed'
+        ? `<small class="${isLatencyStale(link.benchmark.measuredAt) ? 'stale-age' : ''}">${escapeHtml(latencyAgeLabel(link.benchmark.measuredAt))}</small>`
+        : '<span class="muted">—</span>';
+      return `<div class="latency-link-row ${link.benchmark?.status === 'completed' && isLatencyStale(link.benchmark.measuredAt) ? 'stale' : ''}"><span>${escapeHtml(upstream?.name || '—')} ↔ ${escapeHtml(downstream?.name || '—')}</span><span>${status}</span><span>${latency}</span><span>${age}</span></div>`;
+    }).join('')}
+  </div>`;
+}
+
 function renderTopology() {
   const valid = state.topology.validation?.fullyReachable;
   const selected = state.selectedNodeIds.map((id) => state.topology.nodes.find((node) => node.id === id)).filter(Boolean);
-  const waiting = state.topology.links.filter((link) => link.validationStatus === 'preparing').length;
-  const probing = state.topology.links.filter((link) => link.validationStatus === 'probing').length;
-  const benchmarking = state.topology.links.filter((link) => ['preparing', 'testing'].includes(link.benchmark?.status)).length;
+  const links = state.topology.links;
+  const latencySummary = summarizeLinkLatencies(links);
+  const waiting = links.filter((link) => link.validationStatus === 'preparing').length;
+  const probing = links.filter((link) => link.validationStatus === 'probing').length;
+  const latencyRunning = latencySummary.running;
   const validationText = [
     waiting ? `${waiting} 条等待 Agent` : '',
     probing ? `${probing} 条正在探测已填写方向（任一成功即可）` : '',
-    benchmarking ? `${benchmarking} 条正在测速` : '',
+    latencyRunning ? `${latencyRunning} 条延迟探测进行中` : '',
+    latencySummary.completed ? `${latencySummary.completed} 条已有延迟结果` : '',
   ].filter(Boolean).join(' · ') || '可建立直连或查看端到端路径';
   const selectionText = selected.length === 0
     ? '点击画布中的两个节点'
     : selected.length === 1
       ? `已选择 ${selected[0].name}，再选一个节点`
       : `${selected[0].name} ↔ ${selected[1].name}`;
+  const canProbe = links.some((link) => link.validationStatus === 'active') && !latencyRunning;
   return `<article class="card">
-    <div class="card-head"><div><h2>可视化拓扑编辑</h2><p>布局随连接关系自动收敛；拖动节点后会固定该节点的位置</p></div><span class="status ${valid ? 'active' : 'failed'}">${valid ? '全网可达' : '需要修复'}</span></div>
+    <div class="card-head"><div><h2>可视化拓扑编辑</h2><p>布局随连接关系自动收敛；每条链路独立进行 5 次 RTT 采样</p></div><span class="status ${valid ? 'active' : 'failed'}">${valid ? '全网可达' : '需要修复'}</span></div>
     <div class="graph-toolbar">
       <div class="graph-toolbar-main"><span class="selection-count">${selected.length}/2</span><span class="selection-copy"><strong>${escapeHtml(selectionText)}</strong><small>${validationText}</small></span></div>
-      <div class="graph-actions"><button class="button ghost" id="benchmark-adjacent" ${benchmarking || !state.topology.links.some((link) => link.validationStatus === 'active') ? 'disabled' : ''}>${benchmarking ? '测速进行中' : '一键测速相邻链路'}</button><button class="button ghost" id="clear-node-selection" ${selected.length ? '' : 'disabled'}>取消选择</button><button class="button ghost" id="connect-selected" ${selected.length === 2 ? '' : 'disabled'}>建立连接</button><button class="button primary" id="detail-selected" ${selected.length === 2 ? '' : 'disabled'}>详细配置</button></div>
+      <div class="graph-actions"><button class="button ghost" id="benchmark-adjacent" ${canProbe ? '' : 'disabled'}>${latencyRunning ? '探测进行中' : '探测全部相邻链路'}</button><button class="button ghost" id="clear-node-selection" ${selected.length ? '' : 'disabled'}>取消选择</button><button class="button ghost" id="connect-selected" ${selected.length === 2 ? '' : 'disabled'}>建立连接</button><button class="button primary" id="detail-selected" ${selected.length === 2 ? '' : 'disabled'}>详细配置</button></div>
     </div>
     ${renderTopologyGraph()}
-    <div class="graph-legend"><span>已验证通路</span><span class="waiting">等待 Agent</span><span class="probing">按填写方向探测 · 任一成功可用</span><span class="failed">所填方向均失败</span><span class="graph-legend-hint">点击节点进行选择</span></div>
+    <div class="graph-legend"><span>已验证通路</span><span class="waiting">等待 Agent</span><span class="probing">按填写方向探测 · 任一成功可用</span><span class="failed">所填方向均失败</span><span class="latency-excellent">≤ 30 ms</span><span class="latency-good">31–80 ms</span><span class="latency-fair">81–150 ms</span><span class="latency-poor">&gt; 150 ms</span><span class="graph-legend-hint">点击节点进行选择</span></div>
+    <div class="latency-panel"><div class="latency-panel-head"><div><strong>相邻链路延迟</strong><small>${latencySummary.completed}/${latencySummary.total || 0} 已探测${latencySummary.average == null ? '' : ` · 平均 ${formatLatency(latencySummary.average)}`}</small></div><small class="muted">典型值为 5 次采样均值，括号内为最小–最大波动</small></div>${renderLatencyLinkTable(links, state.topology.nodes)}</div>
   </article>`;
 }
 
@@ -504,14 +636,62 @@ function openPathDetail() {
   location.hash = `path-detail?source=${encodeURIComponent(sourceId)}&target=${encodeURIComponent(targetId)}`;
 }
 
+function renderPathChain(path, linkById) {
+  return path.nodes.map((node, nodeIndex) => {
+    const segment = nodeIndex === 0 ? '' : (() => {
+      const linkId = path.linkIds?.[nodeIndex - 1];
+      const benchmark = linkById.get(linkId)?.benchmark;
+      const latency = benchmark?.status === 'completed' ? latencyDisplay(benchmark) : latencyProbeLabel(benchmark);
+      const quality = benchmark?.status === 'completed' ? latencyQuality(benchmark.latencyMs) : 'unknown';
+      return `<span class="path-segment-wrap">${latency ? `<span class="path-segment-latency latency-${quality}">${escapeHtml(latency)}</span>` : ''}<span class="path-segment" aria-hidden="true"></span></span>`;
+    })();
+    return `${segment}<span class="path-chain-node ${node.status === 'online' ? '' : 'offline'}"><strong>${escapeHtml(node.name)}</strong><small>${escapeHtml(node.dataIp)}</small></span>`;
+  }).join('');
+}
+
+function renderPathLatencyBadge(path, linkById) {
+  const linkIds = path.linkIds || [];
+  const segmentBenchmarks = linkIds.map((linkId) => linkById.get(linkId)?.benchmark).filter(Boolean);
+  if (segmentBenchmarks.some((benchmark) => ['preparing', 'testing'].includes(benchmark.status))) {
+    return '<span class="path-latency running">各段探测中…</span>';
+  }
+  if (segmentBenchmarks.some((benchmark) => benchmark.status === 'failed') || path.benchmark?.status === 'failed') {
+    const error = segmentBenchmarks.find((benchmark) => benchmark.error)?.error || path.benchmark?.error || '';
+    return `<span class="path-latency failed" title="${escapeHtml(error)}">探测失败</span>`;
+  }
+  const stats = pathLatencyStats(path, linkById);
+  if (stats) {
+    const stale = isLatencyStale(stats.measuredAt);
+    return `<span class="path-latency success latency-${latencyQuality(stats.typical)}${stale ? ' stale' : ''}" title="各段典型延迟之和 · 括号内为全路径波动区间">${escapeHtml(pathLatencySummary(stats))}</span><small class="path-latency-age${stale ? ' stale-age' : ''}">${escapeHtml(latencyAgeLabel(stats.measuredAt))}</small>`;
+  }
+  return '<span class="path-latency idle">尚未探测</span>';
+}
+
+function renderPathComparison(paths, linkById) {
+  const ranked = paths
+    .map((path) => ({ path, stats: pathLatencyStats(path, linkById) }))
+    .filter((item) => item.stats)
+    .sort((itemA, itemB) => itemA.stats.typical - itemB.stats.typical);
+  if (ranked.length < 2) return '';
+  const maxUpper = Math.max(...ranked.map((item) => item.stats.upper));
+  return `<div class="path-comparison"><div class="path-comparison-head"><strong>通路延迟对比</strong><small>按典型总延迟排序 · 柱长对应波动上限</small></div>${ranked.map((item, index) => {
+    const width = maxUpper ? Math.max(8, Math.round((item.stats.upper / maxUpper) * 100)) : 0;
+    const innerWidth = maxUpper ? Math.max(6, Math.round((item.stats.typical / maxUpper) * 100)) : 0;
+    return `<div class="path-comparison-row"><span class="path-comparison-index">P${String(paths.indexOf(item.path) + 1).padStart(2, '0')}</span><div class="path-comparison-bar"><span class="path-comparison-range latency-${latencyQuality(item.stats.typical)}" style="width:${width}%"><span class="path-comparison-typical" style="width:${innerWidth}%"></span></span></div><strong>${escapeHtml(pathLatencySummary(item.stats))}</strong>${index === 0 ? '<small>最快</small>' : ''}</div>`;
+  }).join('')}</div>`;
+}
+
 function renderPathDetail() {
   const details = state.pathDetail;
   if (!details) return '<div class="loading-card"><span class="spinner"></span>正在计算无环路径…</div>';
+  const linkById = new Map((state.topology?.links || []).map((link) => [link.id, link]));
   const failoverMode = state.pathMode !== 'weighted';
   const selectedIds = new Set(state.selectedPathIds);
   const selectedPaths = details.paths.filter((path) => selectedIds.has(path.id));
   const activeSelectedPaths = selectedPaths.filter((path) => path.available !== false);
   const totalWeight = activeSelectedPaths.reduce((total, path) => total + Number(state.pathWeights[path.id] || 1), 0);
+  const latencyRunning = details.paths.some((path) => path.benchmark?.status === 'testing'
+    || (path.linkIds || []).some((linkId) => latencyProbeLabel(linkById.get(linkId)?.benchmark)));
   const lanes = details.paths.length ? details.paths.map((path, index) => {
     const selected = failoverMode ? state.defaultPathId === path.id : selectedIds.has(path.id);
     const unavailable = path.available === false;
@@ -519,34 +699,29 @@ function renderPathDetail() {
     const share = !failoverMode && selected && !unavailable && totalWeight
       ? Math.round((weight / totalWeight) * 1000) / 10
       : 0;
-    const chain = path.nodes.map((node, nodeIndex) => `${nodeIndex ? '<span class="path-segment" aria-hidden="true"></span>' : ''}<span class="path-chain-node ${node.status === 'online' ? '' : 'offline'}"><strong>${escapeHtml(node.name)}</strong><small>${escapeHtml(node.dataIp)}</small></span>`).join('');
+    const chain = renderPathChain(path, linkById);
     const status = unavailable
       ? '<strong>故障暂时剔除</strong><small>每 20 秒复检 · 保留原权重</small>'
       : !failoverMode && selected
         ? `<strong>运行中 · ${share}%</strong><small>链路恢复后会自动加入</small>`
         : `<strong>${selected && failoverMode ? '默认线路' : `${path.hops} 跳`}</strong><small>${failoverMode && !selected ? `故障候选 · 成本 ${path.totalCost}` : `成本 ${path.totalCost}`}</small>`;
-    const benchmark = path.benchmark?.status === 'completed'
-      ? `<span class="path-benchmark success">${path.benchmark.latencyMs} ms · ${path.benchmark.bandwidthMbps} Mbps</span>`
-      : path.benchmark?.status === 'testing'
-        ? '<span class="path-benchmark running">正在测试各段链路…</span>'
-        : path.benchmark?.status === 'failed'
-          ? `<span class="path-benchmark failed" title="${escapeHtml(path.benchmark.error || '')}">测速失败</span>`
-          : '<span class="path-benchmark">尚未测速</span>';
+    const latency = renderPathLatencyBadge(path, linkById);
     return `<label class="path-lane ${selected ? 'selected' : ''} ${unavailable ? 'unavailable' : ''}">
       <input class="path-option" type="${failoverMode ? 'radio' : 'checkbox'}" ${failoverMode ? 'name="defaultPath"' : ''} value="${path.id}" ${selected ? 'checked' : ''}>
       <span class="path-lane-index">P${String(index + 1).padStart(2, '0')}</span>
       <span class="path-chain">${chain}</span>
-      <span class="path-lane-meta">${status}${benchmark}</span>
+      <span class="path-lane-meta">${status}<span class="path-latency-block">${latency}</span></span>
     </label>`;
   }).join('') : '<div class="empty"><strong>没有可用路径</strong>当前两个节点之间不存在由已验证连接组成的无环路径。</div>';
-  const weights = selectedPaths.map((path, index) => {
+  const weights = selectedPaths.map((path) => {
     const weight = Number(state.pathWeights[path.id] || 1);
     const share = path.available !== false && totalWeight ? Math.round((weight / totalWeight) * 1000) / 10 : 0;
     return `<label class="path-weight-row ${path.available === false ? 'unavailable' : ''}"><span>P${String(details.paths.indexOf(path) + 1).padStart(2, '0')}</span><input class="path-weight" data-path-id="${path.id}" type="number" min="1" max="1000" value="${weight}"><strong data-weight-share="${path.id}">${path.available === false ? '暂时剔除' : `${share}%`}</strong></label>`;
   }).join('');
   return `<article class="card path-detail-card">
-    <div class="card-head"><div><p class="eyebrow">END-TO-END PATHS</p><h2>${escapeHtml(details.source.name)} ↔ ${escapeHtml(details.target.name)}</h2><p>${details.paths.length} 条无环路径${details.truncated ? ' · 已按安全上限截断' : ''}；延迟为各段之和，带宽取路径瓶颈</p></div><div class="graph-actions"><button class="button primary small" id="benchmark-paths" ${details.paths.some((path) => path.benchmark?.status === 'testing') || !details.paths.length ? 'disabled' : ''}>${details.paths.some((path) => path.benchmark?.status === 'testing') ? '通路测速中' : '一键测试全部通路'}</button><a class="button ghost" href="#topology">返回主拓扑</a></div></div>
+    <div class="card-head"><div><p class="eyebrow">END-TO-END PATHS</p><h2>${escapeHtml(details.source.name)} ↔ ${escapeHtml(details.target.name)}</h2><p>${details.paths.length} 条无环路径${details.truncated ? ' · 已按安全上限截断' : ''}；端到端延迟为各段典型 RTT 之和，括号内为全路径波动区间</p></div><div class="graph-actions"><button class="button primary small" id="benchmark-paths" ${latencyRunning || !details.paths.length ? 'disabled' : ''}>${latencyRunning ? '通路探测中' : '探测全部通路'}</button><a class="button ghost" href="#topology">返回主拓扑</a></div></div>
     <div class="path-endpoints"><span><strong>${escapeHtml(details.source.name)}</strong><small>${escapeHtml(details.source.dataIp)}</small></span><span>${details.paths.length} 条路径</span><span><strong>${escapeHtml(details.target.name)}</strong><small>${escapeHtml(details.target.dataIp)}</small></span></div>
+    ${renderPathComparison(details.paths, linkById)}
     <div class="path-mode-bar segmented"><label><input class="path-mode" type="radio" name="pathMode" value="failover" ${failoverMode ? 'checked' : ''}><span>默认线路与故障切换</span></label><label title="${details.paths.length < 2 ? '至少需要两条无环路径' : ''}"><input class="path-mode" type="radio" name="pathMode" value="weighted" ${failoverMode ? '' : 'checked'} ${details.paths.length < 2 ? 'disabled' : ''}><span>负载均衡</span></label></div>
     <div class="path-lanes">${lanes}</div>
     <div class="path-policy-editor">
@@ -829,10 +1004,7 @@ function wireGuardConnection(node, fallbackHost = '') {
 }
 
 function renderRollouts() {
-  const activeUpdate = state.updateRollouts.some((update) => ['probing', 'distributing'].includes(update.status));
-  return `<div class="section-stack"><article class="card"><div class="card-head"><div><h2>软件更新</h2><p>GitHub 探测、制品分发和每台节点的应用结果</p></div><button class="button primary small" id="update-all" ${!state.panelStatus?.writable || activeUpdate ? 'disabled' : ''}>${activeUpdate ? '更新进行中' : '一键更新全网'}</button></div>
-    <div class="card-body section-stack">${state.updateRollouts.length ? state.updateRollouts.map((update) => `${renderUpdateSummary(update)}<div class="command-meta">${update.nodes.map((node) => `<span>${escapeHtml(node.name)}：${escapeHtml(updateNodeStatusLabel(node.status))}${node.error ? `（${escapeHtml(node.error)}）` : ''}</span>`).join('')}</div>`).join('') : renderUpdateSummary(null)}</div>
-  </article><article class="card"><div class="card-head"><div><h2>配置版本</h2><p>IP 和拓扑变更均通过准备、激活两个阶段发布</p></div></div>
+  return `<div class="section-stack"><article class="card"><div class="card-head"><div><h2>配置版本</h2><p>IP 和拓扑变更均通过准备、激活两个阶段发布</p></div></div>
     <div class="timeline">${state.configurations.length ? state.configurations.map((version) => `<div class="rollout"><span class="version">v${version.version}</span><span><strong>${escapeHtml(version.reason)}</strong><small class="rollout-id">${escapeHtml(version.id.slice(0, 12))}</small></span><span class="status ${escapeHtml(version.status)}">${escapeHtml(version.status)}</span><span>${formatDate(version.activatedAt || version.createdAt)}</span></div>`).join('') : '<div class="empty">暂无配置版本</div>'}</div>
   </article></div>`;
 }
@@ -886,7 +1058,6 @@ function bindViewEvents() {
   });
   document.querySelector('#save-path-policy')?.addEventListener('click', savePathPolicy);
   document.querySelector('#disable-path-policy')?.addEventListener('click', disablePathPolicy);
-  document.querySelector('#update-all')?.addEventListener('click', startNetworkUpdate);
   document.querySelector('#join-form')?.addEventListener('submit', createJoinToken);
   document.querySelectorAll('#join-form input[name="mode"]').forEach((radio) => radio.addEventListener('change', () => {
     state.joinMode = radio.value;
@@ -920,19 +1091,6 @@ function bindViewEvents() {
   });
 }
 
-async function startNetworkUpdate() {
-  const button = document.querySelector('#update-all');
-  if (button) button.disabled = true;
-  try {
-    await api(`/api/v1/networks/${state.networkId}/update-rollouts`, { method: 'POST', body: '{}' });
-    await load();
-    toast('已开始探测 GitHub；首个成功节点会把同一更新制品分发到全网');
-  } catch (error) {
-    if (button) button.disabled = false;
-    toast(error.message, 'error');
-  }
-}
-
 async function startLinkBenchmarks(scope = {}) {
   const button = document.querySelector(scope.sourceId ? '#benchmark-paths' : '#benchmark-adjacent');
   if (button) button.disabled = true;
@@ -944,10 +1102,10 @@ async function startLinkBenchmarks(scope = {}) {
     if (state.view === 'path-detail' && scope.sourceId && scope.targetId) {
       await loadPathDetail(scope.sourceId, scope.targetId);
       render();
-      toast('已开始测试这些通路的每一段；总延迟和瓶颈带宽会自动汇总');
+      toast('已开始探测这些通路涉及的每一段链路；端到端延迟会自动汇总');
     } else {
       await load();
-      toast('已开始测试所有相邻链路的延迟与上行带宽');
+      toast('已开始探测全部相邻链路；每条链路独立采样 5 次 RTT');
     }
   } catch (error) {
     if (button) button.disabled = false;
@@ -1305,8 +1463,7 @@ setInterval(() => {
 }, 1000);
 
 setInterval(async () => {
-  const updateActive = state.updateRollouts.some((update) => ['probing', 'distributing'].includes(update.status));
-  if (!state.token || (!['topology', 'path-detail'].includes(state.view) && !(updateActive && ['overview', 'rollouts'].includes(state.view))) || state.runtimeRefreshInFlight) return;
+  if (!state.token || !['topology', 'path-detail'].includes(state.view) || state.runtimeRefreshInFlight) return;
   if ((state.view === 'topology' && (state.selectedNodeIds.length || state.graph.drag)) || document.querySelector('dialog[open]')) return;
   if (state.view === 'path-detail' && document.activeElement?.matches('.path-weight')) return;
   state.runtimeRefreshInFlight = true;
