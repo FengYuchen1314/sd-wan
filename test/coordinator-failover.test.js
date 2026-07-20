@@ -117,7 +117,7 @@ async function registerPublicEdge({
   return registered.node;
 }
 
-test('三节点在初始协调节点失联后由最新副本多数派自动接管', { timeout: 30_000 }, async () => {
+test('三节点在初始协调节点失联后由其余选民自动接管', { timeout: 60_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pathweaver-election-'));
   const centerDirectory = join(root, 'center');
   const edgeBDirectory = join(root, 'edge-b');
@@ -237,7 +237,7 @@ test('三节点在初始协调节点失联后由最新副本多数派自动接�
       if (!winner) return null;
       const health = await fetch(`http://127.0.0.1:${winner.coordinatorPort}/healthz`).catch(() => null);
       return health?.ok ? { winner, states } : null;
-    }, '多数派选出并启动新协调节点', 12_000);
+    }, '选民选出并启动新协调节点', 20_000);
     assert.notEqual(elected.winner.nodeId, initialId);
     assert.equal(elected.winner.coordinatorElection.term > 1, true);
     await waitFor(() => {

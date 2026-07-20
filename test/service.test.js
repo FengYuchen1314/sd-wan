@@ -14,6 +14,15 @@ function fixture() {
   return { database, service, network, center: service.listNodes(network.id)[0] };
 }
 
+function coordinatorUpstreamUrl(service, networkId) {
+  const coordinator = service.getNode(service.getClusterState(networkId).coordinatorNodeId);
+  return `http://${coordinator.dataIp}:${coordinator.controlListenPort}`;
+}
+
+function internalControlUrl(node) {
+  return `http://${node.dataIp}:${node.controlListenPort}`;
+}
+
 function registerPublicEdge(service, network, parent, input = {}) {
   const token = service.createJoinToken(network.id, {
     parentId: parent.id,
@@ -278,7 +287,7 @@ test('选择边缘父节点时强制携带新设备可达的中继地址', () =>
     const second = service.createJoinToken(network.id, { parentId: edge.id });
     assert.match(second.command, /curl -fsSL 'http:\/\/192\.168\.8\.20:8790\/install\.sh'/);
     assert.match(second.command, /--source 'http:\/\/192\.168\.8\.20:8790'/);
-    assert.match(second.command, /--upstream 'http:\/\/192\.168\.8\.20:8790'/);
+    assert.ok(second.command.includes(`--upstream '${coordinatorUpstreamUrl(service, network.id)}'`));
   } finally { database.close(); }
 });
 
@@ -324,7 +333,7 @@ test('公网子节点通过边缘父节点主动加入时，父节点仍动态�
     assert.equal(childConfig.data.peers.find((peer) => peer.nodeId === edge.id).endpointMode, 'static-dial');
 
     const runtime = service.getClusterRuntime(network.id, edge.id);
-    assert.equal(runtime.control.forwarders[child.node.id], undefined);
+    assert.equal(runtime.control.forwarders[child.node.id], internalControlUrl(child.node));
 
     database.run(
       'UPDATE topology_links SET downstream_endpoint = ? WHERE id = ?',
@@ -416,8 +425,8 @@ test('双向探测只要一个方向成功即可建链，并使用数据库中�
     }
     const probeA = service.claimCommand(nodeA.id);
     const probeB = service.claimCommand(nodeB.id);
-    assert.equal(probeA.payload.remoteUrl, 'http://10.20.30.40:19002');
-    assert.equal(probeB.payload.remoteUrl, 'http://192.168.50.10:19001');
+    assert.equal(probeA.payload.remoteUrl, internalControlUrl(nodeB));
+    assert.equal(probeB.payload.remoteUrl, internalControlUrl(nodeA));
     service.completeCommand(nodeA.id, probeA.id, { ok: false, error: 'A 无法主动访问 B' });
     assert.equal(service.listLinks(network.id).find((link) => link.id === candidate.id).validationStatus, 'probing');
     service.completeCommand(nodeB.id, probeB.id, { ok: true, remoteNodeId: nodeA.id });
@@ -479,7 +488,7 @@ test('只填写一个可达地址时仅探测该方向，成功后建立单向�
     assert.equal(service.claimCommand(nodeA.id), null);
     const probeB = service.claimCommand(nodeB.id);
     assert.equal(probeB.type, 'execute-link-probe');
-    assert.equal(probeB.payload.remoteUrl, 'http://192.168.60.10:19101');
+    assert.equal(probeB.payload.remoteUrl, internalControlUrl(nodeA));
     service.completeCommand(nodeB.id, probeB.id, { ok: true, remoteNodeId: nodeA.id });
 
     const active = service.listLinks(network.id).find((link) => link.id === candidate.id);
@@ -532,7 +541,7 @@ test('单向 NAT 直连握手失败时基础拓扑自动回退，恢复后重新
       service.completeCommand(node.id, prepare.id, { ok: true });
     }
     const probe = service.claimCommand(ix.id);
-    assert.equal(probe.payload.remoteUrl, 'http://198.51.100.20:19202');
+    assert.equal(probe.payload.remoteUrl, internalControlUrl(london));
     assert.equal(service.claimCommand(london.id), null);
     service.completeCommand(ix.id, probe.id, { ok: true, remoteNodeId: london.id });
 
@@ -626,7 +635,7 @@ test('选择父节点自动采用已保存的控制地址和端口，并允许�
     assert.equal(override.sourceUrl, 'http://192.168.8.10:18090');
     assert.match(override.command, /curl -fsSL 'http:\/\/192\.168\.8\.10:18090\/install\.sh'/);
     assert.match(override.command, /--source 'http:\/\/192\.168\.8\.10:18090'/);
-    assert.match(override.command, /--upstream 'http:\/\/192\.168\.8\.10:18090'/);
+    assert.ok(override.command.includes(`--upstream '${coordinatorUpstreamUrl(service, network.id)}'`));
   } finally { database.close(); }
 });
 
@@ -805,7 +814,7 @@ test('IX 节点可作主动加入父节点与主动认领，后续可连公网�
 
     assert.ok(!service.clusterVoterIds(network.id).includes(ix.id), 'IX 上行按 NAT，不得进入协调选民');
     const runtime = service.getClusterRuntime(network.id, center.id);
-    assert.equal(runtime.control.forwarders[ix.id], undefined, '上游不得用 IX 自报入口做控制回拨');
+    assert.equal(runtime.control.forwarders[ix.id], internalControlUrl(ix), '控制面应走 IX 内网业务地址');
   } finally { database.close(); }
 });
 

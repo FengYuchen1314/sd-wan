@@ -75,7 +75,8 @@ test('配置包含到全部选民的无环路由，且只有更新任期可迁�
     assert.deepEqual(new Set(config.control.cluster.voterIds), new Set([center.id, edge.id]));
     assert.equal(Array.isArray(config.control.routesByTarget[center.id]), true);
     assert.equal(Array.isArray(config.control.routesByTarget[edge.id]), true);
-    assert.equal(config.control.routesByTarget[edge.id].length, 0);
+    assert.ok(config.control.routesByTarget[center.id].length >= 1, '内网控制路径应可达协调节点');
+    assert.equal(config.control.coordinatorUrl, `http://${center.dataIp}:${center.controlListenPort}`);
 
     const promoted = service.promoteCoordinator(edge.id, 2);
     assert.equal(promoted.cluster.coordinatorNodeId, edge.id);

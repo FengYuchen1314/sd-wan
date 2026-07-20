@@ -1,7 +1,7 @@
 import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
 import { containsIPv4, parseCIDR, parseIPv4, usableHost } from '../core/ipv4.js';
 import { enumerateSimplePaths } from '../core/paths.js';
-import { isActiveJoinLink, remoteEndpointForSource, resolveLinkEndpoints } from '../core/link-endpoints.js';
+import { remoteEndpointForSource, resolveLinkEndpoints } from '../core/link-endpoints.js';
 import { validateAndCompileTopology } from '../core/topology.js';
 
 const now = () => new Date().toISOString();
@@ -107,36 +107,19 @@ function hostFromEndpoint(endpoint) {
   return port ? endpointHost(value) : value;
 }
 
-function controlHopUrl(node, link, nodeId, nodeById) {
-  const upstream = nodeById?.get(link.upstreamId);
-  const downstream = nodeById?.get(link.downstreamId);
-  const resolved = upstream && downstream
-    ? resolveLinkEndpoints(link, upstream, downstream)
-    : {
-      upstreamEndpoint: link.upstreamEndpoint || null,
-      downstreamEndpoint: link.downstreamEndpoint || null,
-    };
-  const linkEndpoint = link.upstreamId === nodeId ? resolved.upstreamEndpoint : resolved.downstreamEndpoint;
-  // 链路明确写了拨号地址时才能反向访问。IX/NAT 的自报入口只给新节点主动加入用，
-  // 它们上行仍走 NAT 出口，不能当成可被上游主动拨入的控制地址。
-  const linkedHost = hostFromEndpoint(linkEndpoint);
-  if (linkedHost) return `http://${linkedHost}:${node.controlListenPort || 8790}`;
-  if (upstream && downstream && nodeId === downstream.id && isActiveJoinLink(link, upstream, downstream)) {
-    return null;
-  }
-  if (node.reachabilityType !== 'public') return null;
-  const publishedHost = hostFromEndpoint(node.dataEndpoint);
-  if (publishedHost) return `http://${publishedHost}:${node.controlListenPort || 8790}`;
-  const details = endpointDetails(node.controlEndpoint);
-  const host = details?.host;
-  if (!host) return null;
-  return `${details.protocol}://${host}:${details.port || node.controlListenPort || 8790}`;
+function internalControlUrl(node) {
+  if (!node?.dataIp) return null;
+  return `http://${node.dataIp}:${node.controlListenPort || 8790}`;
 }
 
-function probeUrl(node, reachableEndpoint) {
-  const host = hostFromEndpoint(reachableEndpoint);
-  if (!host) throw new Error(`节点 ${node.name} 缺少可探测地址`);
-  return `http://${host}:${node.controlListenPort || 8790}`;
+function controlHopUrl(node) {
+  return internalControlUrl(node);
+}
+
+function probeUrl(node) {
+  const url = internalControlUrl(node);
+  if (!url) throw new Error(`节点 ${node.name} 缺少内网控制地址`);
+  return url;
 }
 
 function wireGuardKeyPair() {
@@ -219,7 +202,7 @@ function compileControlPlans(nodes, links, coordinatorId, voterIds = []) {
       else if (link.downstreamId === source.id) peerId = link.upstreamId;
       if (!peerId) continue;
       const peer = nodeById.get(peerId);
-      const url = peer ? controlHopUrl(peer, link, peerId, nodeById) : null;
+      const url = peer ? controlHopUrl(peer) : null;
       if (url) forwarders[peerId] = url;
     }
 
@@ -246,7 +229,7 @@ function compileControlPlans(nodes, links, coordinatorId, voterIds = []) {
             const previousNodeId = path.nodeIds[index];
             const link = linkForPair(links, previousNodeId, nodeId);
             const node = nodeById.get(nodeId);
-            const url = link && node ? controlHopUrl(node, link, nodeId, nodeById) : null;
+            const url = node ? controlHopUrl(node) : null;
             return url ? { nodeId, url } : null;
           });
           if (hops.some((hop) => !hop)) return null;
@@ -1354,8 +1337,11 @@ export class ControlService {
         throw new Error(`父节点 ${parent.name} 尚未配置可被拨入的 WireGuard 固定端点`);
       }
       parentDataConnection = { host: parentDataHost, port: parentDataPort, endpoint: parentDataEndpoint };
+      const coordinator = this.getNode(this.getClusterState(networkId).coordinatorNodeId);
+      const coordinatorUpstream = internalControlUrl(coordinator);
+      if (!coordinatorUpstream) throw new Error('协调节点缺少内网控制地址，无法生成加入命令');
       const installerUrl = `${sourceUrl}/install.sh`;
-      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${sourceUrl}' --join-token '${token}' --upstream '${sourceUrl}'`;
+      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${sourceUrl}' --join-token '${token}' --upstream '${coordinatorUpstream}'`;
     }
     this.db.run(
       `INSERT INTO join_tokens(
@@ -1529,7 +1515,13 @@ export class ControlService {
       this.db.run('UPDATE join_tokens SET used_count = used_count + 1 WHERE id = ?', token.id);
       const versionId = this.createVersionInTransaction(network.id, `节点 ${name} 加入`);
       this.audit('agent.register', 'node', nodeId, { parentId: parent.id, versionId }, `node:${nodeId}`);
-      created = { node: this.getNode(nodeId), credential, parent, versionId };
+      created = {
+        node: this.getNode(nodeId),
+        credential,
+        parent,
+        versionId,
+        coordinatorUrl: internalControlUrl(this.getNode(this.getClusterState(network.id).coordinatorNodeId)),
+      };
     });
     return created;
   }
@@ -1665,8 +1657,11 @@ export class ControlService {
     const cluster = this.getClusterState(networkId);
     const voterIds = this.clusterVoterIds(networkId);
     const controlPlans = compileControlPlans(state.nodes, state.links, cluster.coordinatorNodeId, voterIds);
+    const coordinator = nodeById.get(cluster.coordinatorNodeId);
+    const coordinatorUrl = internalControlUrl(coordinator);
     for (const [nodeId, config] of Object.entries(compiled.configs)) {
       config.control = controlPlans[nodeId] ?? { maxHops: 16, forwarders: {}, routes: [], routesByTarget: {}, truncated: false };
+      config.control.coordinatorUrl = coordinatorUrl;
       config.control.cluster = {
         networkId,
         coordinatorNodeId: cluster.coordinatorNodeId,
@@ -1926,11 +1921,13 @@ export class ControlService {
       this.recordUpdateApplied(nodeId, String(input.updateAppliedRolloutId), input.updateError || null);
     }
     const cluster = this.getClusterState(node.networkId);
+    const coordinator = this.getNode(cluster.coordinatorNodeId);
     return {
       acknowledgedAt: timestamp,
       controlListenPort,
       dataListenPort,
       versionId,
+      coordinatorUrl: internalControlUrl(coordinator),
       cluster: {
         networkId: cluster.networkId,
         coordinatorNodeId: cluster.coordinatorNodeId,
@@ -2567,7 +2564,7 @@ export class ControlService {
             probeId: randomUUID(),
             maxHops: 16,
             token: updated.validation_token,
-            remoteUrl: probeUrl(downstream, updated.downstream_endpoint),
+            remoteUrl: probeUrl(downstream),
             expectedNodeId: updated.downstream_id,
           });
         }
@@ -2577,7 +2574,7 @@ export class ControlService {
             probeId: randomUUID(),
             maxHops: 16,
             token: updated.validation_token,
-            remoteUrl: probeUrl(upstream, updated.upstream_endpoint),
+            remoteUrl: probeUrl(upstream),
             expectedNodeId: updated.upstream_id,
           });
         }

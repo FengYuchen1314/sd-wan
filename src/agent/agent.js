@@ -318,6 +318,14 @@ function normalizeControlUrl(value) {
   return parsed.href.replace(/\/$/, '');
 }
 
+function reachableControlUrl(value) {
+  const normalized = normalizeControlUrl(value);
+  if (applyNetwork) return normalized;
+  const parsed = new URL(normalized);
+  parsed.hostname = '127.0.0.1';
+  return parsed.href.replace(/\/$/, '');
+}
+
 function decodeControlRoute(value) {
   if (!value) return [];
   let route;
@@ -339,11 +347,26 @@ function encodeControlRoute(route) {
 
 function controlCandidates() {
   const candidates = [];
+  const seen = new Set();
+  const pushCandidate = (candidate) => {
+    const key = `${candidate.baseUrl}\u0000${candidate.remaining.map((hop) => `${hop.nodeId}:${hop.url}`).join('\u0000')}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(candidate);
+  };
+  if (state.upstream) {
+    pushCandidate({
+      id: 'coordinator-upstream',
+      baseUrl: normalizeControlUrl(state.upstream),
+      remaining: [],
+      targetId: state.controlCluster?.coordinatorNodeId,
+    });
+  }
   const leaderId = election.leaderId || state.controlCluster?.coordinatorNodeId;
   const targetIds = [leaderId, ...shuffled(state.controlCluster?.voterIds || []).filter((id) => id !== leaderId)].filter(Boolean);
   for (const targetId of targetIds) {
     if (targetId === state.nodeId && localCoordinatorUrl) {
-      candidates.push({ id: `local-${targetId}`, targetId, baseUrl: localCoordinatorUrl, remaining: [] });
+      pushCandidate({ id: `local-${targetId}`, targetId, baseUrl: localCoordinatorUrl, remaining: [] });
     }
     for (const route of shuffled(state.controlRoutesByTarget?.[targetId] || [])) {
       if (!Array.isArray(route.hops) || !route.hops.length || route.hops.length > MAX_PROBE_HOPS) continue;
@@ -352,7 +375,7 @@ function controlCandidates() {
       try {
         const firstUrl = normalizeControlUrl(first.url);
         if (state.controlForwarders?.[first.nodeId] !== firstUrl) continue;
-        candidates.push({ id: route.id, targetId, baseUrl: firstUrl, remaining });
+        pushCandidate({ id: route.id, targetId, baseUrl: firstUrl, remaining });
       } catch {}
     }
   }
@@ -364,14 +387,8 @@ function controlCandidates() {
       try {
         const firstUrl = normalizeControlUrl(first.url);
         if (state.controlForwarders?.[first.nodeId] !== firstUrl) continue;
-        candidates.push({ id: route.id, baseUrl: firstUrl, remaining });
+        pushCandidate({ id: route.id, baseUrl: firstUrl, remaining });
       } catch {}
-    }
-  }
-  if (state.upstream) {
-    const fallback = normalizeControlUrl(state.upstream);
-    if (!candidates.some((candidate) => candidate.baseUrl === fallback && candidate.remaining.length === 0)) {
-      candidates.push({ id: 'initial-upstream', baseUrl: fallback, remaining: [] });
     }
   }
   return candidates;
@@ -396,7 +413,7 @@ async function api(pathname, options = {}) {
       if (credential) headers.Authorization = `Bearer ${credential}`;
       if (candidate.remaining.length) headers['X-PathWeaver-Control-Route'] = encodeControlRoute(candidate.remaining);
       if (state.nodeId || state.agentInstanceId) headers['X-PathWeaver-Relay-Trace'] = state.nodeId || state.agentInstanceId;
-      const response = await fetch(new URL(pathname, `${candidate.baseUrl}/`), {
+      const response = await fetch(new URL(pathname, `${reachableControlUrl(candidate.baseUrl)}/`), {
         ...requestOptions,
         headers,
         signal: AbortSignal.timeout(Math.max(250, Math.min(attemptTimeout, remainingTime))),
@@ -405,8 +422,11 @@ async function api(pathname, options = {}) {
       const contentType = response.headers.get('content-type') ?? '';
       const body = contentType.includes('json') ? await response.json() : await response.text();
       if (!response.ok) {
-        if (response.status < 500) throw Object.assign(new Error(body?.error || `上游返回 HTTP ${response.status}`), { terminal: true });
-        throw new Error(body?.error || `控制路径返回 HTTP ${response.status}`);
+        const message = body?.error || `控制路径返回 HTTP ${response.status}`;
+        if (response.status === 401 && candidate.id === 'coordinator-upstream') {
+          throw Object.assign(new Error(message), { terminal: true });
+        }
+        throw new Error(message);
       }
       if (state.controlCluster && candidate.targetId === (election.leaderId || state.controlCluster.coordinatorNodeId)) {
         election.noteLeader({
@@ -465,6 +485,14 @@ const wireguard = new WireGuardManager({
   applyNetwork,
 });
 
+function applyCoordinatorUpstream(url) {
+  if (!url || state.managedByParent || !applyNetwork) return;
+  const normalized = normalizeControlUrl(url);
+  if (state.upstream === normalized) return;
+  state.upstream = normalized;
+  atomicJson(stateFile, state);
+}
+
 function applyDesiredControlConfig(config) {
   state.controlRoutes = Array.isArray(config?.control?.routes) ? config.control.routes : [];
   state.controlRoutesByTarget = config?.control?.routesByTarget || {};
@@ -472,6 +500,7 @@ function applyDesiredControlConfig(config) {
     ([nodeId, url]) => [nodeId, normalizeControlUrl(url)],
   ));
   applyClusterDescriptor(config?.control?.cluster);
+  applyCoordinatorUpstream(config?.control?.coordinatorUrl);
 }
 
 async function applyDesiredConfig(desired) {
@@ -539,7 +568,7 @@ async function requestPeer(targetId, pathname, payload, timeout = 5_000) {
     try {
       const firstUrl = normalizeControlUrl(first.url);
       if (state.controlForwarders?.[first.nodeId] !== firstUrl) continue;
-      const response = await fetch(new URL(pathname, `${firstUrl}/`), {
+      const response = await fetch(new URL(pathname, `${reachableControlUrl(firstUrl)}/`), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -622,9 +651,6 @@ async function startLocalCoordinator(term) {
 
 async function broadcastCoordinatorHeartbeat() {
   if (!state.controlCluster || election.leaderId !== state.nodeId || !localCoordinatorUrl) return;
-  const voterIds = state.controlCluster.voterIds || [];
-  const quorum = election.quorum(voterIds.length);
-  let acknowledgements = voterIds.includes(state.nodeId) ? 1 : 0;
   const heartbeat = {
     networkId: state.controlCluster.networkId,
     term: election.term,
@@ -632,24 +658,10 @@ async function broadcastCoordinatorHeartbeat() {
     revision: Math.max(election.snapshotRevision, Number(replica?.revision || 0)),
     leaseMs: coordinatorLeaseMs,
   };
-  const responses = await Promise.all(voterIds.filter((id) => id !== state.nodeId).map((id) =>
+  await Promise.all((state.controlCluster.voterIds || []).filter((id) => id !== state.nodeId).map((id) =>
     requestPeer(id, '/peer/v1/election/heartbeat', heartbeat).catch(() => null)));
-  for (const response of responses) {
-    if (response?.accepted) acknowledgements += 1;
-    if (Number(response?.term || 0) > election.term && response?.leaderId) {
-      election.noteLeader({
-        term: response.term,
-        leaderId: response.leaderId,
-        revision: response.revision,
-      });
-    }
-  }
-  if (acknowledgements >= quorum) {
-    election.noteLeader(heartbeat);
-    persistElection();
-  } else if (election.leaseUntil <= Date.now()) {
-    await stopLocalCoordinator();
-  }
+  election.noteLeader(heartbeat);
+  persistElection();
 }
 
 async function maybeElectCoordinator() {
@@ -685,7 +697,7 @@ async function maybeElectCoordinator() {
     persistElection();
     return false;
   }
-  if (votes < election.quorum(voterIds.length)) {
+  if (votes < 1) {
     persistElection();
     return false;
   }
@@ -1025,6 +1037,7 @@ async function tick() {
     }),
   });
   applyClusterDescriptor(heartbeat?.cluster, { renewLease: true });
+  applyCoordinatorUpstream(heartbeat?.coordinatorUrl);
   await syncConfig();
   await syncReplica().catch((error) => console.error('协调快照同步失败：', error.message));
   const command = await api('/agent/v1/commands/next');
@@ -1069,7 +1082,7 @@ async function proxy(req, res) {
     }
     targetUrl = allowedUrl;
     remaining.splice(0, remaining.length, ...rest);
-  } else if (state.controlCluster) {
+  } else if (!targetUrl && state.controlCluster) {
     if (election.leaderId === state.nodeId) {
       targetUrl = localCoordinatorUrl;
     } else {
@@ -1086,7 +1099,7 @@ async function proxy(req, res) {
   const body = ['GET', 'HEAD'].includes(req.method) ? undefined : Buffer.concat(chunks);
   const largeTransfer = /\/agent\/v1\/update-artifacts\//.test(req.url || '')
     || (req.method === 'POST' && /\/agent\/v1\/commands\/[^/]+\/complete/.test(req.url || '') && (body?.length || 0) > 256 * 1024);
-  const upstream = await fetch(new URL(req.url, `${targetUrl}/`), {
+  const upstream = await fetch(new URL(req.url, `${reachableControlUrl(targetUrl)}/`), {
     method: req.method,
     headers: {
       ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),

@@ -25,7 +25,14 @@ export class CoordinatorElection {
 
   noteLeader({ term, leaderId, revision, leaseMs = 12_000 }, now = Date.now()) {
     const nextTerm = Number(term || 0);
-    if (nextTerm < this.term) return { accepted: false, term: this.term };
+    const nextLeader = String(leaderId || '');
+    if (nextTerm < this.term) {
+      if (this.leaseUntil > now && this.leaderId) {
+        return { accepted: false, term: this.term, reason: 'stale-term' };
+      }
+      if (!nextLeader) return { accepted: false, term: this.term, reason: 'stale-term' };
+      return this.followLease({ term: nextTerm, leaderId: nextLeader, revision, leaseMs }, now);
+    }
     if (nextTerm === this.term && this.leaseUntil > now && this.leaderId && this.leaderId !== String(leaderId || '')) {
       return { accepted: false, term: this.term, reason: 'conflicting-leader' };
     }

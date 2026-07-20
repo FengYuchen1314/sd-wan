@@ -507,11 +507,6 @@ function requireCoordinatorWrite() {
       error.statusCode = 503;
       throw error;
     }
-    if (!externalCoordinator && Number(coordinatorLeases.get(runtime.cluster.networkId) || 0) <= Date.now()) {
-      const error = new Error('配置协调节点尚未取得多数派租约，暂时拒绝写入以避免双主');
-      error.statusCode = 503;
-      throw error;
-    }
   }
 }
 
@@ -539,20 +534,12 @@ function clusterMemberships() {
 async function replicateSnapshot(memberships) {
   const snapshot = database.exportSnapshot();
   for (const membership of memberships) {
-    const quorum = Math.floor(Math.max(1, membership.voterIds.length) / 2) + 1;
-    let acknowledgements = membership.voterIds.includes(membership.localNodeId) ? 1 : 0;
-    const responses = await Promise.all(membership.voterIds
+    await Promise.all(membership.voterIds
       .filter((id) => id !== membership.localNodeId)
       .map((id) => requestPeer(membership.networkId, id, '/peer/v1/replica/install', {
         networkId: membership.networkId,
         snapshot,
       }, 15_000).catch(() => null)));
-    acknowledgements += responses.filter((response) => response?.ok).length;
-    if (acknowledgements < quorum) {
-      const error = new Error(`配置快照只同步到 ${acknowledgements}/${membership.voterIds.length} 个选民，未达到多数派`);
-      error.statusCode = 503;
-      throw error;
-    }
   }
   lastReplicatedRevision = Math.max(lastReplicatedRevision, Number(snapshot.revision || 0));
   return snapshot.revision;
@@ -564,8 +551,6 @@ async function coordinatorHeartbeatTick() {
     const localId = localNodeId(networkId);
     const election = electionFor(networkId);
     if (runtime.cluster.coordinatorNodeId !== localId) continue;
-    const quorum = election.quorum(runtime.voterIds.length);
-    let acknowledgements = runtime.voterIds.includes(localId) ? 1 : 0;
     const heartbeat = {
       networkId,
       term: runtime.cluster.term,
@@ -573,26 +558,15 @@ async function coordinatorHeartbeatTick() {
       revision: runtime.cluster.revision,
       leaseMs: coordinatorLeaseMs,
     };
-    const responses = await Promise.all(runtime.voterIds.filter((id) => id !== localId).map((id) =>
+    await Promise.all(runtime.voterIds.filter((id) => id !== localId).map((id) =>
       requestPeer(networkId, id, '/peer/v1/election/heartbeat', heartbeat).catch(() => null)));
-    for (const response of responses) {
-      if (response?.accepted) acknowledgements += 1;
-      if (Number(response?.term || 0) > election.term && response?.leaderId) {
-        election.noteLeader({ term: response.term, leaderId: response.leaderId, revision: response.revision });
-        service.observeCoordinator(networkId, {
-          coordinatorNodeId: response.leaderId,
-          term: response.term,
-          revision: response.revision,
-        });
-      }
-    }
-    if (acknowledgements >= quorum) {
-      election.noteLeader(heartbeat);
-      coordinatorLeases.set(networkId, election.leaseUntil);
-    }
+    election.noteLeader(heartbeat);
+    coordinatorLeases.set(networkId, election.leaseUntil);
   }
   if (!localIsFollower() && clusterRevision() > lastReplicatedRevision) {
-    await replicateSnapshot(clusterMemberships());
+    await replicateSnapshot(clusterMemberships()).catch((error) => {
+      console.error('coordinator snapshot replication failed:', error.message);
+    });
   }
 }
 
