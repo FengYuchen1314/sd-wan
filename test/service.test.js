@@ -287,7 +287,7 @@ test('选择边缘父节点时强制携带新设备可达的中继地址', () =>
     const second = service.createJoinToken(network.id, { parentId: edge.id });
     assert.match(second.command, /curl -fsSL 'http:\/\/192\.168\.8\.20:8790\/install\.sh'/);
     assert.match(second.command, /--source 'http:\/\/192\.168\.8\.20:8790'/);
-    assert.ok(second.command.includes(`--upstream '${coordinatorUpstreamUrl(service, network.id)}'`));
+    assert.match(second.command, /--upstream 'http:\/\/192\.168\.8\.20:8790'/);
   } finally { database.close(); }
 });
 
@@ -635,7 +635,7 @@ test('选择父节点自动采用已保存的控制地址和端口，并允许�
     assert.equal(override.sourceUrl, 'http://192.168.8.10:18090');
     assert.match(override.command, /curl -fsSL 'http:\/\/192\.168\.8\.10:18090\/install\.sh'/);
     assert.match(override.command, /--source 'http:\/\/192\.168\.8\.10:18090'/);
-    assert.ok(override.command.includes(`--upstream '${coordinatorUpstreamUrl(service, network.id)}'`));
+    assert.match(override.command, /--upstream 'http:\/\/192\.168\.8\.10:18090'/);
   } finally { database.close(); }
 });
 

@@ -1337,11 +1337,8 @@ export class ControlService {
         throw new Error(`父节点 ${parent.name} 尚未配置可被拨入的 WireGuard 固定端点`);
       }
       parentDataConnection = { host: parentDataHost, port: parentDataPort, endpoint: parentDataEndpoint };
-      const coordinator = this.getNode(this.getClusterState(networkId).coordinatorNodeId);
-      const coordinatorUpstream = internalControlUrl(coordinator);
-      if (!coordinatorUpstream) throw new Error('协调节点缺少内网控制地址，无法生成加入命令');
       const installerUrl = `${sourceUrl}/install.sh`;
-      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${sourceUrl}' --join-token '${token}' --upstream '${coordinatorUpstream}'`;
+      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${sourceUrl}' --join-token '${token}' --upstream '${sourceUrl}'`;
     }
     this.db.run(
       `INSERT INTO join_tokens(

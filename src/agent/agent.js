@@ -513,6 +513,8 @@ const wireguard = new WireGuardManager({
 
 function applyCoordinatorUpstream(url) {
   if (!url || state.managedByParent || !applyNetwork) return;
+  // 首次加入在 WireGuard 激活前仍经父节点中继，激活后再切到协调节点内网地址。
+  if (state.currentVersion < 1) return;
   const normalized = normalizeControlUrl(url);
   if (state.upstream === normalized) return;
   state.upstream = normalized;
