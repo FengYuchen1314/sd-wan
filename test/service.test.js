@@ -230,7 +230,7 @@ test('选择边缘父节点时强制携带新设备可达的中继地址', () =>
   try {
     const first = service.createJoinToken(network.id, { parentId: center.id });
     const edge = service.registerAgent({ token: first.token, name: '一级边缘', wgDataPublicKey: 'f'.repeat(44) }).node;
-    assert.throws(() => service.createJoinToken(network.id, { parentId: edge.id }), /没有公网拨入能力/);
+    assert.throws(() => service.createJoinToken(network.id, { parentId: edge.id }), /纯 NAT 节点|没有公网拨入能力/);
     service.updateNode(edge.id, {
       hasPublicEndpoint: true,
       canRelay: true,
@@ -677,6 +677,49 @@ test('无公网节点只主动拨号公网节点，两个无公网节点禁止�
   } finally { database.close(); }
 });
 
+test('IX 节点可作主动加入父节点与主动认领，但不能在拓扑中后续建链', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const join = service.createJoinToken(network.id, { parentId: center.id });
+    const ix = service.registerAgent({
+      token: join.token,
+      name: '上海 IX',
+      reachabilityType: 'ix',
+      controlEndpoint: 'http://10.20.0.8:8790',
+      dataEndpoint: '10.20.0.8:19801',
+      dataListenPort: 19801,
+      wgDataPublicKey: 'i'.repeat(44),
+    }).node;
+    assert.equal(ix.reachabilityType, 'ix');
+    assert.equal(ix.hasPublicEndpoint, true);
+    assert.equal(ix.canRelay, true);
+    assert.equal(ix.dataEndpoint, '10.20.0.8:19801');
+
+    const childToken = service.createJoinToken(network.id, {
+      parentId: ix.id,
+      parentHost: '10.20.0.8',
+      parentPort: 8790,
+      parentDataHost: '10.20.0.8',
+      parentDataPort: 19801,
+    });
+    assert.match(childToken.command, /10\.20\.0\.8:8790/);
+    assert.equal(childToken.parentDataConnection.endpoint, '10.20.0.8:19801');
+
+    const passive = service.createJoinToken(network.id, { parentId: ix.id, mode: 'passive' });
+    assert.equal(passive.mode, 'passive');
+    assert.match(passive.command, /--claim-token/);
+
+    const publicToken = service.createJoinToken(network.id, { parentId: center.id });
+    const publicNode = service.registerAgent({
+      token: publicToken.token, name: '公网对照', hasPublicEndpoint: true,
+      dataEndpoint: '198.51.100.20:19801', dataListenPort: 19801, wgDataPublicKey: 'p'.repeat(44),
+    }).node;
+    assert.throws(() => service.createLinkValidation(network.id, {
+      nodeAId: publicNode.id, nodeBId: ix.id, nodeAAddress: '198.51.100.20',
+    }), /IX 节点不能在拓扑中/);
+  } finally { database.close(); }
+});
+
 test('全网更新选择首个可访问 GitHub 的节点并把同一摘要制品排队到全部设备', () => {
   const database = new Database(':memory:');
   const staged = [];
@@ -713,6 +756,10 @@ test('全网更新选择首个可访问 GitHub 的节点并把同一摘要制品
     const install = service.claimCommand(edge.id);
     assert.equal(install.type, 'install-update-bundle');
     assert.equal(install.payload.bundleSha256, distributing.bundleSha256);
+    assert.equal(Object.hasOwn(install.payload, 'bundleBase64'), false, '命令领取不得附带整包制品');
+    const artifact = service.getUpdateArtifactForAgent(edge.id, rollout.id);
+    assert.equal(artifact.bundleSha256, distributing.bundleSha256);
+    assert.ok(artifact.bundleBase64);
     service.completeCommand(edge.id, install.id, { ok: true, scheduled: true });
     assert.equal(staged.length, 1);
     assert.equal(staged[0].bundleSha256, distributing.bundleSha256);
@@ -794,6 +841,37 @@ test('离线节点延期更新不再卡住全网任务，恢复后继续使用�
     service.completeCommand(offline.id, installOffline.id, { ok: true, scheduled: true });
     service.recordUpdateApplied(offline.id, rollout.id);
     assert.equal(service.getUpdateRollout(rollout.id).status, 'completed');
+  } finally { database.close(); }
+});
+
+test('领取更新制品后离线的节点会被延期，不再卡住协调节点本机更新', () => {
+  const database = new Database(':memory:');
+  const staged = [];
+  const service = new ControlService(database, {
+    publicUrl: 'https://center.example', stageLocalUpdate: (request) => staged.push(request),
+  });
+  try {
+    const network = service.createNetwork({
+      name: '卡住恢复', dataCidr: '10.93.0.0/24', controlCidr: '10.243.0.0/24', listenPort: 51820, mtu: 1380,
+    });
+    const center = service.listNodes(network.id)[0];
+    const token = service.createJoinToken(network.id, { parentId: center.id });
+    const edge = service.registerAgent({
+      token: token.token, name: '中途离线节点', hasPublicEndpoint: false, wgDataPublicKey: 'z'.repeat(44),
+    }).node;
+    const rollout = service.createUpdateRollout(network.id, center.id);
+    const probe = service.claimCommand(edge.id);
+    const bundle = gzipSync(randomBytes(1024));
+    service.completeCommand(edge.id, probe.id, {
+      ok: true, installer: '#!/usr/bin/env bash\n# supports --bundle-file\n', bundleBase64: bundle.toString('base64'),
+    });
+    const install = service.claimCommand(edge.id);
+    assert.equal(install.type, 'install-update-bundle');
+    database.run("UPDATE nodes SET status = 'offline' WHERE id = ?", edge.id);
+    service.recoverUpdateRollouts();
+    const recovered = service.getUpdateRollout(rollout.id);
+    assert.equal(recovered.nodes.find((node) => node.nodeId === edge.id).status, 'deferred');
+    assert.equal(staged.length, 1, '远端安装卡住并离线后应允许协调节点继续本机更新');
   } finally { database.close(); }
 });
 

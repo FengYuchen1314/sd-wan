@@ -27,9 +27,12 @@ test('统一对等节点安装不再要求选择中心或边缘，并为每台�
   assert.match(installer, /choose_distinct_tcp_port "节点控制中继 TCP 端口" 8790/);
   assert.match(installer, /net\.ipv4\.ip_forward=1/);
   assert.match(installer, /net\.ipv4\.conf\.all\.rp_filter=2/);
-  assert.match(installer, /choose_public_endpoint/);
+  assert.match(installer, /choose_reachability/);
+  assert.match(installer, /normalize_reachability/);
   assert.match(installer, /choose_port "WireGuard UDP 公网监听端口" udp 19801/);
+  assert.match(installer, /choose_port "WireGuard UDP 内网监听端口" udp 19801/);
   assert.match(installer, /DATA_PORT="\$\{DATA_PORT:-\$\(find_available_port udp 19801\)\}"/);
+  assert.match(installer, /--reachability/);
   assert.match(installer, /choose_panel_password/);
   assert.match(installer, /read -r -s first/);
   assert.match(installer, /SDWAN_PANEL_PASSWORD_HASH=/);

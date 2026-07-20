@@ -10,6 +10,7 @@ RELAY_PORT=""
 DATA_PORT=""
 REACHABLE_HOST=""
 PUBLIC_ENDPOINT=""
+REACHABILITY=""
 PANEL_PASSWORD=""
 UPDATE_ONLY=0
 BUNDLE_FILE=""
@@ -34,6 +35,7 @@ while [[ $# -gt 0 ]]; do
     --data-port) DATA_PORT="$2"; shift 2 ;;
     --reachable-host) REACHABLE_HOST="$2"; shift 2 ;;
     --public-endpoint) PUBLIC_ENDPOINT="$2"; shift 2 ;;
+    --reachability) REACHABILITY="$2"; shift 2 ;;
     --bundle-file) BUNDLE_FILE="$2"; shift 2 ;;
     --panel-password) PANEL_PASSWORD="$2"; shift 2 ;;
     --admin-token) PANEL_PASSWORD="$2"; shift 2 ;;
@@ -223,13 +225,29 @@ normalize_yes_no() {
   esac
 }
 
-choose_public_endpoint() {
+normalize_reachability() {
+  case "${1,,}" in
+    public|y|yes|1|true|是|有|公网) printf 'public\n' ;;
+    nat|n|no|0|false|否|无|纯nat) printf 'nat\n' ;;
+    ix|交换|内网ix) printf 'ix\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+choose_reachability() {
   local supplied="$1" answer=""
   while true; do
     answer="$supplied"
-    if [[ -z "$answer" ]]; then answer="$(ask "本节点是否有可供其他节点主动拨入的公网入口？输入 y 或 n" "n")"; fi
-    if normalize_yes_no "$answer"; then return; fi
-    echo "请输入 y（有公网拨入能力）或 n（无公网，仅主动连接）。" >&2
+    if [[ -z "$answer" ]]; then
+      answer="$(ask "本节点拨入类型：1=公网可拨入，2=纯 NAT（仅主动拨出），3=IX（填内网 IP，可接入新节点但不能后续建拓扑链路）" "2")"
+    fi
+    case "${answer,,}" in
+      1) answer=public ;;
+      2) answer=nat ;;
+      3) answer=ix ;;
+    esac
+    if normalize_reachability "$answer"; then return; fi
+    echo "请输入 1/public（公网）、2/nat（纯 NAT）或 3/ix（交换内网）。" >&2
     if [[ -z "$TTY_DEVICE" ]]; then exit 2; fi
     supplied=""
   done
@@ -493,7 +511,7 @@ update_node() {
 }
 
 install_node() {
-  local endpoint_host control_endpoint data_endpoint node_env panel_password_hash panel_proxy_token bootstrap public_endpoint
+  local endpoint_host control_endpoint data_endpoint node_env panel_password_hash panel_proxy_token bootstrap reachability
   bootstrap=0
   if [[ -z "$JOIN_TOKEN" && -z "$CLAIM_TOKEN" && -z "$UPSTREAM" ]]; then bootstrap=1; fi
   if [[ "$bootstrap" -eq 0 && -z "$JOIN_TOKEN" && -z "$CLAIM_TOKEN" ]]; then
@@ -503,24 +521,28 @@ install_node() {
 
   PANEL_PORT="$(choose_port "本机管理面板 TCP 端口" tcp 19773 "$PANEL_PORT")"
   if [[ "$bootstrap" -eq 1 || -n "$CLAIM_TOKEN" ]]; then
-    public_endpoint="yes"
+    reachability="public"
   else
-    public_endpoint="$(choose_public_endpoint "$PUBLIC_ENDPOINT")"
+    reachability="$(choose_reachability "${REACHABILITY:-$PUBLIC_ENDPOINT}")"
   fi
   if [[ "$bootstrap" -eq 0 ]]; then
-    if [[ "$public_endpoint" == "yes" ]]; then
-      RELAY_PORT="$(choose_distinct_tcp_port "节点控制中继 TCP 端口" 8790 "$RELAY_PORT" "$PANEL_PORT")"
-    else
+    if [[ "$reachability" == "nat" ]]; then
       RELAY_PORT="${RELAY_PORT:-$(find_available_port tcp 8790)}"
+    else
+      RELAY_PORT="$(choose_distinct_tcp_port "节点控制中继 TCP 端口" 8790 "$RELAY_PORT" "$PANEL_PORT")"
     fi
   fi
-  if [[ "$public_endpoint" == "yes" ]]; then
+  if [[ "$reachability" == "public" ]]; then
     DATA_PORT="$(choose_port "WireGuard UDP 公网监听端口" udp 19801 "$DATA_PORT")"
     REACHABLE_HOST="${REACHABLE_HOST:-$(ask "其他节点可访问本节点的公网 IP 或域名" "$(detect_reachable_host)")}"
+  elif [[ "$reachability" == "ix" ]]; then
+    DATA_PORT="$(choose_port "WireGuard UDP 内网监听端口" udp 19801 "$DATA_PORT")"
+    REACHABLE_HOST="${REACHABLE_HOST:-$(ask "同 IX/内网其他节点可访问本节点的内网 IP" "$(detect_reachable_host)")}"
+    echo "本节点按 IX 模式安装：将发布内网入口供新节点主动加入或认领，但不能在拓扑中与其他节点建立后续直连。"
   else
     DATA_PORT="${DATA_PORT:-$(find_available_port udp 19801)}"
     REACHABLE_HOST="$(detect_reachable_host)"
-    echo "本节点按无公网模式安装：WireGuard 本地端口已自动选择，不会发布给其他节点。"
+    echo "本节点按纯 NAT 模式安装：WireGuard 本地端口已自动选择，不会发布给其他节点。"
   fi
   endpoint_host="$(format_endpoint_host "$REACHABLE_HOST")"
   choose_panel_password
@@ -597,7 +619,7 @@ EOF
     panel_proxy_token="$(node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))")"
     control_endpoint=""
     data_endpoint=""
-    if [[ "$public_endpoint" == "yes" ]]; then
+    if [[ "$reachability" == "public" || "$reachability" == "ix" ]]; then
       control_endpoint="http://$endpoint_host:$RELAY_PORT"
       data_endpoint="$endpoint_host:$DATA_PORT"
     fi
@@ -606,7 +628,7 @@ SDWAN_PANEL_PASSWORD_HASH=$panel_password_hash
 SDWAN_PANEL_PROXY_TOKEN=$panel_proxy_token
 EOF
     chmod 0600 "$node_env"
-    ARGS=(--relay-port "$RELAY_PORT" --data-port "$DATA_PORT" --public-endpoint "$public_endpoint" --panel-proxy-token "$panel_proxy_token")
+    ARGS=(--relay-port "$RELAY_PORT" --data-port "$DATA_PORT" --reachability "$reachability" --panel-proxy-token "$panel_proxy_token")
     if [[ -n "$control_endpoint" ]]; then ARGS+=(--control-endpoint "$control_endpoint"); fi
     if [[ -n "$data_endpoint" ]]; then ARGS+=(--data-endpoint "$data_endpoint"); fi
     if [[ -n "$UPSTREAM" ]]; then ARGS+=(--upstream "$UPSTREAM"); fi
@@ -666,8 +688,10 @@ EOF
     systemctl enable --now pathweaver-agent pathweaver-node
   fi
 
-  if [[ "$public_endpoint" == "yes" ]]; then
+  if [[ "$reachability" == "public" ]]; then
     echo "PathWeaver 节点已启动：面板 http://$endpoint_host:$PANEL_PORT，公网 WireGuard UDP $DATA_PORT。"
+  elif [[ "$reachability" == "ix" ]]; then
+    echo "PathWeaver 节点已启动：面板 http://$endpoint_host:$PANEL_PORT，IX 内网 WireGuard UDP $DATA_PORT（$endpoint_host）。"
   else
     echo "PathWeaver 节点已启动：面板 http://$endpoint_host:$PANEL_PORT；数据面仅主动拨出，不公开 WireGuard 端口。"
   fi

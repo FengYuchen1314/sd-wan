@@ -50,6 +50,18 @@ function booleanValue(value, fallback = false) {
   return ['1', 'true', 'yes', 'y', 'on'].includes(String(value).toLowerCase());
 }
 
+function normalizeReachabilityType(value, { hasPublicEndpoint, dataEndpoint } = {}) {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (raw === 'public' || raw === 'nat' || raw === 'ix') return raw;
+  if (raw === 'yes' || raw === 'y' || raw === '1' || raw === 'true' || raw === 'on') return 'public';
+  if (raw === 'no' || raw === 'n' || raw === '0' || raw === 'false' || raw === 'off') return 'nat';
+  if (value === undefined || value === null || value === '') {
+    if (hasPublicEndpoint !== undefined) return booleanValue(hasPublicEndpoint) ? 'public' : 'nat';
+    return dataEndpoint ? 'public' : 'nat';
+  }
+  throw new Error('节点拨入类型只能是 public、nat 或 ix');
+}
+
 function atomicJson(filename, value) {
   const temporary = `${filename}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
@@ -151,9 +163,13 @@ if (args.panelProxyToken || process.env.SDWAN_PANEL_PROXY_TOKEN) {
     .update(String(args.panelProxyToken || process.env.SDWAN_PANEL_PROXY_TOKEN))
     .digest('hex');
 }
-const publicEndpointSetting = args.publicEndpoint ?? process.env.SDWAN_PUBLIC_ENDPOINT;
-if (publicEndpointSetting !== undefined) state.hasPublicEndpoint = booleanValue(publicEndpointSetting);
-state.hasPublicEndpoint ??= Boolean(state.dataEndpoint || args.dataEndpoint || process.env.SDWAN_DATA_ENDPOINT);
+const reachabilitySetting = args.reachability ?? process.env.SDWAN_REACHABILITY
+  ?? args.publicEndpoint ?? process.env.SDWAN_PUBLIC_ENDPOINT;
+state.reachabilityType = normalizeReachabilityType(reachabilitySetting, {
+  hasPublicEndpoint: state.hasPublicEndpoint,
+  dataEndpoint: state.dataEndpoint || args.dataEndpoint || process.env.SDWAN_DATA_ENDPOINT,
+});
+state.hasPublicEndpoint = state.reachabilityType === 'public' || state.reachabilityType === 'ix';
 if (state.hasPublicEndpoint) {
   state.controlEndpoint ||= args.controlEndpoint || process.env.SDWAN_CONTROL_ENDPOINT || null;
   state.dataEndpoint ||= args.dataEndpoint || process.env.SDWAN_DATA_ENDPOINT || null;
@@ -334,7 +350,12 @@ function controlCandidates() {
 }
 
 async function api(pathname, options = {}) {
-  const { credential = state.credential, timeout = 20_000, ...requestOptions } = options;
+  const {
+    credential = state.credential,
+    timeout = 20_000,
+    attemptTimeout = 5_000,
+    ...requestOptions
+  } = options;
   const candidates = controlCandidates();
   if (!candidates.length) throw new Error('Agent 尚未设置可用的中心控制路径');
   const failures = [];
@@ -350,7 +371,7 @@ async function api(pathname, options = {}) {
       const response = await fetch(new URL(pathname, `${candidate.baseUrl}/`), {
         ...requestOptions,
         headers,
-        signal: AbortSignal.timeout(Math.max(250, Math.min(5_000, remainingTime))),
+        signal: AbortSignal.timeout(Math.max(250, Math.min(attemptTimeout, remainingTime))),
       });
       if (response.status === 204) return null;
       const contentType = response.headers.get('content-type') ?? '';
@@ -393,6 +414,7 @@ async function register({ passive = false } = {}) {
       dataEndpoint: state.dataEndpoint,
       dataListenPort: state.dataListenPort,
       hasPublicEndpoint: state.hasPublicEndpoint,
+      reachabilityType: state.reachabilityType,
     }),
   });
   state = {
@@ -401,6 +423,7 @@ async function register({ passive = false } = {}) {
     credential: result.credential,
     joinToken: null,
     networkId: result.node.networkId,
+    reachabilityType: result.node.reachabilityType || state.reachabilityType,
     hasPublicEndpoint: result.node.hasPublicEndpoint,
   };
   election.nodeId = state.nodeId;
@@ -802,7 +825,15 @@ async function runCommand(command) {
     } else if (command.type === 'probe-update-source') {
       result = await fetchUpdateArtifact(command.payload);
     } else if (command.type === 'install-update-bundle') {
-      result = stageUpdateArtifact(command.payload);
+      let payload = command.payload;
+      if (!payload?.bundleBase64 || !payload?.installer) {
+        const artifact = await api(`/agent/v1/update-artifacts/${payload.rolloutId}`, {
+          timeout: 180_000,
+          attemptTimeout: 120_000,
+        });
+        payload = { ...payload, ...artifact };
+      }
+      result = stageUpdateArtifact(payload);
     } else if (command.type === 'prepare-link-benchmark') {
       result = prepareBenchmark(state.pendingBenchmarks, command.payload);
       atomicJson(stateFile, state);
@@ -818,8 +849,22 @@ async function runCommand(command) {
 }
 
 async function executeCommand(command) {
-  const result = await runCommand(command);
-  await api(`/agent/v1/commands/${command.id}/complete`, { method: 'POST', body: JSON.stringify(result) });
+  const largeTransfer = ['probe-update-source', 'install-update-bundle'].includes(command.type);
+  try {
+    const result = await runCommand(command);
+    await api(`/agent/v1/commands/${command.id}/complete`, {
+      method: 'POST',
+      body: JSON.stringify(result),
+      timeout: largeTransfer ? 180_000 : 60_000,
+      attemptTimeout: largeTransfer ? 120_000 : 30_000,
+    });
+  } catch (error) {
+    if (largeTransfer) {
+      console.error(`更新命令 ${command.type} 传输失败，将在租约到期后重试：`, error.message);
+      return;
+    }
+    throw error;
+  }
 }
 
 async function syncManagedChild(child) {
@@ -862,11 +907,25 @@ async function syncManagedChild(child) {
   const desired = await api(`/agent/v1/config?currentVersion=${Number(child.currentVersion || 0)}`, {
     credential: child.credential,
   });
-  const command = await api('/agent/v1/commands/next', { credential: child.credential });
+  let command = await api('/agent/v1/commands/next', { credential: child.credential });
+  if (command?.type === 'install-update-bundle' && (!command.payload?.bundleBase64 || !command.payload?.installer)) {
+    try {
+      const artifact = await api(`/agent/v1/update-artifacts/${command.payload.rolloutId}`, {
+        credential: child.credential,
+        timeout: 180_000,
+        attemptTimeout: 120_000,
+      });
+      command = { ...command, payload: { ...command.payload, ...artifact } };
+    } catch (error) {
+      console.error(`被认领节点 ${child.nodeId} 领取更新制品失败，将在租约到期后重试：`, error.message);
+      return;
+    }
+  }
+  const largeTransfer = ['probe-update-source', 'install-update-bundle'].includes(command?.type);
   const result = await requestManagedChild(child, '/agent/v1/managed/tick', {
     method: 'POST',
     body: JSON.stringify({ node: child.node, desired, command }),
-    timeout: 30_000,
+    timeout: largeTransfer ? 180_000 : 30_000,
   });
   if (result.currentVersion !== undefined) {
     child.currentVersion = Number(result.currentVersion);
@@ -908,6 +967,8 @@ async function syncManagedChild(child) {
       method: 'POST',
       credential: child.credential,
       body: JSON.stringify(commandResult),
+      timeout: ['probe-update-source', 'install-update-bundle'].includes(command.type) ? 180_000 : 60_000,
+      attemptTimeout: ['probe-update-source', 'install-update-bundle'].includes(command.type) ? 120_000 : 30_000,
     });
   }
 }
@@ -994,6 +1055,9 @@ async function proxy(req, res) {
     res.writeHead(503, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: '中继节点没有可用的下一跳控制路径' }));
   }
+  const body = ['GET', 'HEAD'].includes(req.method) ? undefined : Buffer.concat(chunks);
+  const largeTransfer = /\/agent\/v1\/update-artifacts\//.test(req.url || '')
+    || (req.method === 'POST' && /\/agent\/v1\/commands\/[^/]+\/complete/.test(req.url || '') && (body?.length || 0) > 256 * 1024);
   const upstream = await fetch(new URL(req.url, `${targetUrl}/`), {
     method: req.method,
     headers: {
@@ -1002,8 +1066,8 @@ async function proxy(req, res) {
       'X-PathWeaver-Relay-Trace': relayTrace,
       ...(remaining.length ? { 'X-PathWeaver-Control-Route': encodeControlRoute(remaining) } : {}),
     },
-    body: ['GET', 'HEAD'].includes(req.method) ? undefined : Buffer.concat(chunks),
-    signal: AbortSignal.timeout(30_000),
+    body,
+    signal: AbortSignal.timeout(largeTransfer ? 180_000 : 30_000),
   });
   res.writeHead(upstream.status, {
     'Content-Type': upstream.headers.get('content-type') || 'application/octet-stream',

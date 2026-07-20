@@ -12,7 +12,26 @@ const PASSIVE_GITHUB_SOURCE = 'https://raw.githubusercontent.com/FengYuchen1314/
 const UPDATE_INSTALLER_URL = `${PASSIVE_GITHUB_SOURCE}/scripts/install.sh`;
 const UPDATE_BUNDLE_URL = 'https://github.com/FengYuchen1314/sd-wan/archive/refs/heads/main.tar.gz';
 const COMMAND_LEASE_MS = 90_000;
+const UPDATE_SCHEDULED_TIMEOUT_MS = 15 * 60_000;
+const UPDATE_INSTALLING_STALE_MS = 10 * 60_000;
 const PRIVATE_RANGES = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'].map(parseCIDR);
+
+function normalizeReachabilityType(value, { hasPublicEndpoint } = {}) {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (raw === 'public' || raw === 'nat' || raw === 'ix') return raw;
+  if (value === undefined || value === null || value === '') {
+    return hasPublicEndpoint ? 'public' : 'nat';
+  }
+  throw new Error('节点拨入类型只能是 public（公网）、nat（纯 NAT）或 ix（交换内网）');
+}
+
+function publishesDialIn(node) {
+  return node.reachabilityType === 'public' || node.reachabilityType === 'ix';
+}
+
+function canJoinAsParent(node) {
+  return publishesDialIn(node) && node.canRelay;
+}
 
 function rangesOverlap(rangeA, rangeB) {
   return !(rangeA.broadcast < rangeB.network || rangeB.broadcast < rangeA.network);
@@ -129,13 +148,17 @@ function networkFromRow(row) {
 
 function nodeFromRow(row) {
   if (!row) return null;
+  const reachabilityType = normalizeReachabilityType(row.reachability_type, {
+    hasPublicEndpoint: Boolean(row.has_public_endpoint),
+  });
   return {
     id: row.id,
     networkId: row.network_id,
     name: row.name,
     status: row.status,
     isCenter: Boolean(row.is_center),
-    hasPublicEndpoint: Boolean(row.has_public_endpoint),
+    reachabilityType,
+    hasPublicEndpoint: reachabilityType === 'public' || reachabilityType === 'ix',
     canRelay: Boolean(row.can_relay),
     parentId: row.parent_id,
     controlIp: row.control_ip,
@@ -567,10 +590,10 @@ export class ControlService {
         id, name, data.cidr, control.cidr, listenPort, mtu, timestamp,
       );
       this.db.run(
-        `INSERT INTO nodes(id, network_id, name, status, is_center, has_public_endpoint, can_relay, parent_id, control_ip, data_ip,
+        `INSERT INTO nodes(id, network_id, name, status, is_center, reachability_type, has_public_endpoint, can_relay, parent_id, control_ip, data_ip,
           control_endpoint, control_listen_port, data_endpoint, data_listen_port, wg_control_public_key, wg_data_public_key,
           created_at, updated_at, last_seen)
-         VALUES (?, ?, ?, 'online', 1, 1, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, 'online', 1, 'public', 1, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         centerId, id, '初始节点', usableHost(control, 1), usableHost(data, 1), this.publicUrl,
         endpointDetails(this.publicUrl)?.port || 19773, centerDataEndpoint, listenPort,
         centerControlKeys.publicKey, centerDataKeys.publicKey, timestamp, timestamp, timestamp,
@@ -1109,16 +1132,20 @@ export class ControlService {
     const network = this.getNetwork(node.networkId);
     const nextName = input.name === undefined ? node.name : String(input.name).trim();
     const nextIp = input.dataIp === undefined ? node.dataIp : String(input.dataIp).trim();
-    const nextHasPublicEndpoint = input.hasPublicEndpoint === undefined
-      ? node.hasPublicEndpoint
-      : Boolean(input.hasPublicEndpoint);
-    const nextRelay = nextHasPublicEndpoint
+    const nextReachabilityType = input.reachabilityType === undefined && input.hasPublicEndpoint === undefined
+      ? node.reachabilityType
+      : normalizeReachabilityType(
+        input.reachabilityType,
+        { hasPublicEndpoint: input.hasPublicEndpoint === undefined ? node.hasPublicEndpoint : Boolean(input.hasPublicEndpoint) },
+      );
+    const nextPublishes = nextReachabilityType === 'public' || nextReachabilityType === 'ix';
+    const nextRelay = nextPublishes
       ? (input.canRelay === undefined ? node.canRelay : Boolean(input.canRelay))
       : false;
     const nextControlEndpoint = input.controlEndpoint === undefined ? node.controlEndpoint : String(input.controlEndpoint).trim() || null;
     const nextControlListenPort = normalizePort(input.controlListenPort, `${node.name} 的控制中继端口`, node.controlListenPort);
     const suppliedDataEndpoint = input.dataEndpoint === undefined ? node.dataEndpoint : String(input.dataEndpoint).trim() || null;
-    const nextDataEndpoint = nextHasPublicEndpoint ? suppliedDataEndpoint : null;
+    const nextDataEndpoint = nextPublishes ? suppliedDataEndpoint : null;
     const nextDataListenPort = normalizePort(input.dataListenPort, `${node.name} 的 WireGuard 端口`, node.dataListenPort);
     if (!nextName) throw new Error('节点名称不能为空');
     if (nextControlEndpoint) {
@@ -1129,12 +1156,17 @@ export class ControlService {
     if (nextDataEndpoint && !/^\[[0-9a-f:]+\]:\d+$|^[^\s:]+:\d+$/i.test(nextDataEndpoint)) {
       throw new Error('WireGuard 数据端点格式应为 IP或域名:端口');
     }
-    if (nextHasPublicEndpoint && !nextDataEndpoint) throw new Error('有公网入口的节点必须填写可被拨入的 WireGuard 固定端点');
+    if (nextPublishes && !nextDataEndpoint) {
+      throw new Error(nextReachabilityType === 'ix'
+        ? 'IX 节点必须填写可供同网段拨入的 WireGuard 固定端点（内网 IP:端口）'
+        : '有公网入口的节点必须填写可被拨入的 WireGuard 固定端点');
+    }
 
     const nodes = this.listNodes(node.networkId).map((item) => item.id === nodeId
       ? {
           ...item, name: nextName, dataIp: nextIp, canRelay: nextRelay,
-          hasPublicEndpoint: nextHasPublicEndpoint,
+          reachabilityType: nextReachabilityType,
+          hasPublicEndpoint: nextPublishes,
           controlEndpoint: nextControlEndpoint, controlListenPort: nextControlListenPort,
           dataEndpoint: nextDataEndpoint, dataListenPort: nextDataListenPort,
         }
@@ -1145,9 +1177,9 @@ export class ControlService {
     let versionId;
     this.db.transaction(() => {
       this.db.run(
-        `UPDATE nodes SET name = ?, data_ip = ?, can_relay = ?, has_public_endpoint = ?, control_endpoint = ?,
+        `UPDATE nodes SET name = ?, data_ip = ?, can_relay = ?, reachability_type = ?, has_public_endpoint = ?, control_endpoint = ?,
          control_listen_port = ?, data_endpoint = ?, data_listen_port = ?, updated_at = ? WHERE id = ?`,
-        nextName, node.dataIp, nextRelay ? 1 : 0, nextHasPublicEndpoint ? 1 : 0, nextControlEndpoint, nextControlListenPort,
+        nextName, node.dataIp, nextRelay ? 1 : 0, nextReachabilityType, nextPublishes ? 1 : 0, nextControlEndpoint, nextControlListenPort,
         nextDataEndpoint, nextDataListenPort, now(), nodeId,
       );
       versionId = this.createVersionInTransaction(node.networkId, dataIpChanged ? '修改节点业务地址' : '修改节点配置', compiled);
@@ -1163,8 +1195,8 @@ export class ControlService {
         if (version?.status === 'active') this.applyNetworkCidrChangeInTransaction(versionId, now());
       }
       this.audit('node.update', 'node', nodeId, {
-        before: { name: node.name, dataIp: node.dataIp, hasPublicEndpoint: node.hasPublicEndpoint, controlEndpoint: node.controlEndpoint, controlListenPort: node.controlListenPort, dataEndpoint: node.dataEndpoint, dataListenPort: node.dataListenPort },
-        after: { name: nextName, dataIp: nextIp, hasPublicEndpoint: nextHasPublicEndpoint, controlEndpoint: nextControlEndpoint, controlListenPort: nextControlListenPort, dataEndpoint: nextDataEndpoint, dataListenPort: nextDataListenPort }, versionId,
+        before: { name: node.name, dataIp: node.dataIp, reachabilityType: node.reachabilityType, hasPublicEndpoint: node.hasPublicEndpoint, controlEndpoint: node.controlEndpoint, controlListenPort: node.controlListenPort, dataEndpoint: node.dataEndpoint, dataListenPort: node.dataListenPort },
+        after: { name: nextName, dataIp: nextIp, reachabilityType: nextReachabilityType, hasPublicEndpoint: nextPublishes, controlEndpoint: nextControlEndpoint, controlListenPort: nextControlListenPort, dataEndpoint: nextDataEndpoint, dataListenPort: nextDataListenPort }, versionId,
       });
     });
     return {
@@ -1256,10 +1288,12 @@ export class ControlService {
     const parent = this.getNode(input.parentId);
     if (parent.networkId !== networkId) throw new Error('父节点不属于当前节点组');
     const mode = input.mode === 'passive' ? 'passive' : 'active';
-    if (mode === 'active' && !parent.hasPublicEndpoint) {
-      throw new Error(`节点 ${parent.name} 没有公网拨入能力，不能作为主动加入节点的父节点`);
+    if (mode === 'active' && !canJoinAsParent(parent)) {
+      throw new Error(parent.reachabilityType === 'nat'
+        ? `节点 ${parent.name} 是纯 NAT 节点，不能作为主动加入的父节点`
+        : `节点 ${parent.name} 未启用可供拨入的接入能力，不能作为主动加入的父节点`);
     }
-    if (mode === 'active' && !parent.canRelay) throw new Error('所选父节点未启用下级接入能力');
+    if (!parent.canRelay) throw new Error(mode === 'passive' ? '所选认领节点未启用下级接入能力' : '所选父节点未启用下级接入能力');
     const ttlMinutes = Math.min(1440, Math.max(5, Number(input.ttlMinutes ?? 30)));
     const token = `pwj_${randomBytes(24).toString('base64url')}`;
     const id = randomUUID();
@@ -1327,6 +1361,9 @@ export class ControlService {
     if (upstream.id === downstream.id) throw new Error('请选择两个不同节点');
     const unavailable = [upstream, downstream].find((node) => !node.isCoordinator && node.status !== 'online');
     if (unavailable) throw new Error(`节点 ${unavailable.name} 当前离线，不能开始直连验证`);
+    if (upstream.reachabilityType === 'ix' || downstream.reachabilityType === 'ix') {
+      throw new Error('IX 节点不能在拓扑中与其他节点建立后续直连；请通过“接入新节点”或主动认领完成初始链路');
+    }
 
     const duplicate = this.db.get(
       `SELECT id, validation_status FROM topology_links WHERE network_id = ?
@@ -1343,14 +1380,14 @@ export class ControlService {
 
     const upstreamAddress = String(input.nodeAAddress ?? '').trim();
     const downstreamAddress = String(input.nodeBAddress ?? '').trim();
-    if (!upstream.hasPublicEndpoint && !downstream.hasPublicEndpoint) {
+    if (!publishesDialIn(upstream) && !publishesDialIn(downstream)) {
       throw new Error('两个都没有公网入口的节点不能建立直接连接；请分别连接到具有公网入口的节点');
     }
-    const effectiveUpstreamAddress = upstream.hasPublicEndpoint
-      ? (upstreamAddress || (!downstream.hasPublicEndpoint ? hostFromEndpoint(upstream.dataEndpoint) : '') || '')
+    const effectiveUpstreamAddress = upstream.reachabilityType === 'public'
+      ? (upstreamAddress || (downstream.reachabilityType === 'nat' ? hostFromEndpoint(upstream.dataEndpoint) : '') || '')
       : '';
-    const effectiveDownstreamAddress = downstream.hasPublicEndpoint
-      ? (downstreamAddress || (!upstream.hasPublicEndpoint ? hostFromEndpoint(downstream.dataEndpoint) : '') || '')
+    const effectiveDownstreamAddress = downstream.reachabilityType === 'public'
+      ? (downstreamAddress || (upstream.reachabilityType === 'nat' ? hostFromEndpoint(downstream.dataEndpoint) : '') || '')
       : '';
     if (!effectiveUpstreamAddress && !effectiveDownstreamAddress) {
       throw new Error('至少填写一个公网节点可被对方访问的 IP 或域名');
@@ -1414,13 +1451,21 @@ export class ControlService {
       if (existingIps.has(dataIp) || existingIps.has(controlIp)) throw new Error('无法分配节点地址');
       const nodeId = randomUUID();
       const name = String(input.name || `节点-${nodeId.slice(0, 6)}`).slice(0, 80);
-      const hasPublicEndpoint = token.mode === 'passive'
-        ? true
-        : input.hasPublicEndpoint === undefined
-          ? Boolean(input.dataEndpoint)
-          : Boolean(input.hasPublicEndpoint);
-      if (hasPublicEndpoint && !input.dataEndpoint) {
-        throw new Error('声明有公网入口的节点必须提供 WireGuard 固定端点');
+      const reachabilityType = token.mode === 'passive'
+        ? 'public'
+        : normalizeReachabilityType(
+          input.reachabilityType,
+          {
+            hasPublicEndpoint: input.hasPublicEndpoint === undefined
+              ? Boolean(input.dataEndpoint)
+              : Boolean(input.hasPublicEndpoint),
+          },
+        );
+      const publishes = reachabilityType === 'public' || reachabilityType === 'ix';
+      if (publishes && !input.dataEndpoint) {
+        throw new Error(reachabilityType === 'ix'
+          ? 'IX 节点必须提供可供同网段拨入的 WireGuard 固定端点'
+          : '声明有公网入口的节点必须提供 WireGuard 固定端点');
       }
       const dataListenPort = normalizePort(
         input.dataListenPort,
@@ -1433,14 +1478,14 @@ export class ControlService {
         endpointDetails(input.controlEndpoint)?.port || 8790,
       );
       this.db.run(
-        `INSERT INTO nodes(id, network_id, name, status, is_center, has_public_endpoint, can_relay, parent_id, control_ip, data_ip,
+        `INSERT INTO nodes(id, network_id, name, status, is_center, reachability_type, has_public_endpoint, can_relay, parent_id, control_ip, data_ip,
           control_endpoint, control_listen_port, data_endpoint, data_listen_port,
           wg_control_public_key, wg_data_public_key, credential_hash,
           agent_version, last_seen, created_at, updated_at)
-         VALUES (?, ?, ?, 'online', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        nodeId, network.id, name, hasPublicEndpoint ? 1 : 0, hasPublicEndpoint ? 1 : 0, parent.id, controlIp, dataIp,
-        hasPublicEndpoint ? (input.controlEndpoint ?? null) : null, controlListenPort,
-        hasPublicEndpoint ? (input.dataEndpoint ?? null) : null, dataListenPort,
+         VALUES (?, ?, ?, 'online', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        nodeId, network.id, name, reachabilityType, publishes ? 1 : 0, publishes ? 1 : 0, parent.id, controlIp, dataIp,
+        publishes ? (input.controlEndpoint ?? null) : null, controlListenPort,
+        publishes ? (input.dataEndpoint ?? null) : null, dataListenPort,
         input.wgControlPublicKey ?? '', input.wgDataPublicKey ?? '', hashSecret(credential),
         input.agentVersion ?? '0.1.0', timestamp, timestamp, timestamp,
       );
@@ -1829,8 +1874,8 @@ export class ControlService {
     this.db.transaction(() => {
       this.db.run(
         `UPDATE nodes SET status = 'online', last_seen = ?, agent_version = COALESCE(?, agent_version),
-         control_endpoint = CASE WHEN has_public_endpoint = 1 THEN COALESCE(?, control_endpoint) ELSE NULL END,
-         data_endpoint = CASE WHEN has_public_endpoint = 1 THEN COALESCE(?, data_endpoint) ELSE NULL END,
+         control_endpoint = CASE WHEN reachability_type IN ('public', 'ix') THEN COALESCE(?, control_endpoint) ELSE NULL END,
+         data_endpoint = CASE WHEN reachability_type IN ('public', 'ix') THEN COALESCE(?, data_endpoint) ELSE NULL END,
          control_listen_port = ?, data_listen_port = ?, updated_at = ? WHERE id = ?`,
         timestamp, input.agentVersion ?? null, input.controlEndpoint ?? null, input.dataEndpoint ?? null,
         controlListenPort, dataListenPort, timestamp, nodeId,
@@ -2122,14 +2167,17 @@ export class ControlService {
 
   recoverUpdateRollouts() {
     const recovered = [];
+    const timestamp = now();
+    const scheduledBefore = new Date(Date.now() - UPDATE_SCHEDULED_TIMEOUT_MS).toISOString();
+    const installingBefore = new Date(Date.now() - UPDATE_INSTALLING_STALE_MS).toISOString();
     for (const rollout of this.db.all("SELECT * FROM update_rollouts WHERE status IN ('probing', 'distributing')")) {
       if (rollout.status === 'probing') {
         this.db.run(
           `UPDATE update_rollout_nodes SET status = 'probe-failed', error = ?, updated_at = ?
            WHERE rollout_id = ? AND status = 'probing' AND node_id IN (
-             SELECT id FROM nodes WHERE status != 'online' AND is_center = 0
+             SELECT id FROM nodes WHERE status != 'online'
            )`,
-          '节点在 GitHub 探测期间离线', now(), rollout.id,
+          '节点在 GitHub 探测期间离线', timestamp, rollout.id,
         );
         const remaining = Number(this.db.get(
           "SELECT COUNT(*) AS count FROM update_rollout_nodes WHERE rollout_id = ? AND status = 'probing'", rollout.id,
@@ -2137,7 +2185,7 @@ export class ControlService {
         if (!remaining) {
           this.db.run(
             "UPDATE update_rollouts SET status = 'failed', error = ?, completed_at = ? WHERE id = ?",
-            '所有可用节点均未取得 GitHub 更新制品', now(), rollout.id,
+            '所有可用节点均未取得 GitHub 更新制品', timestamp, rollout.id,
           );
         }
         continue;
@@ -2159,29 +2207,47 @@ export class ControlService {
         if (!migrated) {
           this.db.run(
             "UPDATE update_rollouts SET status = 'failed', error = ?, completed_at = ? WHERE id = ?",
-            '旧更新任务缺少可恢复的制品缓存，请重新点击一键更新', now(), rollout.id,
+            '旧更新任务缺少可恢复的制品缓存，请重新点击一键更新', timestamp, rollout.id,
           );
           this.db.run(
             `UPDATE update_rollout_nodes SET status = 'failed', error = ?, updated_at = ?
              WHERE rollout_id = ? AND status NOT IN ('completed', 'failed')`,
-            '更新制品缓存已丢失', now(), rollout.id,
+            '更新制品缓存已丢失', timestamp, rollout.id,
           );
           continue;
         }
       }
       this.db.run(
         `UPDATE update_rollout_nodes SET status = 'deferred', error = ?, updated_at = ?
-         WHERE rollout_id = ? AND status = 'queued' AND node_id IN (
-           SELECT id FROM nodes WHERE status != 'online' AND is_center = 0
+         WHERE rollout_id = ? AND status IN ('queued', 'installing', 'waiting') AND node_id IN (
+           SELECT id FROM nodes WHERE status != 'online'
          )`,
-        '节点离线，恢复后将继续执行已排队更新', now(), rollout.id,
+        '节点离线，恢复后将继续执行已排队更新', timestamp, rollout.id,
+      );
+      this.db.run(
+        `UPDATE update_rollout_nodes SET status = 'failed', error = ?, updated_at = ?
+         WHERE rollout_id = ? AND status = 'scheduled' AND updated_at < ?`,
+        '本机更新调度器超时未回报；请确认 pathweaver-update.path 已启用后重试', timestamp, rollout.id, scheduledBefore,
+      );
+      this.db.run(
+        `UPDATE update_rollout_nodes SET status = 'queued', error = ?, updated_at = ?
+         WHERE rollout_id = ? AND status = 'installing' AND updated_at < ? AND node_id IN (
+           SELECT id FROM nodes WHERE status = 'online'
+         )`,
+        '领取更新制品超时，已重新排队', timestamp, rollout.id, installingBefore,
+      );
+      this.db.run(
+        `UPDATE commands SET status = 'pending', claimed_at = NULL
+         WHERE status = 'running' AND type = 'install-update-bundle' AND claimed_at < ?
+           AND id IN (SELECT command_id FROM update_rollout_nodes WHERE rollout_id = ? AND status = 'queued')`,
+        installingBefore, rollout.id,
       );
       const localNode = this.listNodes(rollout.network_id).find((node) => node.isCoordinator) ||
         this.listNodes(rollout.network_id).find((node) => node.isCenter);
       if (localNode) {
         this.db.run(
           "UPDATE update_rollout_nodes SET status = 'waiting-local', error = ?, updated_at = ? WHERE rollout_id = ? AND node_id = ? AND status = 'source-ready'",
-          '等待更新制品先送达其他在线节点', now(), rollout.id, localNode.id,
+          '等待更新制品先送达其他在线节点', timestamp, rollout.id, localNode.id,
         );
       }
       this.maybeStageLocalUpdate(rollout.id);
@@ -2207,13 +2273,14 @@ export class ControlService {
       id, networkId, timestamp, timestamp,
     );
     for (const node of nodes) {
-      const canProbe = node.id === localNodeId || (!node.isCenter && node.status === 'online');
+      const isLocal = node.id === localNodeId;
+      const canProbe = isLocal || node.status === 'online';
       this.db.run(
         'INSERT INTO update_rollout_nodes(rollout_id, node_id, status, error, updated_at) VALUES (?, ?, ?, ?, ?)',
         id, node.id, canProbe ? 'probing' : 'waiting',
-        canProbe ? null : (node.isCenter ? '等待该节点自己的面板执行更新' : '节点离线，制品就绪后仍会排队'), timestamp,
+        canProbe ? null : '节点离线，制品就绪后仍会排队', timestamp,
       );
-      if (node.id !== localNodeId && !node.isCenter && node.status === 'online') {
+      if (!isLocal && node.status === 'online') {
         const command = this.enqueueCommand(node.id, 'probe-update-source', {
           rolloutId: id,
           installerUrl: UPDATE_INSTALLER_URL,
@@ -2306,7 +2373,6 @@ export class ControlService {
     }
     for (const target of networkNodes) {
       if (target.id === localNode?.id) continue;
-      if (target.isCenter) continue;
       const command = this.enqueueCommand(target.id, 'install-update-bundle', {
         rolloutId,
         bundleSha256: artifact.bundleSha256,
@@ -2386,8 +2452,21 @@ export class ControlService {
     ).map((row) => this.getUpdateRollout(row.id));
   }
 
+  getUpdateArtifactForAgent(nodeId, rolloutId) {
+    const row = this.db.get(
+      'SELECT * FROM update_rollout_nodes WHERE rollout_id = ? AND node_id = ?', rolloutId, nodeId,
+    );
+    if (!row) throw new Error('节点不属于该更新任务');
+    const rollout = this.db.get('SELECT * FROM update_rollouts WHERE id = ?', rolloutId);
+    if (!rollout || !['distributing', 'partial', 'completed'].includes(rollout.status)) {
+      throw new Error('更新制品尚未就绪');
+    }
+    if (['failed', 'probe-failed'].includes(row.status)) throw new Error('该节点的更新任务已失败');
+    return this.readUpdateArtifact(rolloutId);
+  }
+
   claimCommand(nodeId) {
-    const claimed = this.db.transaction(() => {
+    return this.db.transaction(() => {
       const staleBefore = new Date(Date.now() - COMMAND_LEASE_MS).toISOString();
       this.db.run(
         "UPDATE commands SET status = 'pending', claimed_at = NULL WHERE node_id = ? AND status = 'running' AND claimed_at < ?",
@@ -2398,6 +2477,7 @@ export class ControlService {
       this.db.run("UPDATE commands SET status = 'running', claimed_at = ? WHERE id = ?", now(), row.id);
       const payload = JSON.parse(row.payload_json);
       if (row.type === 'install-update-bundle') {
+        this.readUpdateArtifact(payload.rolloutId);
         this.db.run(
           "UPDATE update_rollout_nodes SET status = 'installing', error = NULL, updated_at = ? WHERE rollout_id = ? AND node_id = ?",
           now(), payload.rolloutId, nodeId,
@@ -2405,10 +2485,6 @@ export class ControlService {
       }
       return { id: row.id, type: row.type, payload, createdAt: row.created_at };
     });
-    if (claimed?.type === 'install-update-bundle') {
-      claimed.payload = { ...claimed.payload, ...this.readUpdateArtifact(claimed.payload.rolloutId) };
-    }
-    return claimed;
   }
 
   completeCommand(nodeId, commandId, input) {

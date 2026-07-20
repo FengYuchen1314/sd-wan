@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   name TEXT NOT NULL,
   status TEXT NOT NULL,
   is_center INTEGER NOT NULL DEFAULT 0,
+  reachability_type TEXT NOT NULL DEFAULT 'nat',
   has_public_endpoint INTEGER NOT NULL DEFAULT 0,
   can_relay INTEGER NOT NULL DEFAULT 1,
   parent_id TEXT REFERENCES nodes(id),
@@ -345,6 +346,10 @@ export class Database {
       this.handle.exec('UPDATE nodes SET has_public_endpoint = 1 WHERE is_center = 1');
       this.handle.exec('UPDATE nodes SET can_relay = 0 WHERE is_center = 0');
     }
+    if (!nodeColumns.has('reachability_type')) {
+      this.handle.exec("ALTER TABLE nodes ADD COLUMN reachability_type TEXT NOT NULL DEFAULT 'nat'");
+      this.handle.exec("UPDATE nodes SET reachability_type = CASE WHEN has_public_endpoint = 1 THEN 'public' ELSE 'nat' END");
+    }
     const proxyColumns = new Set(this.handle.prepare('PRAGMA table_info(managed_node_proxies)').all().map((column) => column.name));
     if (!proxyColumns.has('relay_path_json')) {
       this.handle.exec("ALTER TABLE managed_node_proxies ADD COLUMN relay_path_json TEXT NOT NULL DEFAULT '[]'");
@@ -454,6 +459,9 @@ export class Database {
             : snapshotRow;
           if (table === 'nodes' && !Object.hasOwn(row, 'has_public_endpoint')) {
             row = { ...row, has_public_endpoint: row.is_center ? 1 : 0 };
+          }
+          if (table === 'nodes' && !Object.hasOwn(row, 'reachability_type')) {
+            row = { ...row, reachability_type: row.has_public_endpoint ? 'public' : 'nat' };
           }
           const keys = Object.keys(row);
           if (!keys.length || keys.some((key) => !allowed.has(key))) throw new Error(`协调快照中的 ${table} 字段无效`);

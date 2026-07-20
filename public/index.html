@@ -93,11 +93,17 @@
       <div class="form-grid">
         <label class="span-2">节点名称<input name="name" required></label>
         <label class="span-2">业务内网 IP<input name="dataIp" required inputmode="decimal"></label>
-        <label class="toggle-line span-2"><input name="hasPublicEndpoint" type="checkbox"><span>本节点有可供其他节点主动拨入的公网入口</span></label>
+        <label class="span-2">拨入类型
+          <select name="reachabilityType">
+            <option value="public">公网可拨入</option>
+            <option value="nat">纯 NAT（仅主动拨出）</option>
+            <option value="ix">IX（内网入口，可接入新节点，不可后续建拓扑链路）</option>
+          </select>
+        </label>
         <label>接入中继地址<input name="controlEndpoint" placeholder="http://公网或内网IP:8790"></label>
         <label>控制中继 TCP 端口<input name="controlListenPort" type="number" min="1" max="65535" required></label>
         <label>WireGuard 监听端口<input name="dataListenPort" type="number" min="1" max="65535" required></label>
-        <label>供其他节点拨入的 WireGuard 固定端点<input name="dataEndpoint" placeholder="公网或内网IP:19801；NAT 后可留空"></label>
+        <label>供其他节点拨入的 WireGuard 固定端点<input name="dataEndpoint" placeholder="公网IP:19801 或 IX 内网IP:19801"></label>
         <label class="toggle-line span-2"><input name="canRelay" type="checkbox"><span>允许作为下级节点的接入和控制中继</span></label>
       </div>
       <div class="notice warning"><strong>版本化变更</strong><span>保存后将生成全网配置版本。新 IP、下一跳和所有相关 AllowedIPs 会一起下发。</span></div>
@@ -119,13 +125,13 @@
         <label><span id="node-b-port-label">节点 B 固定入口端口</span><input name="nodeBPort" type="number" min="1" max="65535" required></label>
         <label class="span-2">路径优先级<input name="priority" type="number" min="0" value="10"><small>数字越小越优先；新直连通常会成为两节点之间的首选路径。</small></label>
       </div>
-      <div class="notice" id="connection-capability-note"><strong>按公网能力确定拨号方向</strong><span>无公网节点的一侧不会发布端口，只能主动拨号公网节点。两个无公网节点之间不允许建立直接连接。</span></div>
+      <div class="notice" id="connection-capability-note"><strong>按拨入类型确定拨号方向</strong><span>纯 NAT 只能主动拨号公网节点；IX 不能在拓扑中建立后续直连，请用接入命令或主动认领。</span></div>
       <p class="form-error" data-form-error></p>
       <div class="modal-actions"><button class="button ghost" value="cancel">取消</button><button class="button primary" value="default">开始连通性探测</button></div>
     </form>
   </dialog>
 
   <div id="toast-region" class="toast-region" aria-live="assertive"></div>
-  <script type="module" src="/app.js?v=22"></script>
+  <script type="module" src="/app.js?v=23"></script>
 </body>
 </html>

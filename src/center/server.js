@@ -813,6 +813,10 @@ async function handleAgent(req, res, pathname, url) {
     const command = service.claimCommand(node.id);
     return command ? send(res, 200, command) : send(res, 204);
   }
+  params = match(pathname, '/agent/v1/update-artifacts/:rolloutId');
+  if (req.method === 'GET' && params) {
+    return send(res, 200, service.getUpdateArtifactForAgent(node.id, params.rolloutId));
+  }
   params = match(pathname, '/agent/v1/commands/:id/complete');
   if (req.method === 'POST' && params) {
     return send(res, 200, service.completeCommand(node.id, params.id, await readJson(req, 24 * 1_048_576)));

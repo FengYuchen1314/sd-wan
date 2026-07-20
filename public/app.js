@@ -193,7 +193,7 @@ function nodeTable(nodes, editable = true) {
       <span class="mono">${escapeHtml(node.dataIp)}${pendingAddresses.has(node.id) && pendingAddresses.get(node.id) !== node.dataIp
         ? `<small class="pending-ip">→ ${escapeHtml(pendingAddresses.get(node.id))}</small>` : ''}</span>
       <span class="mono">${escapeHtml(node.controlIp)}</span>
-      <span><span class="status ${escapeHtml(node.status)}">${node.status === 'online' ? '在线' : escapeHtml(node.status)}</span><small>${node.hasPublicEndpoint ? '公网可拨入' : '仅主动拨出'}</small></span>
+      <span><span class="status ${escapeHtml(node.status)}">${node.status === 'online' ? '在线' : escapeHtml(node.status)}</span><small>${escapeHtml(reachabilityLabel(node))}</small></span>
       ${editable ? `<button class="button ghost small edit-node" data-id="${node.id}">编辑</button>` : '<span></span>'}
     </div>`).join('')}
   </div>`;
@@ -710,11 +710,27 @@ async function disablePathPolicy() {
   } catch (error) { toast(error.message, 'error'); }
 }
 
+function reachabilityTypeOf(node) {
+  return node?.reachabilityType || (node?.hasPublicEndpoint ? 'public' : 'nat');
+}
+
+function reachabilityLabel(node) {
+  const type = reachabilityTypeOf(node);
+  if (type === 'ix') return 'IX 内网入口';
+  if (type === 'public') return '公网可拨入';
+  return '仅主动拨出';
+}
+
+function canJoinAsParent(node) {
+  const type = reachabilityTypeOf(node);
+  return Boolean(node?.canRelay && (type === 'public' || type === 'ix'));
+}
+
 function renderJoin() {
   const result = state.joinResult;
   const mode = state.joinMode || result?.mode || 'active';
   const nodes = state.topology.nodes.filter((node) => node.status === 'online' && (
-    mode === 'passive' || (node.canRelay && node.hasPublicEndpoint)
+    mode === 'passive' ? node.canRelay : canJoinAsParent(node)
   ));
   const selectedParent = nodes.find((node) => node.id === (state.joinParentId || result?.parent?.id)) || nodes[0];
   const parentConnection = controlConnection(selectedParent);
@@ -723,7 +739,7 @@ function renderJoin() {
     <article class="card"><div class="card-head"><div><h2>生成安装命令</h2><p>${mode === 'passive' ? '选择负责主动连接待认领设备的已入网节点' : '选择新设备实际能够访问的接入节点'}</p></div></div>
       <form class="card-body form-stack" id="join-form">
         <div class="segmented"><label><input type="radio" name="mode" value="active" ${mode === 'active' ? 'checked' : ''}><span>设备主动加入</span></label><label><input type="radio" name="mode" value="passive" ${mode === 'passive' ? 'checked' : ''}><span>已入网节点主动认领</span></label></div>
-        <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '新设备主动拨号公网父节点'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。' : '安装时会询问新设备是否有公网入口。无公网设备不需要填写 WireGuard 端口，系统仅保留本地随机监听并由它主动拨号父节点。'}</span></div>
+        <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '新设备主动拨号可接入父节点'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。公网与 IX 节点均可发起认领。' : '安装时会询问拨入类型：公网、纯 NAT 或 IX。纯 NAT 不发布入口；IX 填内网 IP，可继续接入新节点，但不能在拓扑中建立后续直连。'}</span></div>
         <label>${mode === 'passive' ? '执行认领的已入网节点' : '接入节点'}<select name="parentId">${nodes.map((node) => {
           const connection = controlConnection(node);
           const dataConnection = wireGuardConnection(node, connection.host);
@@ -957,11 +973,14 @@ function syncConnectionEndpointInputs(form) {
 }
 
 function syncNodePublicFields(form) {
-  const enabled = form.elements.hasPublicEndpoint.checked;
+  const type = form.elements.reachabilityType.value;
+  const enabled = type === 'public' || type === 'ix';
   form.elements.controlEndpoint.disabled = !enabled;
   form.elements.dataEndpoint.disabled = !enabled;
   form.elements.dataEndpoint.required = enabled;
   form.elements.canRelay.disabled = !enabled;
+  form.elements.dataEndpoint.placeholder = type === 'ix' ? '内网 IP:19801' : '公网 IP 或域名:19801';
+  form.elements.controlEndpoint.placeholder = type === 'ix' ? 'http://内网IP:8790' : 'http://公网或内网IP:8790';
   if (!enabled) {
     form.elements.controlEndpoint.value = '';
     form.elements.dataEndpoint.value = '';
@@ -978,35 +997,39 @@ function openConnectionDialog() {
       (link.upstreamId === nodeB.id && link.downstreamId === nodeA.id)
     ));
   if (existing) return toast('这两个节点之间已经存在连接或正在验证', 'error');
-  if (!nodeA.hasPublicEndpoint && !nodeB.hasPublicEndpoint) {
+  if (reachabilityTypeOf(nodeA) === 'ix' || reachabilityTypeOf(nodeB) === 'ix') {
+    return toast('IX 节点不能在拓扑中建立后续直连；请通过接入命令或主动认领完成初始链路', 'error');
+  }
+  if (reachabilityTypeOf(nodeA) !== 'public' && reachabilityTypeOf(nodeB) !== 'public') {
     return toast('两个节点都没有公网入口，不能建立直接连接', 'error');
   }
   const form = document.querySelector('#connection-form');
   form.elements.nodeAId.value = nodeA.id;
   form.elements.nodeBId.value = nodeB.id;
-  form.elements.nodeAAddress.value = nodeA.hasPublicEndpoint ? wireGuardConnection(nodeA).host : '';
-  form.elements.nodeBAddress.value = nodeB.hasPublicEndpoint ? wireGuardConnection(nodeB).host : '';
+  form.elements.nodeAAddress.value = reachabilityTypeOf(nodeA) === 'public' ? wireGuardConnection(nodeA).host : '';
+  form.elements.nodeBAddress.value = reachabilityTypeOf(nodeB) === 'public' ? wireGuardConnection(nodeB).host : '';
   form.elements.nodeAPort.value = reachablePort(nodeA);
   form.elements.nodeBPort.value = reachablePort(nodeB);
   syncConnectionEndpointInputs(form);
   for (const [node, suffix] of [[nodeA, 'A'], [nodeB, 'B']]) {
     const address = form.elements[`node${suffix}Address`];
     const port = form.elements[`node${suffix}Port`];
-    address.disabled = !node.hasPublicEndpoint;
-    port.disabled = !node.hasPublicEndpoint;
-    address.placeholder = node.hasPublicEndpoint ? '公网 IP 或域名' : '无公网：此侧不发布入口';
+    const isPublic = reachabilityTypeOf(node) === 'public';
+    address.disabled = !isPublic;
+    port.disabled = !isPublic;
+    address.placeholder = isPublic ? '公网 IP 或域名' : '无公网：此侧不发布入口';
   }
   form.elements.priority.value = 10;
   document.querySelector('#connection-pair').innerHTML = `<strong>${escapeHtml(nodeA.name)}</strong><span>↔</span><strong>${escapeHtml(nodeB.name)}</strong>`;
-  document.querySelector('#node-a-address-label').textContent = nodeA.hasPublicEndpoint
+  document.querySelector('#node-a-address-label').textContent = reachabilityTypeOf(nodeA) === 'public'
     ? `${nodeA.name} 的公网 IP 或域名`
     : `${nodeA.name} 无公网入口（仅主动拨出）`;
-  document.querySelector('#node-b-address-label').textContent = nodeB.hasPublicEndpoint
+  document.querySelector('#node-b-address-label').textContent = reachabilityTypeOf(nodeB) === 'public'
     ? `${nodeB.name} 的公网 IP 或域名`
     : `${nodeB.name} 无公网入口（仅主动拨出）`;
-  document.querySelector('#connection-capability-note').innerHTML = nodeA.hasPublicEndpoint && nodeB.hasPublicEndpoint
+  document.querySelector('#connection-capability-note').innerHTML = reachabilityTypeOf(nodeA) === 'public' && reachabilityTypeOf(nodeB) === 'public'
     ? '<strong>两端均可被拨入</strong><span>系统会执行双向探测；任一方向成功即可建链，失败方向会被丢弃。</span>'
-    : `<strong>固定单向拨号</strong><span>${escapeHtml(nodeA.hasPublicEndpoint ? nodeB.name : nodeA.name)} 将主动拨号 ${escapeHtml(nodeA.hasPublicEndpoint ? nodeA.name : nodeB.name)}；NAT 出口端口由 WireGuard 握手动态学习。</span>`;
+    : `<strong>固定单向拨号</strong><span>${escapeHtml(reachabilityTypeOf(nodeA) === 'public' ? nodeB.name : nodeA.name)} 将主动拨号 ${escapeHtml(reachabilityTypeOf(nodeA) === 'public' ? nodeA.name : nodeB.name)}；NAT 出口端口由 WireGuard 握手动态学习。</span>`;
   form.querySelector('[data-form-error]').textContent = '';
   document.querySelector('#connection-dialog').showModal();
 }
@@ -1022,7 +1045,7 @@ function openNode(id) {
   form.elements.dataEndpoint.value = node.dataEndpoint || '';
   form.elements.dataListenPort.value = reachablePort(node);
   form.elements.canRelay.checked = node.canRelay;
-  form.elements.hasPublicEndpoint.checked = node.hasPublicEndpoint;
+  form.elements.reachabilityType.value = reachabilityTypeOf(node);
   syncNodePublicFields(form);
   const deleteButton = document.querySelector('#delete-node');
   deleteButton.disabled = node.isCoordinator;
@@ -1195,14 +1218,15 @@ document.querySelector('#node-form').addEventListener('submit', async (event) =>
   const form = new FormData(event.currentTarget);
   const error = event.currentTarget.querySelector('[data-form-error]');
   try {
-    const hasPublicEndpoint = event.currentTarget.elements.hasPublicEndpoint.checked;
+    const reachabilityType = event.currentTarget.elements.reachabilityType.value;
+    const publishes = reachabilityType === 'public' || reachabilityType === 'ix';
     const result = await api(`/api/v1/nodes/${form.get('nodeId')}`, {
       method: 'PATCH',
       body: JSON.stringify({
-        name: form.get('name'), dataIp: form.get('dataIp'), hasPublicEndpoint,
-        controlEndpoint: hasPublicEndpoint ? event.currentTarget.elements.controlEndpoint.value : '',
+        name: form.get('name'), dataIp: form.get('dataIp'), reachabilityType,
+        controlEndpoint: publishes ? event.currentTarget.elements.controlEndpoint.value : '',
         controlListenPort: Number(form.get('controlListenPort')),
-        dataEndpoint: hasPublicEndpoint ? event.currentTarget.elements.dataEndpoint.value : '',
+        dataEndpoint: publishes ? event.currentTarget.elements.dataEndpoint.value : '',
         dataListenPort: Number(form.get('dataListenPort')),
         canRelay: form.get('canRelay') === 'on',
       }),
@@ -1213,7 +1237,7 @@ document.querySelector('#node-form').addEventListener('submit', async (event) =>
   } catch (reason) { error.textContent = reason.message; }
 });
 document.querySelector('#delete-node').addEventListener('click', deleteSelectedNode);
-document.querySelector('#node-form [name="hasPublicEndpoint"]').addEventListener('change', (event) => {
+document.querySelector('#node-form [name="reachabilityType"]').addEventListener('change', (event) => {
   syncNodePublicFields(event.currentTarget.form);
 });
 
