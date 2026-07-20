@@ -1,6 +1,7 @@
 import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
 import { containsIPv4, parseCIDR, parseIPv4, usableHost } from '../core/ipv4.js';
 import { enumerateSimplePaths } from '../core/paths.js';
+import { isActiveJoinLink, remoteEndpointForSource, resolveLinkEndpoints } from '../core/link-endpoints.js';
 import { validateAndCompileTopology } from '../core/topology.js';
 
 const now = () => new Date().toISOString();
@@ -106,12 +107,23 @@ function hostFromEndpoint(endpoint) {
   return port ? endpointHost(value) : value;
 }
 
-function controlHopUrl(node, link, nodeId) {
-  const linkEndpoint = link.upstreamId === nodeId ? link.upstreamEndpoint : link.downstreamEndpoint;
+function controlHopUrl(node, link, nodeId, nodeById) {
+  const upstream = nodeById?.get(link.upstreamId);
+  const downstream = nodeById?.get(link.downstreamId);
+  const resolved = upstream && downstream
+    ? resolveLinkEndpoints(link, upstream, downstream)
+    : {
+      upstreamEndpoint: link.upstreamEndpoint || null,
+      downstreamEndpoint: link.downstreamEndpoint || null,
+    };
+  const linkEndpoint = link.upstreamId === nodeId ? resolved.upstreamEndpoint : resolved.downstreamEndpoint;
   // 链路明确写了拨号地址时才能反向访问。IX/NAT 的自报入口只给新节点主动加入用，
   // 它们上行仍走 NAT 出口，不能当成可被上游主动拨入的控制地址。
   const linkedHost = hostFromEndpoint(linkEndpoint);
   if (linkedHost) return `http://${linkedHost}:${node.controlListenPort || 8790}`;
+  if (upstream && downstream && nodeId === downstream.id && isActiveJoinLink(link, upstream, downstream)) {
+    return null;
+  }
   if (node.reachabilityType !== 'public') return null;
   const publishedHost = hostFromEndpoint(node.dataEndpoint);
   if (publishedHost) return `http://${publishedHost}:${node.controlListenPort || 8790}`;
@@ -206,7 +218,7 @@ function compileControlPlans(nodes, links, coordinatorId, voterIds = []) {
       else if (link.downstreamId === source.id) peerId = link.upstreamId;
       if (!peerId) continue;
       const peer = nodeById.get(peerId);
-      const url = peer ? controlHopUrl(peer, link, peerId) : null;
+      const url = peer ? controlHopUrl(peer, link, peerId, nodeById) : null;
       if (url) forwarders[peerId] = url;
     }
 
@@ -233,7 +245,7 @@ function compileControlPlans(nodes, links, coordinatorId, voterIds = []) {
             const previousNodeId = path.nodeIds[index];
             const link = linkForPair(links, previousNodeId, nodeId);
             const node = nodeById.get(nodeId);
-            const url = link && node ? controlHopUrl(node, link, nodeId) : null;
+            const url = link && node ? controlHopUrl(node, link, nodeId, nodeById) : null;
             return url ? { nodeId, url } : null;
           });
           if (hops.some((hop) => !hop)) return null;
@@ -265,13 +277,16 @@ function applyPreferredPath(compiled, state, pathNodeIds) {
     const nextHop = nodeById.get(nextHopId);
     const link = linkForPair(state.links, sourceId, nextHopId);
     if (!config || !nextHop || !link) continue;
+    const upstream = nodeById.get(link.upstreamId);
+    const downstream = nodeById.get(link.downstreamId);
     for (const peer of config.data.peers) {
       peer.allowedIps = peer.allowedIps.filter((cidr) => cidr !== destinationCidr);
     }
     let peer = config.data.peers.find((item) => item.nodeId === nextHopId);
     if (!peer) {
-      const endpoint = link.upstreamId === sourceId ? link.downstreamEndpoint : link.upstreamEndpoint;
-      const staticEndpoint = endpoint || null;
+      const staticEndpoint = upstream && downstream
+        ? remoteEndpointForSource(link, sourceId, upstream, downstream)
+        : (link.upstreamId === sourceId ? link.downstreamEndpoint : link.upstreamEndpoint) || null;
       peer = {
         nodeId: nextHopId,
         name: nextHop.name,
@@ -295,15 +310,19 @@ function applyPreferredPath(compiled, state, pathNodeIds) {
 function attachFailedLinkHealthPeers(compiled, state, failedLinkIds) {
   const nodeById = new Map(state.nodes.map((node) => [node.id, node]));
   for (const link of state.links.filter((item) => failedLinkIds.has(item.id))) {
-    for (const [sourceId, peerId, explicitEndpoint] of [
-      [link.upstreamId, link.downstreamId, link.downstreamEndpoint],
-      [link.downstreamId, link.upstreamId, link.upstreamEndpoint],
+    const upstream = nodeById.get(link.upstreamId);
+    const downstream = nodeById.get(link.downstreamId);
+    for (const [sourceId, peerId] of [
+      [link.upstreamId, link.downstreamId],
+      [link.downstreamId, link.upstreamId],
     ]) {
       const config = compiled.configs[sourceId];
       const peerNode = nodeById.get(peerId);
       if (!config || !peerNode) continue;
       if (!config.data.peers.some((peer) => peer.nodeId === peerId)) {
-        const staticEndpoint = explicitEndpoint || null;
+        const staticEndpoint = upstream && downstream
+          ? remoteEndpointForSource(link, sourceId, upstream, downstream)
+          : null;
         config.data.peers.push({
           nodeId: peerId,
           name: peerNode.name,

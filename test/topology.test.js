@@ -78,3 +78,41 @@ test('拒绝孤立节点、自连接和重复 IP', () => {
   });
   assert.ok(Object.values(dynamicOnly.configs).every((config) => config.data.peers[0].endpointMode === 'dynamic-learn'));
 });
+
+function childNode(id, offset, parentId) {
+  return {
+    id, name: id.toUpperCase(), parentId, dataIp: `10.77.0.${offset}`, controlIp: `10.254.0.${offset}`,
+    wgDataPublicKey: `${id}`.padEnd(44, '='), dataEndpoint: `${id}.example:51820`,
+    reachabilityType: 'public', hasPublicEndpoint: true,
+  };
+}
+
+test('主动加入的父子链路强制父节点动态学习，即使子节点声明公网', () => {
+  const nodes = [node('a', 1), childNode('b', 2, 'a')];
+  const result = validateAndCompileTopology({
+    network,
+    nodes,
+    links: [{
+      upstreamId: 'a', downstreamId: 'b', priority: 100,
+      upstreamEndpoint: '203.0.113.1:51820', downstreamEndpoint: '',
+    }],
+  });
+  assert.equal(result.configs.a.data.peers[0].endpoint, null);
+  assert.equal(result.configs.a.data.peers[0].endpointMode, 'dynamic-learn');
+  assert.equal(result.configs.b.data.peers[0].endpoint, '203.0.113.1:51820');
+  assert.equal(result.configs.b.data.peers[0].endpointMode, 'static-dial');
+});
+
+test('主动加入链路会清空误写的子节点公网 Endpoint', () => {
+  const nodes = [node('a', 1), childNode('b', 2, 'a')];
+  const result = validateAndCompileTopology({
+    network,
+    nodes,
+    links: [{
+      upstreamId: 'a', downstreamId: 'b', priority: 100,
+      upstreamEndpoint: '203.0.113.1:51820', downstreamEndpoint: 'b.example:51820',
+    }],
+  });
+  assert.equal(result.configs.a.data.peers[0].endpoint, null);
+  assert.equal(result.configs.a.data.peers[0].endpointMode, 'dynamic-learn');
+});

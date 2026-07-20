@@ -1,4 +1,5 @@
 import { assertUsableHost } from './ipv4.js';
+import { resolveLinkEndpoints } from './link-endpoints.js';
 
 export class TopologyError extends Error {
   constructor(message, details = {}) {
@@ -96,13 +97,11 @@ export function validateAndCompileTopology({ network, nodes, links }) {
     if (linkKeys.has(key)) throw new TopologyError('两个节点之间存在重复连接', { link });
     linkKeys.add(key);
     const priority = Number.isInteger(Number(link.priority)) ? Math.max(0, Number(link.priority)) : 100;
-    const endpointFallback = (node) => (node.reachabilityType === 'public' ? (node.dataEndpoint ?? null) : null);
-    const upstreamEndpoint = link.upstreamEndpoint === undefined
-      ? endpointFallback(nodeById.get(upstreamId))
-      : link.upstreamEndpoint || null;
-    const downstreamEndpoint = link.downstreamEndpoint === undefined
-      ? endpointFallback(nodeById.get(downstreamId))
-      : link.downstreamEndpoint || null;
+    const { upstreamEndpoint, downstreamEndpoint } = resolveLinkEndpoints(
+      link,
+      nodeById.get(upstreamId),
+      nodeById.get(downstreamId),
+    );
     const normalized = {
       ...(link.id ? { id: link.id } : {}),
       upstreamId,

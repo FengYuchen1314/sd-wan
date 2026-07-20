@@ -244,6 +244,68 @@ test('选择边缘父节点时强制携带新设备可达的中继地址', () =>
   } finally { database.close(); }
 });
 
+test('公网子节点通过边缘父节点主动加入时，父节点仍动态学习子节点 Endpoint', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const edgeToken = service.createJoinToken(network.id, { parentId: center.id });
+    const edge = service.registerAgent({
+      token: edgeToken.token,
+      name: '边缘 A',
+      wgDataPublicKey: 'a'.repeat(44),
+      dataEndpoint: '192.168.8.20:51820',
+      controlEndpoint: 'http://192.168.8.20:8790',
+    }).node;
+    const childToken = service.createJoinToken(network.id, {
+      parentId: edge.id,
+      parentHost: '192.168.8.20',
+      parentPort: 8790,
+      parentDataHost: '192.168.8.20',
+      parentDataPort: 51820,
+    });
+    const child = service.registerAgent({
+      token: childToken.token,
+      name: '公网子节点 B',
+      wgDataPublicKey: 'b'.repeat(44),
+      dataEndpoint: '203.0.113.50:51820',
+    });
+    assert.equal(child.node.parentId, edge.id);
+    assert.equal(child.node.reachabilityType, 'public');
+    const joinLink = service.listLinks(network.id).find((link) =>
+      link.upstreamId === edge.id && link.downstreamId === child.node.id);
+    assert.equal(joinLink.downstreamEndpoint, '');
+
+    const edgeConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', child.versionId, edge.id,
+    ).config_json);
+    const childConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', child.versionId, child.node.id,
+    ).config_json);
+    assert.equal(edgeConfig.data.peers.find((peer) => peer.nodeId === child.node.id).endpoint, null);
+    assert.equal(edgeConfig.data.peers.find((peer) => peer.nodeId === child.node.id).endpointMode, 'dynamic-learn');
+    assert.equal(childConfig.data.peers.find((peer) => peer.nodeId === edge.id).endpoint, '192.168.8.20:51820');
+    assert.equal(childConfig.data.peers.find((peer) => peer.nodeId === edge.id).endpointMode, 'static-dial');
+
+    const runtime = service.getClusterRuntime(network.id, edge.id);
+    assert.equal(runtime.control.forwarders[child.node.id], undefined);
+
+    database.run(
+      'UPDATE topology_links SET downstream_endpoint = ? WHERE id = ?',
+      '203.0.113.50:51820', joinLink.id,
+    );
+    database.migrate();
+    assert.equal(service.listLinks(network.id).find((link) => link.id === joinLink.id).downstreamEndpoint, '');
+    let versionId;
+    database.transaction(() => {
+      versionId = service.createVersionInTransaction(network.id, '修复主动加入 Endpoint 语义');
+    });
+    const regenerated = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', versionId, edge.id,
+    ).config_json);
+    assert.equal(regenerated.data.peers.find((peer) => peer.nodeId === child.node.id).endpoint, null);
+    assert.equal(regenerated.data.peers.find((peer) => peer.nodeId === child.node.id).endpointMode, 'dynamic-learn');
+  } finally { database.close(); }
+});
+
 test('可视化新增连接必须经两个节点准备和双向探测后激活', () => {
   const { database, service, network, center } = fixture();
   try {

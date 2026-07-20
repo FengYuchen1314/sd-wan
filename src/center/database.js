@@ -333,6 +333,19 @@ export class Database {
           endpoint_semantics_version = 1
       WHERE endpoint_semantics_version = 0
     `);
+    this.handle.exec(`
+      UPDATE topology_links
+      SET downstream_endpoint = ''
+      WHERE EXISTS (
+        SELECT 1 FROM nodes child
+        WHERE child.id = topology_links.downstream_id
+          AND child.parent_id = topology_links.upstream_id
+      )
+      AND upstream_endpoint IS NOT NULL
+      AND upstream_endpoint != ''
+      AND downstream_endpoint IS NOT NULL
+      AND downstream_endpoint != ''
+    `);
 
     const nodeColumns = new Set(this.handle.prepare('PRAGMA table_info(nodes)').all().map((column) => column.name));
     if (!nodeColumns.has('control_listen_port')) {
