@@ -96,11 +96,12 @@ export function validateAndCompileTopology({ network, nodes, links }) {
     if (linkKeys.has(key)) throw new TopologyError('两个节点之间存在重复连接', { link });
     linkKeys.add(key);
     const priority = Number.isInteger(Number(link.priority)) ? Math.max(0, Number(link.priority)) : 100;
+    const endpointFallback = (node) => (node.reachabilityType === 'public' ? (node.dataEndpoint ?? null) : null);
     const upstreamEndpoint = link.upstreamEndpoint === undefined
-      ? nodeById.get(upstreamId).dataEndpoint ?? null
+      ? endpointFallback(nodeById.get(upstreamId))
       : link.upstreamEndpoint || null;
     const downstreamEndpoint = link.downstreamEndpoint === undefined
-      ? nodeById.get(downstreamId).dataEndpoint ?? null
+      ? endpointFallback(nodeById.get(downstreamId))
       : link.downstreamEndpoint || null;
     const normalized = {
       ...(link.id ? { id: link.id } : {}),

@@ -54,16 +54,23 @@ function formatDate(value) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${state.token}`,
-      ...(options.headers || {}),
-    },
-  });
+  let response;
+  try {
+    response = await fetch(path, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${state.token}`,
+        ...(options.headers || {}),
+      },
+    });
+  } catch (error) {
+    throw new Error(error?.message === 'Failed to fetch'
+      ? '无法连接本机面板或控制面（网络中断、协调节点不可写，或请求在快照同步时超时）。请刷新后重试'
+      : (error?.message || '请求失败'));
+  }
   if (response.status === 204) return null;
-  const result = await response.json();
+  const result = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(result.error || `HTTP ${response.status}`);
     error.details = result.details;
@@ -716,7 +723,7 @@ function reachabilityTypeOf(node) {
 
 function reachabilityLabel(node) {
   const type = reachabilityTypeOf(node);
-  if (type === 'ix') return 'IX 内网入口';
+  if (type === 'ix') return 'IX（上行 NAT）';
   if (type === 'public') return '公网可拨入';
   return '仅主动拨出';
 }
@@ -739,7 +746,7 @@ function renderJoin() {
     <article class="card"><div class="card-head"><div><h2>生成安装命令</h2><p>${mode === 'passive' ? '选择负责主动连接待认领设备的已入网节点' : '选择新设备实际能够访问的接入节点'}</p></div></div>
       <form class="card-body form-stack" id="join-form">
         <div class="segmented"><label><input type="radio" name="mode" value="active" ${mode === 'active' ? 'checked' : ''}><span>设备主动加入</span></label><label><input type="radio" name="mode" value="passive" ${mode === 'passive' ? 'checked' : ''}><span>已入网节点主动认领</span></label></div>
-        <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '新设备主动拨号可接入父节点'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。公网与 IX 节点均可发起认领。' : '安装时会询问拨入类型：公网、纯 NAT 或 IX。纯 NAT 不发布入口；IX 填内网 IP，可继续接入新节点，但不能在拓扑中建立后续直连。'}</span></div>
+        <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '新设备主动拨号可接入父节点'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。公网与 IX 节点均可发起认领。' : '安装时会询问拨入类型：公网、纯 NAT 或 IX。IX 只发布给新节点用的内网入口，自身上行仍按 NAT；不能在拓扑中建立后续直连。'}</span></div>
         <label>${mode === 'passive' ? '执行认领的已入网节点' : '接入节点'}<select name="parentId">${nodes.map((node) => {
           const connection = controlConnection(node);
           const dataConnection = wireGuardConnection(node, connection.host);
@@ -979,8 +986,8 @@ function syncNodePublicFields(form) {
   form.elements.dataEndpoint.disabled = !enabled;
   form.elements.dataEndpoint.required = enabled;
   form.elements.canRelay.disabled = !enabled;
-  form.elements.dataEndpoint.placeholder = type === 'ix' ? '内网 IP:19801' : '公网 IP 或域名:19801';
-  form.elements.controlEndpoint.placeholder = type === 'ix' ? 'http://内网IP:8790' : 'http://公网或内网IP:8790';
+  form.elements.dataEndpoint.placeholder = type === 'ix' ? '供新节点拨入的内网 IP:端口' : '公网 IP 或域名:19801';
+  form.elements.controlEndpoint.placeholder = type === 'ix' ? 'http://内网IP:中继端口' : 'http://公网或内网IP:8790';
   if (!enabled) {
     form.elements.controlEndpoint.value = '';
     form.elements.dataEndpoint.value = '';

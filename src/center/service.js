@@ -109,8 +109,13 @@ function hostFromEndpoint(endpoint) {
 
 function controlHopUrl(node, link, nodeId) {
   const linkEndpoint = link.upstreamId === nodeId ? link.upstreamEndpoint : link.downstreamEndpoint;
-  const linkedHost = hostFromEndpoint(linkEndpoint) || hostFromEndpoint(node.dataEndpoint);
+  // 链路明确写了拨号地址时才能反向访问。IX/NAT 的自报入口只给新节点主动加入用，
+  // 它们上行仍走 NAT 出口，不能当成可被上游主动拨入的控制地址。
+  const linkedHost = hostFromEndpoint(linkEndpoint);
   if (linkedHost) return `http://${linkedHost}:${node.controlListenPort || 8790}`;
+  if (node.reachabilityType !== 'public') return null;
+  const publishedHost = hostFromEndpoint(node.dataEndpoint);
+  if (publishedHost) return `http://${publishedHost}:${node.controlListenPort || 8790}`;
   const details = endpointDetails(node.controlEndpoint);
   const host = details?.host;
   if (!host) return null;
@@ -1558,10 +1563,12 @@ export class ControlService {
   }
 
   clusterVoterIds(networkId) {
+    // 只有真正可被拨入的公网中继参与协调选举。IX 虽可接入新节点，但上行仍是 NAT，
+    // 不能可靠接受快照推送，否则会把写操作卡在多数派同步上。
     return this.db.all(
       `SELECT n.id FROM nodes n
        LEFT JOIN managed_node_proxies m ON m.node_id = n.id
-       WHERE n.network_id = ? AND n.can_relay = 1 AND m.node_id IS NULL
+       WHERE n.network_id = ? AND n.can_relay = 1 AND n.reachability_type = 'public' AND m.node_id IS NULL
        ORDER BY n.created_at, n.id`,
       networkId,
     ).map((row) => row.id);

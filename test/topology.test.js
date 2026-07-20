@@ -10,6 +10,7 @@ function node(id, offset) {
   return {
     id, name: id.toUpperCase(), dataIp: `10.77.0.${offset}`, controlIp: `10.254.0.${offset}`,
     wgDataPublicKey: `${id}`.padEnd(44, '='), dataEndpoint: `${id}.example:51820`,
+    reachabilityType: 'public', hasPublicEndpoint: true,
   };
 }
 

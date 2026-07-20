@@ -97,7 +97,7 @@
           <select name="reachabilityType">
             <option value="public">公网可拨入</option>
             <option value="nat">纯 NAT（仅主动拨出）</option>
-            <option value="ix">IX（内网入口，可接入新节点，不可后续建拓扑链路）</option>
+            <option value="ix">IX（发布内网入口供新节点接入；本节点上行仍按 NAT）</option>
           </select>
         </label>
         <label>接入中继地址<input name="controlEndpoint" placeholder="http://公网或内网IP:8790"></label>
@@ -132,6 +132,6 @@
   </dialog>
 
   <div id="toast-region" class="toast-region" aria-live="assertive"></div>
-  <script type="module" src="/app.js?v=23"></script>
+  <script type="module" src="/app.js?v=24"></script>
 </body>
 </html>

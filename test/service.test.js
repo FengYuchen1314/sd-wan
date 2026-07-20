@@ -717,6 +717,21 @@ test('IX 节点可作主动加入父节点与主动认领，但不能在拓扑�
     assert.throws(() => service.createLinkValidation(network.id, {
       nodeAId: publicNode.id, nodeBId: ix.id, nodeAAddress: '198.51.100.20',
     }), /IX 节点不能在拓扑中/);
+
+    assert.ok(!service.clusterVoterIds(network.id).includes(ix.id), 'IX 上行按 NAT，不得进入协调选民');
+    const runtime = service.getClusterRuntime(network.id, center.id);
+    assert.equal(runtime.control.forwarders[ix.id], undefined, '上游不得用 IX 自报入口做控制回拨');
+    service.updateNode(ix.id, {
+      name: ix.name,
+      reachabilityType: 'ix',
+      canRelay: true,
+      controlEndpoint: ix.controlEndpoint,
+      controlListenPort: ix.controlListenPort,
+      dataEndpoint: ix.dataEndpoint,
+      dataListenPort: ix.dataListenPort,
+    });
+    assert.ok(!service.clusterVoterIds(network.id).includes(ix.id));
+    assert.equal(service.getClusterRuntime(network.id, center.id).control.forwarders[ix.id], undefined);
   } finally { database.close(); }
 });
 
