@@ -7,18 +7,18 @@ PathWeaver 是一个自托管的全节点面板 SD-WAN。所有设备安装同�
 适用于带 `systemd` 的 x86_64 或 arm64 Linux。在第一台设备直接执行：
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/FengYuchen1314/sd-wan/master/scripts/install.sh?cache=$(date +%s)" | sudo bash -s -- --source https://raw.githubusercontent.com/FengYuchen1314/sd-wan/master
+curl -fsSL "https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main/scripts/install.sh?cache=$(date +%s)" | sudo bash -s -- --source https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main
 ```
 
 安装器会自动补齐基础工具；如果系统没有 Node.js，或版本低于 `22.5`，会下载、校验并安装 PathWeaver 私有的 Node.js 22 运行时，不会替换系统已有 Node.js。随后安装器会自动识别这是初始节点，依次检测管理面板 TCP `19773` 和 WireGuard UDP `19801`；直接回车使用检测到的空闲端口，并按提示输入两次本机面板密码。完成后访问 `http://<这台设备的 IP>:19773`。后续设备请从面板“接入新节点”生成一次性命令，不要重复使用上面的初始节点命令。
 
 主动加入的后续设备会先询问“是否有可供其他节点主动拨入的公网入口”。选择无公网时，只需选择本机面板端口并设置密码；控制中继和 WireGuard 本地端口都会静默选择空闲值，不会发布成固定 Endpoint。该节点只主动拨号有公网入口的父节点，也不能与另一台无公网节点建立直接连接。选择有公网时，安装器才会继续询问公网 IP/域名、控制中继端口和 WireGuard UDP 端口。
 
-> 推送到 GitHub `master` 分支后上述命令才可下载本仓库。公网部署应使用 HTTPS 反向代理，并只向可信管理网开放面板；通过纯 HTTP 传递安装包不具备抗中间人篡改能力。
+> 推送到 GitHub `main` 分支后上述命令才可下载本仓库。公网部署应使用 HTTPS 反向代理，并只向可信管理网开放面板；通过纯 HTTP 传递安装包不具备抗中间人篡改能力。
 
 ## 已安装节点原地更新
 
-仓库推送到 GitHub `master` 分支后，在需要更新的节点执行本机命令：
+仓库推送到 GitHub `main` 分支后，在需要更新的节点执行本机命令：
 
 ```bash
 sudo pathweaver-update
