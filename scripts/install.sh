@@ -21,6 +21,7 @@ WIREGUARD_RUNTIME_LINK="$WIREGUARD_RUNTIME_ROOT/wireguard-current"
 NODE_DIST_BASE="${PATHWEAVER_NODE_DIST_BASE:-https://nodejs.org/dist/latest-v22.x}"
 NODE_RUNTIME_ROOT="/opt/pathweaver/runtime"
 NODE_RUNTIME_LINK="$NODE_RUNTIME_ROOT/node-current"
+PATHWEAVER_NODE_BIN=""
 export PATH="$NODE_RUNTIME_LINK/bin:$PATH"
 
 while [[ $# -gt 0 ]]; do
@@ -84,6 +85,7 @@ process.exit(major > 22 || (major === 22 && minor >= 5) ? 0 : 1);
 ensure_node_runtime() {
   if [[ -x "$NODE_RUNTIME_LINK/bin/node" ]] && node_runtime_supported "$NODE_RUNTIME_LINK/bin/node"; then
     echo "使用 PathWeaver 私有 Node.js：$($NODE_RUNTIME_LINK/bin/node --version) ($NODE_RUNTIME_LINK)" >&2
+    PATHWEAVER_NODE_BIN="$NODE_RUNTIME_LINK/bin/node"
     export PATH="$NODE_RUNTIME_LINK/bin:$PATH"
     hash -r
     return
@@ -127,6 +129,7 @@ ensure_node_runtime() {
   fi
   ln -sfn "$release_dir" "$NODE_RUNTIME_LINK"
   rm -rf -- "$work_dir"
+  PATHWEAVER_NODE_BIN="$NODE_RUNTIME_LINK/bin/node"
   export PATH="$NODE_RUNTIME_LINK/bin:$PATH"
   hash -r
   echo "Node.js $($NODE_RUNTIME_LINK/bin/node --version) 已安装到 $NODE_RUNTIME_LINK。" >&2
@@ -148,7 +151,7 @@ ask() {
 }
 
 port_available() {
-  node - "$1" "$2" <<'NODE'
+  "${PATHWEAVER_NODE_BIN:-$NODE_RUNTIME_LINK/bin/node}" - "$1" "$2" <<'NODE'
 const [kind, rawPort] = process.argv.slice(2);
 const port = Number(rawPort);
 if (!Number.isInteger(port) || port < 1 || port > 65535) process.exit(2);
@@ -366,10 +369,11 @@ choose_panel_password() {
 }
 
 hash_panel_password() {
-  local node_bin="$1"
+  local node_bin="${PATHWEAVER_NODE_BIN:-$NODE_RUNTIME_LINK/bin/node}"
+  node_bin="${node_bin//$'\r'/}"
   if [[ -z "$node_bin" || ! -x "$node_bin" ]]; then
-    echo "未找到可用的 Node.js 运行时用于生成面板密码哈希。" >&2
-    exit 1
+    echo "未找到可用的 Node.js 运行时用于生成面板密码哈希（${node_bin:-空路径}）。" >&2
+    return 1
   fi
   printf '%s' "$PANEL_PASSWORD" | "$node_bin" -e '
 const { randomBytes, scryptSync } = require("node:crypto");
@@ -381,6 +385,19 @@ process.stdin.on("end", () => {
   const digest = scryptSync(password, salt, 32);
   process.stdout.write(`scrypt-v1.${salt.toString("base64url")}.${digest.toString("base64url")}`);
 });'
+}
+
+require_pathweaver_node() {
+  if [[ -n "$PATHWEAVER_NODE_BIN" && -x "$PATHWEAVER_NODE_BIN" ]] && node_runtime_supported "$PATHWEAVER_NODE_BIN"; then
+    return 0
+  fi
+  ensure_node_runtime
+  if [[ -x "$NODE_RUNTIME_LINK/bin/node" ]] && node_runtime_supported "$NODE_RUNTIME_LINK/bin/node"; then
+    PATHWEAVER_NODE_BIN="$NODE_RUNTIME_LINK/bin/node"
+    return 0
+  fi
+  echo "PathWeaver 私有 Node.js 运行时不可用。" >&2
+  return 1
 }
 
 verify_panel_password_env() {
@@ -420,20 +437,6 @@ write_peer_node_env() {
     printf 'SDWAN_PANEL_PROXY_TOKEN=%s\n' "$proxy_token"
   } >"$env_file"
   chmod 0600 "$env_file"
-}
-
-resolve_node_executable() {
-  if [[ -x "$NODE_RUNTIME_LINK/bin/node" ]] && node_runtime_supported "$NODE_RUNTIME_LINK/bin/node"; then
-    printf '%s\n' "$NODE_RUNTIME_LINK/bin/node"
-    return
-  fi
-  ensure_node_runtime
-  if [[ -x "$NODE_RUNTIME_LINK/bin/node" ]] && node_runtime_supported "$NODE_RUNTIME_LINK/bin/node"; then
-    printf '%s\n' "$NODE_RUNTIME_LINK/bin/node"
-    return
-  fi
-  echo "PathWeaver 私有 Node.js 运行时不可用。" >&2
-  exit 1
 }
 
 install_node_bundle() {
@@ -611,8 +614,9 @@ install_node() {
   fi
   endpoint_host="$(format_endpoint_host "$REACHABLE_HOST")"
   choose_panel_password
-  node_executable="$(resolve_node_executable)"
-  panel_password_hash="$(hash_panel_password "$node_executable")"
+  require_pathweaver_node || exit 1
+  node_executable="$PATHWEAVER_NODE_BIN"
+  panel_password_hash="$(hash_panel_password)" || exit 1
 
   install_private_wireguard_runtime
   install_node_bundle
