@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { Database } from '../center/database.js';
 import { CoordinatorElection } from '../core/coordinator.js';
 import { executeBenchmark, handleBenchmarkRequest, prepareBenchmark } from '../core/benchmark.js';
+import { fetchViaInternalControlRoutes } from '../core/control-fetch.js';
 import {
   acceptProbeEnvelope,
   DEFAULT_DATA_PORT,
@@ -345,38 +346,60 @@ function encodeControlRoute(route) {
   return Buffer.from(JSON.stringify(route), 'utf8').toString('base64url');
 }
 
+function pushControlRouteCandidates(candidates, seen, targetId, { localUrl = null } = {}) {
+  if (targetId === state.nodeId && localUrl) {
+    const key = `${localUrl}\u0000`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      candidates.push({ id: `local-${targetId}`, targetId, baseUrl: localUrl, remaining: [] });
+    }
+  }
+  for (const route of shuffled(state.controlRoutesByTarget?.[targetId] || [])) {
+    if (!Array.isArray(route.hops) || !route.hops.length || route.hops.length > MAX_PROBE_HOPS) continue;
+    if (new Set(route.nodeIds || []).size !== (route.nodeIds || []).length) continue;
+    const [first, ...remaining] = route.hops;
+    try {
+      const firstUrl = normalizeControlUrl(first.url);
+      if (state.controlForwarders?.[first.nodeId] !== firstUrl) continue;
+      const key = `${firstUrl}\u0000${remaining.map((hop) => `${hop.nodeId}:${hop.url}`).join('\u0000')}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({ id: route.id, targetId, baseUrl: firstUrl, remaining });
+    } catch {}
+  }
+}
+
 function controlCandidates() {
   const candidates = [];
   const seen = new Set();
-  const pushCandidate = (candidate) => {
-    const key = `${candidate.baseUrl}\u0000${candidate.remaining.map((hop) => `${hop.nodeId}:${hop.url}`).join('\u0000')}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    candidates.push(candidate);
-  };
-  if (state.upstream) {
-    pushCandidate({
-      id: 'coordinator-upstream',
-      baseUrl: normalizeControlUrl(state.upstream),
-      remaining: [],
-      targetId: state.controlCluster?.coordinatorNodeId,
+  const coordinatorId = state.controlCluster?.coordinatorNodeId;
+  const leaderId = election.leaderId || coordinatorId;
+  if (coordinatorId) {
+    pushControlRouteCandidates(candidates, seen, coordinatorId, {
+      localUrl: coordinatorId === state.nodeId ? localCoordinatorUrl : null,
     });
   }
-  const leaderId = election.leaderId || state.controlCluster?.coordinatorNodeId;
-  const targetIds = [leaderId, ...shuffled(state.controlCluster?.voterIds || []).filter((id) => id !== leaderId)].filter(Boolean);
-  for (const targetId of targetIds) {
-    if (targetId === state.nodeId && localCoordinatorUrl) {
-      pushCandidate({ id: `local-${targetId}`, targetId, baseUrl: localCoordinatorUrl, remaining: [] });
-    }
-    for (const route of shuffled(state.controlRoutesByTarget?.[targetId] || [])) {
-      if (!Array.isArray(route.hops) || !route.hops.length || route.hops.length > MAX_PROBE_HOPS) continue;
-      if (new Set(route.nodeIds || []).size !== (route.nodeIds || []).length) continue;
-      const [first, ...remaining] = route.hops;
-      try {
-        const firstUrl = normalizeControlUrl(first.url);
-        if (state.controlForwarders?.[first.nodeId] !== firstUrl) continue;
-        pushCandidate({ id: route.id, targetId, baseUrl: firstUrl, remaining });
-      } catch {}
+  for (const targetId of shuffled(state.controlCluster?.voterIds || []).filter((id) => id && id !== coordinatorId)) {
+    pushControlRouteCandidates(candidates, seen, targetId, {
+      localUrl: targetId === state.nodeId ? localCoordinatorUrl : null,
+    });
+  }
+  if (leaderId && leaderId !== coordinatorId) {
+    pushControlRouteCandidates(candidates, seen, leaderId, {
+      localUrl: leaderId === state.nodeId ? localCoordinatorUrl : null,
+    });
+  }
+  if (state.upstream) {
+    const baseUrl = normalizeControlUrl(state.upstream);
+    const key = `${baseUrl}\u0000`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      candidates.push({
+        id: 'coordinator-upstream',
+        baseUrl,
+        remaining: [],
+        targetId: coordinatorId,
+      });
     }
   }
   if (!state.controlCluster) {
@@ -387,7 +410,10 @@ function controlCandidates() {
       try {
         const firstUrl = normalizeControlUrl(first.url);
         if (state.controlForwarders?.[first.nodeId] !== firstUrl) continue;
-        pushCandidate({ id: route.id, baseUrl: firstUrl, remaining });
+        const key = `${firstUrl}\u0000${remaining.map((hop) => `${hop.nodeId}:${hop.url}`).join('\u0000')}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        candidates.push({ id: route.id, baseUrl: firstUrl, remaining });
       } catch {}
     }
   }
@@ -836,22 +862,22 @@ async function runCommand(command) {
     } else if (command.type === 'execute-link-probe') {
       const probeId = String(command.payload.probeId || `probe-${randomBytes(16).toString('hex')}`);
       const maxHops = Math.min(MAX_PROBE_HOPS, Math.max(1, Number(command.payload.maxHops) || MAX_PROBE_HOPS));
-      const response = await fetch(
-        new URL(`/agent/v1/link-probe/${command.payload.validationId}`, command.payload.remoteUrl),
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            token: command.payload.token,
-            probeId,
-            trace: [state.nodeId || state.agentInstanceId],
-            remainingHops: maxHops - 1,
-          }),
-          signal: AbortSignal.timeout(12_000),
-        },
-      );
-      const probe = await response.json();
-      if (!response.ok) throw new Error(probe.error || `探测返回 HTTP ${response.status}`);
+      const probe = await fetchViaInternalControlRoutes({
+        targetId: command.payload.expectedNodeId,
+        pathname: `/agent/v1/link-probe/${command.payload.validationId}`,
+        routesByTarget: state.controlRoutesByTarget,
+        forwarders: state.controlForwarders,
+        relayTrace: state.nodeId || state.agentInstanceId,
+        method: 'POST',
+        body: JSON.stringify({
+          token: command.payload.token,
+          probeId,
+          trace: [state.nodeId || state.agentInstanceId],
+          remainingHops: maxHops - 1,
+        }),
+        timeout: 12_000,
+        resolveUrl: reachableControlUrl,
+      });
       if (probe.nodeId !== command.payload.expectedNodeId) throw new Error('目标节点身份与预期不一致');
       result = {
         ok: true,
@@ -878,7 +904,24 @@ async function runCommand(command) {
       result = prepareBenchmark(state.pendingBenchmarks, command.payload);
       atomicJson(stateFile, state);
     } else if (command.type === 'execute-link-benchmark') {
-      result = await executeBenchmark(command.payload);
+      const expectedNodeId = String(command.payload.expectedNodeId || '');
+      result = await executeBenchmark(command.payload, {
+        measureSample: async () => {
+          const sample = await fetchViaInternalControlRoutes({
+            targetId: expectedNodeId,
+            pathname: `/agent/v1/benchmark/${encodeURIComponent(command.payload.itemId)}?mode=latency`,
+            routesByTarget: state.controlRoutesByTarget,
+            forwarders: state.controlForwarders,
+            relayTrace: state.nodeId || state.agentInstanceId,
+            method: 'POST',
+            headers: { 'X-PathWeaver-Benchmark-Token': String(command.payload.token || '') },
+            body: Buffer.alloc(0),
+            timeout: 20_000,
+            resolveUrl: reachableControlUrl,
+          });
+          if (sample.nodeId !== expectedNodeId) throw new Error('延迟探测目标节点身份与预期不一致');
+        },
+      });
     } else {
       throw new Error(`不允许执行命令 ${command.type}`);
     }

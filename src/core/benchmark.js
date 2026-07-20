@@ -52,15 +52,18 @@ async function fetchChecked(url, options, expectedNodeId) {
   return result;
 }
 
-export async function executeBenchmark(payload) {
+export async function executeBenchmark(payload, options = {}) {
   const itemId = String(payload.itemId || '');
   const expectedNodeId = String(payload.expectedNodeId || '');
   const remote = new URL(`/agent/v1/benchmark/${encodeURIComponent(itemId)}`, `${String(payload.remoteUrl || '').replace(/\/$/, '')}/`);
   const headers = { 'X-PathWeaver-Benchmark-Token': String(payload.token || '') };
+  const measureSample = options.measureSample || (async () => {
+    await fetchChecked(`${remote}?mode=latency`, { method: 'POST', headers, body: Buffer.alloc(0) }, expectedNodeId);
+  });
   const samples = [];
   for (let index = 0; index < LATENCY_TOTAL_SAMPLES; index += 1) {
     const started = performance.now();
-    await fetchChecked(`${remote}?mode=latency`, { method: 'POST', headers, body: Buffer.alloc(0) }, expectedNodeId);
+    await measureSample();
     samples.push(performance.now() - started);
   }
   return {

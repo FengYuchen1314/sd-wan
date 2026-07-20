@@ -15,6 +15,7 @@ import { CoordinatorElection } from '../core/coordinator.js';
 import { verifyPanelPassword, isPanelPasswordHashRecord } from '../core/password.js';
 import { acceptProbeEnvelope } from '../agent/runtime.js';
 import { executeBenchmark, handleBenchmarkRequest, prepareBenchmark } from '../core/benchmark.js';
+import { fetchViaInternalControlRoutes } from '../core/control-fetch.js';
 
 const rootDir = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const publicDir = join(rootDir, 'public');
@@ -273,22 +274,23 @@ async function runLocalCommand(nodeId, command) {
     return { ok: true, prepared: true };
   }
   if (command.type === 'execute-link-probe') {
-    const response = await fetch(
-      new URL(`/agent/v1/link-probe/${command.payload.validationId}`, command.payload.remoteUrl),
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          token: command.payload.token,
-          probeId: command.payload.probeId,
-          trace: [nodeId],
-          remainingHops: Math.max(0, Number(command.payload.maxHops || 16) - 1),
-        }),
-        signal: AbortSignal.timeout(12_000),
-      },
-    );
-    const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(result.error || `探测返回 HTTP ${response.status}`);
+    const node = service.getNode(nodeId);
+    const runtime = service.getClusterRuntime(node.networkId, nodeId);
+    const result = await fetchViaInternalControlRoutes({
+      targetId: command.payload.expectedNodeId,
+      pathname: `/agent/v1/link-probe/${command.payload.validationId}`,
+      routesByTarget: runtime.control.routesByTarget,
+      forwarders: runtime.control.forwarders,
+      relayTrace: nodeId,
+      method: 'POST',
+      body: JSON.stringify({
+        token: command.payload.token,
+        probeId: command.payload.probeId,
+        trace: [nodeId],
+        remainingHops: Math.max(0, Number(command.payload.maxHops || 16) - 1),
+      }),
+      timeout: 12_000,
+    });
     if (result.nodeId !== command.payload.expectedNodeId) throw new Error('目标节点身份与预期不一致');
     return { ok: true, remoteNodeId: result.nodeId, probeId: result.probeId, trace: result.trace, reachedAt: result.reachedAt };
   }
@@ -298,7 +300,25 @@ async function runLocalCommand(nodeId, command) {
     return result;
   }
   if (command.type === 'execute-link-benchmark') {
-    return executeBenchmark(command.payload);
+    const node = service.getNode(nodeId);
+    const runtime = service.getClusterRuntime(node.networkId, nodeId);
+    const expectedNodeId = String(command.payload.expectedNodeId || '');
+    return executeBenchmark(command.payload, {
+      measureSample: async () => {
+        const sample = await fetchViaInternalControlRoutes({
+          targetId: expectedNodeId,
+          pathname: `/agent/v1/benchmark/${encodeURIComponent(command.payload.itemId)}?mode=latency`,
+          routesByTarget: runtime.control.routesByTarget,
+          forwarders: runtime.control.forwarders,
+          relayTrace: nodeId,
+          method: 'POST',
+          headers: { 'X-PathWeaver-Benchmark-Token': String(command.payload.token || '') },
+          body: Buffer.alloc(0),
+          timeout: 20_000,
+        });
+        if (sample.nodeId !== expectedNodeId) throw new Error('延迟探测目标节点身份与预期不一致');
+      },
+    });
   }
   if (command.type === 'probe-update-source') {
     return probeGithubUpdateArtifact(command.payload);
