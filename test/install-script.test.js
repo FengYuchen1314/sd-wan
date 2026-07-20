@@ -54,12 +54,11 @@ test('安装器提供本机面板密码重置命令', () => {
   assert.match(bundleSource, /scripts\/set-panel-password\.sh/);
 });
 
-test('安装器为 systemd 选择 PathWeaver 私有 Node 运行时', () => {
-  assert.match(installer, /resolve_node_executable/);
+test('Node 运行时状态信息写入 stderr，避免污染 command substitution', () => {
+  assert.match(installer, /echo "使用 PathWeaver 私有 Node\.js[^"]*" >&2/);
+  assert.match(installer, /Node\.js \$\(\$NODE_RUNTIME_LINK\/bin\/node --version\) 已安装到 \$NODE_RUNTIME_LINK。" >&2/);
+  assert.match(installer, /echo "未检测到 Node\.js，正在安装 PathWeaver 私有运行时……" >&2/);
   assert.match(installer, /ExecStart=\$node_executable/);
-  assert.match(installer, /ensure_node_runtime/);
-  assert.match(installer, /使用 PathWeaver 私有 Node\.js/);
-  assert.doesNotMatch(installer, /使用兼容的 Node\.js/);
   assert.doesNotMatch(installer, /ExecStart=\$\(command -v node\)/);
 });
 

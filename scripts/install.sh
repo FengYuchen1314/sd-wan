@@ -83,7 +83,7 @@ process.exit(major > 22 || (major === 22 && minor >= 5) ? 0 : 1);
 
 ensure_node_runtime() {
   if [[ -x "$NODE_RUNTIME_LINK/bin/node" ]] && node_runtime_supported "$NODE_RUNTIME_LINK/bin/node"; then
-    echo "使用 PathWeaver 私有 Node.js：$($NODE_RUNTIME_LINK/bin/node --version) ($NODE_RUNTIME_LINK)"
+    echo "使用 PathWeaver 私有 Node.js：$($NODE_RUNTIME_LINK/bin/node --version) ($NODE_RUNTIME_LINK)" >&2
     export PATH="$NODE_RUNTIME_LINK/bin:$PATH"
     hash -r
     return
@@ -99,9 +99,9 @@ ensure_node_runtime() {
   esac
 
   if [[ -n "$current_node" ]]; then
-    echo "检测到的 $($current_node --version 2>/dev/null || echo Node.js) 低于 22.5，正在安装 PathWeaver 私有运行时……"
+    echo "检测到的 $($current_node --version 2>/dev/null || echo Node.js) 低于 22.5，正在安装 PathWeaver 私有运行时……" >&2
   else
-    echo "未检测到 Node.js，正在安装 PathWeaver 私有运行时……"
+    echo "未检测到 Node.js，正在安装 PathWeaver 私有运行时……" >&2
   fi
   work_dir="$(mktemp -d)"
   checksums="$work_dir/SHASUMS256.txt"
@@ -129,7 +129,7 @@ ensure_node_runtime() {
   rm -rf -- "$work_dir"
   export PATH="$NODE_RUNTIME_LINK/bin:$PATH"
   hash -r
-  echo "Node.js $($NODE_RUNTIME_LINK/bin/node --version) 已安装到 $NODE_RUNTIME_LINK。"
+  echo "Node.js $($NODE_RUNTIME_LINK/bin/node --version) 已安装到 $NODE_RUNTIME_LINK。" >&2
 }
 
 install_base_dependencies
@@ -423,6 +423,10 @@ write_peer_node_env() {
 }
 
 resolve_node_executable() {
+  if [[ -x "$NODE_RUNTIME_LINK/bin/node" ]] && node_runtime_supported "$NODE_RUNTIME_LINK/bin/node"; then
+    printf '%s\n' "$NODE_RUNTIME_LINK/bin/node"
+    return
+  fi
   ensure_node_runtime
   if [[ -x "$NODE_RUNTIME_LINK/bin/node" ]] && node_runtime_supported "$NODE_RUNTIME_LINK/bin/node"; then
     printf '%s\n' "$NODE_RUNTIME_LINK/bin/node"
