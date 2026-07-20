@@ -87,8 +87,8 @@ function childNode(id, offset, parentId, { joinMode = 'active', reachabilityType
   };
 }
 
-test('主动加入的父子链路强制父节点动态学习，即使子节点误带 Endpoint', () => {
-  const nodes = [node('a', 1), childNode('b', 2, 'a')];
+test('主动加入的父子链路强制父节点动态学习，即使子节点声明公网', () => {
+  const nodes = [node('a', 1), childNode('b', 2, 'a', { reachabilityType: 'public' })];
   const result = validateAndCompileTopology({
     network,
     nodes,

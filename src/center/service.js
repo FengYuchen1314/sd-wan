@@ -1156,9 +1156,6 @@ export class ControlService {
         input.reachabilityType,
         { hasPublicEndpoint: input.hasPublicEndpoint === undefined ? node.hasPublicEndpoint : Boolean(input.hasPublicEndpoint) },
       );
-    if (node.joinMode === 'active' && nextReachabilityType !== 'nat') {
-      throw new Error('主动加入的节点只能保持 NAT 拨出模式，不能改为公网或 IX 入口');
-    }
     const nextPublishes = nextReachabilityType === 'public' || nextReachabilityType === 'ix';
     const nextRelay = nextPublishes
       ? (input.canRelay === undefined ? node.canRelay : Boolean(input.canRelay))
@@ -1401,8 +1398,7 @@ export class ControlService {
     if (upstream.reachabilityType !== 'public' && downstream.reachabilityType !== 'public') {
       throw new Error('NAT 与 IX 只能和有公网入口的节点建立后续直连；两个非公网节点之间不能直连');
     }
-    const peerNeedsPublicDialIn = (node) =>
-      node.joinMode === 'active' || node.reachabilityType === 'nat' || node.reachabilityType === 'ix';
+    const peerNeedsPublicDialIn = (node) => node.reachabilityType === 'nat' || node.reachabilityType === 'ix';
     const effectiveUpstreamAddress = upstream.reachabilityType === 'public'
       ? (upstreamAddress || (peerNeedsPublicDialIn(downstream) ? hostFromEndpoint(upstream.dataEndpoint) : '') || '')
       : '';
@@ -1474,10 +1470,19 @@ export class ControlService {
       const joinMode = token.mode === 'passive' ? 'passive' : 'active';
       const reachabilityType = token.mode === 'passive'
         ? 'public'
-        : 'nat';
+        : normalizeReachabilityType(
+          input.reachabilityType,
+          {
+            hasPublicEndpoint: input.hasPublicEndpoint === undefined
+              ? Boolean(input.dataEndpoint)
+              : Boolean(input.hasPublicEndpoint),
+          },
+        );
       const publishes = reachabilityType === 'public' || reachabilityType === 'ix';
-      if (token.mode === 'passive' && !input.dataEndpoint) {
-        throw new Error('被动认领节点必须提供父节点可访问的 WireGuard 地址');
+      if (publishes && !input.dataEndpoint) {
+        throw new Error(reachabilityType === 'ix'
+          ? 'IX 节点必须提供可供同网段拨入的 WireGuard 固定端点'
+          : '声明有公网入口的节点必须提供 WireGuard 固定端点');
       }
       const dataListenPort = normalizePort(
         input.dataListenPort,
@@ -1496,12 +1501,13 @@ export class ControlService {
           agent_version, last_seen, created_at, updated_at)
          VALUES (?, ?, ?, 'online', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         nodeId, network.id, name, reachabilityType, joinMode, publishes ? 1 : 0, publishes ? 1 : 0, parent.id, controlIp, dataIp,
-        joinMode === 'passive' ? (input.controlEndpoint ?? null) : null, controlListenPort,
-        joinMode === 'passive' ? (input.dataEndpoint ?? null) : null, dataListenPort,
+        publishes ? (input.controlEndpoint ?? null) : null, controlListenPort,
+        publishes ? (input.dataEndpoint ?? null) : null, dataListenPort,
         input.wgControlPublicKey ?? '', input.wgDataPublicKey ?? '', hashSecret(credential),
         input.agentVersion ?? '0.1.0', timestamp, timestamp, timestamp,
       );
       if (token.mode === 'passive') {
+        if (!input.dataEndpoint) throw new Error('被动认领节点必须提供父节点可访问的 WireGuard 地址');
         this.db.run(
           `INSERT INTO topology_links(
             id, network_id, upstream_id, downstream_id, priority, upstream_endpoint, downstream_endpoint, created_at

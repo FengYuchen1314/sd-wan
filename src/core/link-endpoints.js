@@ -11,9 +11,9 @@ export function isParentChildLink(upstreamNode, downstreamNode) {
   return downstreamNode?.parentId === upstreamNode?.id;
 }
 
-/** 主动加入或纯 NAT 节点只主动拨出，对端应动态学习其 Endpoint。 */
+/** 纯 NAT 节点在所有链路上只主动拨出。主动加入的公网/IX 节点仅在父子加入链路上由父节点动态学习。 */
 export function isDialOutOnlyNode(node) {
-  return node?.joinMode === 'active' || node?.reachabilityType === 'nat';
+  return node?.reachabilityType === 'nat';
 }
 
 export function isActiveJoinLink(link, upstreamNode, downstreamNode) {

@@ -41,12 +41,6 @@ test('统一对等节点安装不再要求选择中心或边缘，并为每台�
   assert.match(installer, /pathweaver-node\.service/);
 });
 
-test('主动加入上级时安装器强制纯 NAT，不再询问拨入类型', () => {
-  assert.match(installer, /elif \[\[ -n "\$JOIN_TOKEN" \|\| -n "\$UPSTREAM" \]\]; then/);
-  assert.match(installer, /reachability="nat"/);
-  assert.match(installer, /本节点通过主动连接加入上级，按纯 NAT 安装/);
-});
-
 test('安装器写入 node.env 时使用不含 \$ 的 scrypt 哈希，避免 systemd 截断面板密码', () => {
   assert.match(installer, /write_bootstrap_node_env/);
   assert.match(installer, /write_peer_node_env/);

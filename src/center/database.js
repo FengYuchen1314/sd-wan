@@ -387,16 +387,6 @@ export class Database {
           AND parent_id IS NOT NULL
           AND join_mode != 'passive'
       `);
-      this.handle.exec(`
-        UPDATE nodes
-        SET reachability_type = 'nat',
-            has_public_endpoint = 0,
-            can_relay = 0,
-            control_endpoint = NULL,
-            data_endpoint = NULL
-        WHERE join_mode = 'active'
-          AND is_center = 0
-      `);
     }
     const proxyColumns = new Set(this.handle.prepare('PRAGMA table_info(managed_node_proxies)').all().map((column) => column.name));
     if (!proxyColumns.has('relay_path_json')) {

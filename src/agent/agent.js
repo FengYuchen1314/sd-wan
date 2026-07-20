@@ -428,7 +428,6 @@ async function api(pathname, options = {}) {
 
 async function register({ passive = false } = {}) {
   if (state.credential || !state.joinToken || !state.upstream) return;
-  const activeJoin = !passive;
   const result = await api('/agent/v1/register', {
     method: 'POST',
     body: JSON.stringify({
@@ -438,17 +437,12 @@ async function register({ passive = false } = {}) {
       agentVersion: '0.1.0',
       wgControlPublicKey: state.controlKeys.publicKey,
       wgDataPublicKey: state.dataKeys.publicKey,
+      controlEndpoint: state.controlEndpoint,
       controlListenPort: state.controlListenPort,
+      dataEndpoint: state.dataEndpoint,
       dataListenPort: state.dataListenPort,
-      ...(passive ? {
-        controlEndpoint: state.controlEndpoint,
-        dataEndpoint: state.dataEndpoint,
-        hasPublicEndpoint: state.hasPublicEndpoint,
-        reachabilityType: state.reachabilityType,
-      } : {
-        reachabilityType: 'nat',
-        hasPublicEndpoint: false,
-      }),
+      hasPublicEndpoint: state.hasPublicEndpoint,
+      reachabilityType: state.reachabilityType,
     }),
   });
   state = {
@@ -457,9 +451,8 @@ async function register({ passive = false } = {}) {
     credential: result.credential,
     joinToken: null,
     networkId: result.node.networkId,
-    reachabilityType: result.node.reachabilityType || (activeJoin ? 'nat' : state.reachabilityType),
+    reachabilityType: result.node.reachabilityType || state.reachabilityType,
     hasPublicEndpoint: result.node.hasPublicEndpoint,
-    ...(activeJoin ? { controlEndpoint: null, dataEndpoint: null } : {}),
   };
   election.nodeId = state.nodeId;
   atomicJson(stateFile, state);

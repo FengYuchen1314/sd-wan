@@ -263,27 +263,19 @@ test('被动认领固定从指定 GitHub 仓库安装，命令不要求目标访
   } finally { database.close(); }
 });
 
-test('主动加入的边缘节点不能通过修改配置变成下级接入父节点', () => {
+test('选择边缘父节点时强制携带新设备可达的中继地址', () => {
   const { database, service, network, center } = fixture();
   try {
-    const edge = registerActiveJoinNode(service, network, center, {
-      name: '一级边缘',
-      wgDataPublicKey: 'f'.repeat(44),
-    }).node;
+    const first = service.createJoinToken(network.id, { parentId: center.id });
+    const edge = service.registerAgent({ token: first.token, name: '一级边缘', wgDataPublicKey: 'f'.repeat(44) }).node;
     assert.throws(() => service.createJoinToken(network.id, { parentId: edge.id }), /纯 NAT 节点|没有公网拨入能力/);
-    assert.throws(() => service.updateNode(edge.id, {
+    service.updateNode(edge.id, {
       hasPublicEndpoint: true,
       canRelay: true,
       controlEndpoint: 'http://192.168.8.20:8790',
       dataEndpoint: '192.168.8.20:51820',
-    }), /主动加入的节点只能保持 NAT/);
-    const publicEdge = registerPublicEdge(service, network, center, {
-      name: '公网边缘',
-      wgDataPublicKey: 'g'.repeat(44),
-      controlEndpoint: 'http://192.168.8.20:8790',
-      dataEndpoint: '192.168.8.20:51820',
-    }).node;
-    const second = service.createJoinToken(network.id, { parentId: publicEdge.id });
+    });
+    const second = service.createJoinToken(network.id, { parentId: edge.id });
     assert.match(second.command, /curl -fsSL 'http:\/\/192\.168\.8\.20:8790\/install\.sh'/);
     assert.match(second.command, /--source 'http:\/\/192\.168\.8\.20:8790'/);
     assert.match(second.command, /--upstream 'http:\/\/192\.168\.8\.20:8790'/);
@@ -313,9 +305,9 @@ test('公网子节点通过边缘父节点主动加入时，父节点仍动态�
       dataEndpoint: '203.0.113.50:51820',
     });
     assert.equal(child.node.parentId, edge.id);
-    assert.equal(child.node.reachabilityType, 'nat');
+    assert.equal(child.node.reachabilityType, 'public');
     assert.equal(child.node.joinMode, 'active');
-    assert.equal(child.node.dataEndpoint, null);
+    assert.equal(child.node.dataEndpoint, '203.0.113.50:51820');
     const joinLink = service.listLinks(network.id).find((link) =>
       link.upstreamId === edge.id && link.downstreamId === child.node.id);
     assert.equal(joinLink.downstreamEndpoint, '');
@@ -763,19 +755,20 @@ test('无公网节点只主动拨号公网节点，两个无公网节点禁止�
 test('IX 节点可作主动加入父节点与主动认领，后续可连公网但不能连 NAT', () => {
   const { database, service, network, center } = fixture();
   try {
-    const ix = registerPublicEdge(service, network, center, {
+    const join = service.createJoinToken(network.id, { parentId: center.id });
+    const ix = service.registerAgent({
+      token: join.token,
       name: '上海 IX',
+      reachabilityType: 'ix',
       controlEndpoint: 'http://10.20.0.8:8790',
       dataEndpoint: '10.20.0.8:19801',
       dataListenPort: 19801,
       wgDataPublicKey: 'i'.repeat(44),
     }).node;
-    service.updateNode(ix.id, { reachabilityType: 'ix', canRelay: true });
-    const promoted = service.getNode(ix.id);
-    assert.equal(promoted.reachabilityType, 'ix');
-    assert.equal(promoted.hasPublicEndpoint, true);
-    assert.equal(promoted.canRelay, true);
-    assert.equal(promoted.dataEndpoint, '10.20.0.8:19801');
+    assert.equal(ix.reachabilityType, 'ix');
+    assert.equal(ix.hasPublicEndpoint, true);
+    assert.equal(ix.canRelay, true);
+    assert.equal(ix.dataEndpoint, '10.20.0.8:19801');
 
     const childToken = service.createJoinToken(network.id, {
       parentId: ix.id,
@@ -812,7 +805,7 @@ test('IX 节点可作主动加入父节点与主动认领，后续可连公网�
 
     assert.ok(!service.clusterVoterIds(network.id).includes(ix.id), 'IX 上行按 NAT，不得进入协调选民');
     const runtime = service.getClusterRuntime(network.id, center.id);
-    assert.equal(runtime.control.forwarders[ix.id], 'http://10.20.0.8:8790', '被动认领的 IX 节点可经内网入口被上游回拨');
+    assert.equal(runtime.control.forwarders[ix.id], undefined, '上游不得用 IX 自报入口做控制回拨');
   } finally { database.close(); }
 });
 
