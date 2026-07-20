@@ -661,7 +661,7 @@ test('无公网节点只主动拨号公网节点，两个无公网节点禁止�
     assert.equal(privateA.dataEndpoint, null);
     assert.throws(() => service.createLinkValidation(network.id, {
       nodeAId: privateA.id, nodeBId: privateB.id, nodeAAddress: '192.0.2.10',
-    }), /两个都没有公网入口/);
+    }), /只能和有公网入口的节点建立后续直连|两个都没有公网入口/);
 
     const publicToken = service.createJoinToken(network.id, { parentId: center.id });
     const publicNode = service.registerAgent({
@@ -677,7 +677,7 @@ test('无公网节点只主动拨号公网节点，两个无公网节点禁止�
   } finally { database.close(); }
 });
 
-test('IX 节点可作主动加入父节点与主动认领，但不能在拓扑中后续建链', () => {
+test('IX 节点可作主动加入父节点与主动认领，后续可连公网但不能连 NAT', () => {
   const { database, service, network, center } = fixture();
   try {
     const join = service.createJoinToken(network.id, { parentId: center.id });
@@ -714,24 +714,23 @@ test('IX 节点可作主动加入父节点与主动认领，但不能在拓扑�
       token: publicToken.token, name: '公网对照', hasPublicEndpoint: true,
       dataEndpoint: '198.51.100.20:19801', dataListenPort: 19801, wgDataPublicKey: 'p'.repeat(44),
     }).node;
+    const ixToPublic = service.createLinkValidation(network.id, {
+      nodeAId: ix.id, nodeBId: publicNode.id, nodeBAddress: '198.51.100.20',
+    });
+    assert.equal(ixToPublic.upstreamEndpoint, null);
+    assert.equal(ixToPublic.downstreamEndpoint, '198.51.100.20:19801');
+
+    const natToken = service.createJoinToken(network.id, { parentId: center.id });
+    const nat = service.registerAgent({
+      token: natToken.token, name: '纯 NAT', hasPublicEndpoint: false, wgDataPublicKey: 'n'.repeat(44),
+    }).node;
     assert.throws(() => service.createLinkValidation(network.id, {
-      nodeAId: publicNode.id, nodeBId: ix.id, nodeAAddress: '198.51.100.20',
-    }), /IX 节点不能在拓扑中/);
+      nodeAId: ix.id, nodeBId: nat.id, nodeAAddress: '10.20.0.8',
+    }), /只能和有公网入口的节点建立后续直连/);
 
     assert.ok(!service.clusterVoterIds(network.id).includes(ix.id), 'IX 上行按 NAT，不得进入协调选民');
     const runtime = service.getClusterRuntime(network.id, center.id);
     assert.equal(runtime.control.forwarders[ix.id], undefined, '上游不得用 IX 自报入口做控制回拨');
-    service.updateNode(ix.id, {
-      name: ix.name,
-      reachabilityType: 'ix',
-      canRelay: true,
-      controlEndpoint: ix.controlEndpoint,
-      controlListenPort: ix.controlListenPort,
-      dataEndpoint: ix.dataEndpoint,
-      dataListenPort: ix.dataListenPort,
-    });
-    assert.ok(!service.clusterVoterIds(network.id).includes(ix.id));
-    assert.equal(service.getClusterRuntime(network.id, center.id).control.forwarders[ix.id], undefined);
   } finally { database.close(); }
 });
 

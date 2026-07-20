@@ -763,7 +763,7 @@ function renderJoin() {
     <article class="card"><div class="card-head"><div><h2>生成安装命令</h2><p>${mode === 'passive' ? '选择负责主动连接待认领设备的已入网节点' : '选择新设备实际能够访问的接入节点'}</p></div></div>
       <form class="card-body form-stack" id="join-form">
         <div class="segmented"><label><input type="radio" name="mode" value="active" ${mode === 'active' ? 'checked' : ''}><span>设备主动加入</span></label><label><input type="radio" name="mode" value="passive" ${mode === 'passive' ? 'checked' : ''}><span>已入网节点主动认领</span></label></div>
-        <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '新设备主动拨号可接入父节点'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。公网与 IX 节点均可发起认领。' : '安装时会询问拨入类型：公网、纯 NAT 或 IX。IX 只发布给新节点用的内网入口，自身上行仍按 NAT；不能在拓扑中建立后续直连。'}</span></div>
+        <div class="notice"><strong>${mode === 'passive' ? '连接方向：认领节点 → 待认领设备' : '新设备主动拨号可接入父节点'}</strong><span>${mode === 'passive' ? '待认领设备只监听，不会反向连接接入节点；认领节点将代理它的注册、心跳和配置下发。公网与 IX 节点均可发起认领。' : '安装时会询问拨入类型：公网、纯 NAT 或 IX。IX 发布内网入口供新节点接入，上行仍按 NAT；NAT/IX 后续都可主动连接有公网的节点。'}</span></div>
         <label>${mode === 'passive' ? '执行认领的已入网节点' : '接入节点'}<select name="parentId">${nodes.map((node) => {
           const connection = controlConnection(node);
           const dataConnection = wireGuardConnection(node, connection.host);
@@ -1021,11 +1021,8 @@ function openConnectionDialog() {
       (link.upstreamId === nodeB.id && link.downstreamId === nodeA.id)
     ));
   if (existing) return toast('这两个节点之间已经存在连接或正在验证', 'error');
-  if (reachabilityTypeOf(nodeA) === 'ix' || reachabilityTypeOf(nodeB) === 'ix') {
-    return toast('IX 节点不能在拓扑中建立后续直连；请通过接入命令或主动认领完成初始链路', 'error');
-  }
   if (reachabilityTypeOf(nodeA) !== 'public' && reachabilityTypeOf(nodeB) !== 'public') {
-    return toast('两个节点都没有公网入口，不能建立直接连接', 'error');
+    return toast('NAT/IX 只能和有公网入口的节点建立后续直连', 'error');
   }
   const form = document.querySelector('#connection-form');
   form.elements.nodeAId.value = nodeA.id;
@@ -1041,19 +1038,19 @@ function openConnectionDialog() {
     const isPublic = reachabilityTypeOf(node) === 'public';
     address.disabled = !isPublic;
     port.disabled = !isPublic;
-    address.placeholder = isPublic ? '公网 IP 或域名' : '无公网：此侧不发布入口';
+    address.placeholder = isPublic ? '公网 IP 或域名' : `${reachabilityTypeOf(node) === 'ix' ? 'IX' : 'NAT'}：此侧仅主动拨出`;
   }
   form.elements.priority.value = 10;
   document.querySelector('#connection-pair').innerHTML = `<strong>${escapeHtml(nodeA.name)}</strong><span>↔</span><strong>${escapeHtml(nodeB.name)}</strong>`;
   document.querySelector('#node-a-address-label').textContent = reachabilityTypeOf(nodeA) === 'public'
     ? `${nodeA.name} 的公网 IP 或域名`
-    : `${nodeA.name} 无公网入口（仅主动拨出）`;
+    : `${nodeA.name}（${reachabilityTypeOf(nodeA) === 'ix' ? 'IX' : 'NAT'}，仅主动拨出）`;
   document.querySelector('#node-b-address-label').textContent = reachabilityTypeOf(nodeB) === 'public'
     ? `${nodeB.name} 的公网 IP 或域名`
-    : `${nodeB.name} 无公网入口（仅主动拨出）`;
+    : `${nodeB.name}（${reachabilityTypeOf(nodeB) === 'ix' ? 'IX' : 'NAT'}，仅主动拨出）`;
   document.querySelector('#connection-capability-note').innerHTML = reachabilityTypeOf(nodeA) === 'public' && reachabilityTypeOf(nodeB) === 'public'
     ? '<strong>两端均可被拨入</strong><span>系统会执行双向探测；任一方向成功即可建链，失败方向会被丢弃。</span>'
-    : `<strong>固定单向拨号</strong><span>${escapeHtml(reachabilityTypeOf(nodeA) === 'public' ? nodeB.name : nodeA.name)} 将主动拨号 ${escapeHtml(reachabilityTypeOf(nodeA) === 'public' ? nodeA.name : nodeB.name)}；NAT 出口端口由 WireGuard 握手动态学习。</span>`;
+    : `<strong>固定单向拨号</strong><span>${escapeHtml(reachabilityTypeOf(nodeA) === 'public' ? nodeB.name : nodeA.name)} 将主动拨号 ${escapeHtml(reachabilityTypeOf(nodeA) === 'public' ? nodeA.name : nodeB.name)}；NAT/IX 出口由 WireGuard 握手动态学习。</span>`;
   form.querySelector('[data-form-error]').textContent = '';
   document.querySelector('#connection-dialog').showModal();
 }

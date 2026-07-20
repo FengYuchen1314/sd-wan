@@ -97,7 +97,7 @@
           <select name="reachabilityType">
             <option value="public">公网可拨入</option>
             <option value="nat">纯 NAT（仅主动拨出）</option>
-            <option value="ix">IX（发布内网入口供新节点接入；本节点上行仍按 NAT）</option>
+            <option value="ix">IX（内网入口可接入新节点；上行按 NAT，可再连公网节点）</option>
           </select>
         </label>
         <label>接入中继地址<input name="controlEndpoint" placeholder="http://公网或内网IP:8790"></label>
@@ -125,13 +125,13 @@
         <label><span id="node-b-port-label">节点 B 固定入口端口</span><input name="nodeBPort" type="number" min="1" max="65535" required></label>
         <label class="span-2">路径优先级<input name="priority" type="number" min="0" value="10"><small>数字越小越优先；新直连通常会成为两节点之间的首选路径。</small></label>
       </div>
-      <div class="notice" id="connection-capability-note"><strong>按拨入类型确定拨号方向</strong><span>纯 NAT 只能主动拨号公网节点；IX 不能在拓扑中建立后续直连，请用接入命令或主动认领。</span></div>
+      <div class="notice" id="connection-capability-note"><strong>按拨入类型确定拨号方向</strong><span>NAT 与 IX 都可以主动拨号有公网的节点；两个非公网节点之间不能直连。</span></div>
       <p class="form-error" data-form-error></p>
       <div class="modal-actions"><button class="button ghost" value="cancel">取消</button><button class="button primary" value="default">开始连通性探测</button></div>
     </form>
   </dialog>
 
   <div id="toast-region" class="toast-region" aria-live="assertive"></div>
-  <script type="module" src="/app.js?v=25"></script>
+  <script type="module" src="/app.js?v=26"></script>
 </body>
 </html>

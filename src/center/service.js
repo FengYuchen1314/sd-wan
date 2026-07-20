@@ -1366,10 +1366,6 @@ export class ControlService {
     if (upstream.id === downstream.id) throw new Error('请选择两个不同节点');
     const unavailable = [upstream, downstream].find((node) => !node.isCoordinator && node.status !== 'online');
     if (unavailable) throw new Error(`节点 ${unavailable.name} 当前离线，不能开始直连验证`);
-    if (upstream.reachabilityType === 'ix' || downstream.reachabilityType === 'ix') {
-      throw new Error('IX 节点不能在拓扑中与其他节点建立后续直连；请通过“接入新节点”或主动认领完成初始链路');
-    }
-
     const duplicate = this.db.get(
       `SELECT id, validation_status FROM topology_links WHERE network_id = ?
        AND ((upstream_id = ? AND downstream_id = ?) OR (upstream_id = ? AND downstream_id = ?))
@@ -1385,14 +1381,16 @@ export class ControlService {
 
     const upstreamAddress = String(input.nodeAAddress ?? '').trim();
     const downstreamAddress = String(input.nodeBAddress ?? '').trim();
-    if (!publishesDialIn(upstream) && !publishesDialIn(downstream)) {
-      throw new Error('两个都没有公网入口的节点不能建立直接连接；请分别连接到具有公网入口的节点');
+    // 拓扑后续建链：NAT/IX 都可以主动拨号公网节点；两个非公网节点（NAT/IX）之间仍禁止直连。
+    if (upstream.reachabilityType !== 'public' && downstream.reachabilityType !== 'public') {
+      throw new Error('NAT 与 IX 只能和有公网入口的节点建立后续直连；两个非公网节点之间不能直连');
     }
+    const peerNeedsPublicDialIn = (node) => node.reachabilityType === 'nat' || node.reachabilityType === 'ix';
     const effectiveUpstreamAddress = upstream.reachabilityType === 'public'
-      ? (upstreamAddress || (downstream.reachabilityType === 'nat' ? hostFromEndpoint(upstream.dataEndpoint) : '') || '')
+      ? (upstreamAddress || (peerNeedsPublicDialIn(downstream) ? hostFromEndpoint(upstream.dataEndpoint) : '') || '')
       : '';
     const effectiveDownstreamAddress = downstream.reachabilityType === 'public'
-      ? (downstreamAddress || (upstream.reachabilityType === 'nat' ? hostFromEndpoint(downstream.dataEndpoint) : '') || '')
+      ? (downstreamAddress || (peerNeedsPublicDialIn(upstream) ? hostFromEndpoint(downstream.dataEndpoint) : '') || '')
       : '';
     if (!effectiveUpstreamAddress && !effectiveDownstreamAddress) {
       throw new Error('至少填写一个公网节点可被对方访问的 IP 或域名');

@@ -541,7 +541,7 @@ install_node() {
   elif [[ "$reachability" == "ix" ]]; then
     DATA_PORT="$(choose_port "WireGuard UDP 内网监听端口" udp 19801 "$DATA_PORT")"
     REACHABLE_HOST="${REACHABLE_HOST:-$(ask "同 IX/内网其他节点可访问本节点的内网 IP" "$(detect_reachable_host)")}"
-    echo "本节点按 IX 模式安装：将发布内网入口供新节点主动加入或认领，但不能在拓扑中与其他节点建立后续直连。"
+    echo "本节点按 IX 模式安装：将发布内网入口供新节点主动加入或认领；上行按 NAT，后续可主动连接有公网的节点。"
   else
     DATA_PORT="${DATA_PORT:-$(find_available_port udp 19801)}"
     REACHABLE_HOST="$(detect_reachable_host)"
