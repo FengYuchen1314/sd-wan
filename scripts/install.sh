@@ -443,6 +443,8 @@ Description=Watch for PathWeaver control-plane update requests
 
 [Path]
 PathExists=/var/lib/pathweaver/update-request.json
+PathChanged=/var/lib/pathweaver/update-request.json
+PathModified=/var/lib/pathweaver/update-request.json
 Unit=pathweaver-update-apply.service
 
 [Install]
@@ -450,6 +452,7 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable --now pathweaver-update.path
+  systemctl restart pathweaver-update.path || true
 }
 
 update_node() {

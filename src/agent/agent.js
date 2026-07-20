@@ -103,6 +103,33 @@ async function fetchUpdateArtifact(payload) {
   };
 }
 
+function triggerUpdateApply(requestFile) {
+  if (process.platform !== 'linux') return;
+  const applyScript = existsSync('/usr/local/libexec/pathweaver-apply-update')
+    ? '/usr/local/libexec/pathweaver-apply-update'
+    : resolve(dirname(fileURLToPath(import.meta.url)), '../../scripts/apply-update-request.sh');
+  const trySpawn = (command, args) => {
+    try {
+      const child = spawn(command, args, {
+        detached: true,
+        stdio: 'ignore',
+        env: {
+          ...process.env,
+          PATHWEAVER_UPDATE_REQUEST_FILE: requestFile,
+          PATHWEAVER_UPDATE_STAGING_DIR: process.env.SDWAN_UPDATE_STAGING_DIR || join(dirname(requestFile), 'update-staging'),
+          PATHWEAVER_UPDATE_APPLIED_FILE: process.env.SDWAN_UPDATE_APPLIED_FILE || join(dirname(requestFile), 'update-applied.json'),
+        },
+      });
+      child.unref();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (trySpawn('systemctl', ['start', 'pathweaver-update-apply.service'])) return;
+  if (existsSync(applyScript)) trySpawn('bash', [applyScript]);
+}
+
 function stageUpdateArtifact(payload) {
   const rolloutId = String(payload.rolloutId || '');
   if (!/^[0-9a-f-]{36}$/i.test(rolloutId)) throw new Error('更新任务 ID 无效');
@@ -123,6 +150,7 @@ function stageUpdateArtifact(payload) {
   writeFileSync(bundleFile, bundle, { mode: 0o600 });
   mkdirSync(dirname(requestFile), { recursive: true });
   atomicJson(requestFile, { rolloutId, installerFile, bundleFile, bundleSha256: digest });
+  triggerUpdateApply(requestFile);
   return { ok: true, scheduled: true, rolloutId, bundleSha256: digest };
 }
 

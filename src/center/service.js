@@ -2142,6 +2142,8 @@ export class ControlService {
       'SELECT status FROM update_rollout_nodes WHERE rollout_id = ? AND node_id = ?', rolloutId, localNode.id,
     );
     if (!localRow || localRow.status !== 'waiting-local') return;
+    // 其他节点只要已经拿到制品（scheduled）或结束，协调节点就可以更新；
+    // 不再等待它们全部 applied，否则协调节点会永远卡在 N-1。
     const remoteBlocking = Number(this.db.get(
       `SELECT COUNT(*) AS count FROM update_rollout_nodes
        WHERE rollout_id = ? AND node_id != ? AND status IN ('probing', 'source-ready', 'queued', 'installing')`,

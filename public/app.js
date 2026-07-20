@@ -175,6 +175,22 @@ function renderOverview() {
     </div>`;
 }
 
+function updateNodeStatusLabel(status) {
+  return ({
+    probing: '探测 GitHub',
+    'probe-failed': '探测失败',
+    'source-ready': '已取得制品',
+    queued: '等待领取',
+    installing: '领取制品中',
+    scheduled: '已暂存待应用',
+    'waiting-local': '等待最后更新本机',
+    completed: '已完成',
+    failed: '失败',
+    deferred: '已延期',
+    waiting: '等待中',
+  })[status] || status;
+}
+
 function renderUpdateSummary(update) {
   if (!update) return '<div class="notice"><strong>尚未执行全网更新</strong><span>点击后，各在线节点并行探测 GitHub；首个成功节点上传一次制品，其他节点无需访问 GitHub。</span></div>';
   const labels = {
@@ -182,9 +198,10 @@ function renderUpdateSummary(update) {
     partial: '部分完成', failed: '更新失败',
   };
   const completed = update.nodes.filter((node) => node.status === 'completed').length;
-  const failed = update.nodes.filter((node) => node.status === 'failed').length;
+  const pendingApply = update.nodes.filter((node) => ['scheduled', 'waiting-local'].includes(node.status)).length;
+  const failed = update.nodes.filter((node) => ['failed', 'probe-failed'].includes(node.status)).length;
   const source = update.source ? `更新源：${escapeHtml(update.source.name)}` : '正在选择更新源';
-  return `<div class="notice ${['partial', 'failed'].includes(update.status) ? 'warning' : ''}"><strong>${labels[update.status] || escapeHtml(update.status)}</strong><span>${source} · 完成 ${completed}/${update.nodes.length}${failed ? ` · 失败 ${failed}` : ''}${update.bundleSha256 ? ` · SHA256 ${escapeHtml(update.bundleSha256.slice(0, 12))}…` : ''}${update.error ? ` · ${escapeHtml(update.error)}` : ''}</span></div>`;
+  return `<div class="notice ${['partial', 'failed'].includes(update.status) ? 'warning' : ''}"><strong>${labels[update.status] || escapeHtml(update.status)}</strong><span>${source} · 完成 ${completed}/${update.nodes.length}${pendingApply ? ` · 待应用 ${pendingApply}` : ''}${failed ? ` · 失败 ${failed}` : ''}${update.bundleSha256 ? ` · SHA256 ${escapeHtml(update.bundleSha256.slice(0, 12))}…` : ''}${update.error ? ` · ${escapeHtml(update.error)}` : ''}</span></div>`;
 }
 
 function nodeTable(nodes, editable = true) {
@@ -814,7 +831,7 @@ function wireGuardConnection(node, fallbackHost = '') {
 function renderRollouts() {
   const activeUpdate = state.updateRollouts.some((update) => ['probing', 'distributing'].includes(update.status));
   return `<div class="section-stack"><article class="card"><div class="card-head"><div><h2>软件更新</h2><p>GitHub 探测、制品分发和每台节点的应用结果</p></div><button class="button primary small" id="update-all" ${!state.panelStatus?.writable || activeUpdate ? 'disabled' : ''}>${activeUpdate ? '更新进行中' : '一键更新全网'}</button></div>
-    <div class="card-body section-stack">${state.updateRollouts.length ? state.updateRollouts.map((update) => `${renderUpdateSummary(update)}<div class="command-meta">${update.nodes.map((node) => `<span>${escapeHtml(node.name)}：${escapeHtml(node.status)}</span>`).join('')}</div>`).join('') : renderUpdateSummary(null)}</div>
+    <div class="card-body section-stack">${state.updateRollouts.length ? state.updateRollouts.map((update) => `${renderUpdateSummary(update)}<div class="command-meta">${update.nodes.map((node) => `<span>${escapeHtml(node.name)}：${escapeHtml(updateNodeStatusLabel(node.status))}${node.error ? `（${escapeHtml(node.error)}）` : ''}</span>`).join('')}</div>`).join('') : renderUpdateSummary(null)}</div>
   </article><article class="card"><div class="card-head"><div><h2>配置版本</h2><p>IP 和拓扑变更均通过准备、激活两个阶段发布</p></div></div>
     <div class="timeline">${state.configurations.length ? state.configurations.map((version) => `<div class="rollout"><span class="version">v${version.version}</span><span><strong>${escapeHtml(version.reason)}</strong><small class="rollout-id">${escapeHtml(version.id.slice(0, 12))}</small></span><span class="status ${escapeHtml(version.status)}">${escapeHtml(version.status)}</span><span>${formatDate(version.activatedAt || version.createdAt)}</span></div>`).join('') : '<div class="empty">暂无配置版本</div>'}</div>
   </article></div>`;

@@ -1,7 +1,8 @@
 import { createServer } from 'node:http';
 import { Readable } from 'node:stream';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { extname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Database } from './database.js';
@@ -58,6 +59,34 @@ const wireGuardArtifacts = new WireGuardArtifactStore(join(dataDir, 'artifacts',
 service.ensureDefaultNetwork();
 service.recoverUpdateRollouts();
 
+function triggerLocalUpdateApply() {
+  if (process.platform !== 'linux') return;
+  const applyScript = existsSync('/usr/local/libexec/pathweaver-apply-update')
+    ? '/usr/local/libexec/pathweaver-apply-update'
+    : join(rootDir, 'scripts', 'apply-update-request.sh');
+  const trySpawn = (command, args) => {
+    try {
+      const child = spawn(command, args, {
+        detached: true,
+        stdio: 'ignore',
+        env: {
+          ...process.env,
+          PATHWEAVER_UPDATE_REQUEST_FILE: join(dataDir, 'update-request.json'),
+          PATHWEAVER_UPDATE_STAGING_DIR: join(dataDir, 'update-staging'),
+          PATHWEAVER_UPDATE_APPLIED_FILE: join(dataDir, 'update-applied.json'),
+        },
+      });
+      child.unref();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // PathExists 在部分环境下不可靠（尤其是协调节点最后更新）；主动拉起 oneshot / 脚本。
+  if (trySpawn('systemctl', ['start', 'pathweaver-update-apply.service'])) return;
+  if (existsSync(applyScript)) trySpawn('bash', [applyScript]);
+}
+
 function stageLocalUpdate({ rolloutId, installer, bundleBase64, bundleSha256 }) {
   if (!/^[0-9a-f-]{36}$/i.test(String(rolloutId || ''))) throw new Error('更新任务 ID 无效');
   const bundle = Buffer.from(String(bundleBase64 || ''), 'base64');
@@ -71,6 +100,7 @@ function stageLocalUpdate({ rolloutId, installer, bundleBase64, bundleSha256 }) 
   const temporary = `${requestFile}.tmp`;
   writeFileSync(temporary, `${JSON.stringify({ rolloutId, installerFile, bundleFile, bundleSha256 })}\n`, { mode: 0o600 });
   renameSync(temporary, requestFile);
+  triggerLocalUpdateApply();
 }
 
 function updateArtifactFiles(rolloutId) {
@@ -215,7 +245,10 @@ function localNodeId(networkId) {
       if (node.networkId === networkId) return promotedNodeId;
     } catch {}
   }
-  return service.listNodes(networkId).find((node) => node.isCenter)?.id || null;
+  const nodes = service.listNodes(networkId);
+  return nodes.find((node) => node.isCoordinator)?.id
+    || nodes.find((node) => node.isCenter)?.id
+    || null;
 }
 
 function tokenMatchesHash(token, expectedHash) {
@@ -263,6 +296,21 @@ async function runLocalCommand(nodeId, command) {
   }
   if (command.type === 'execute-link-benchmark') {
     return executeBenchmark(command.payload);
+  }
+  if (command.type === 'probe-update-source') {
+    return probeGithubUpdateArtifact(command.payload);
+  }
+  if (command.type === 'install-update-bundle') {
+    const artifact = command.payload?.bundleBase64 && command.payload?.installer
+      ? command.payload
+      : service.getUpdateArtifactForAgent(nodeId, command.payload.rolloutId);
+    stageLocalUpdate({
+      rolloutId: command.payload.rolloutId,
+      installer: artifact.installer,
+      bundleBase64: artifact.bundleBase64,
+      bundleSha256: artifact.bundleSha256 || command.payload.bundleSha256,
+    });
+    return { ok: true, scheduled: true, rolloutId: command.payload.rolloutId, bundleSha256: artifact.bundleSha256 };
   }
   throw new Error(`本机协调节点不支持命令 ${command.type}`);
 }
@@ -333,14 +381,25 @@ let lastLocalUpdateMarker = '';
 function reconcileLocalUpdateMarker() {
   let marker;
   try { marker = JSON.parse(readFileSync(join(dataDir, 'update-applied.json'), 'utf8')); }
-  catch { return; }
-  const markerKey = `${marker.rolloutId || ''}:${marker.ok}:${marker.error || ''}`;
-  if (!marker.rolloutId || markerKey === lastLocalUpdateMarker) return;
-  for (const network of service.listNetworks()) {
-    const nodeId = localNodeId(network.id);
-    if (nodeId) service.recordUpdateApplied(nodeId, marker.rolloutId, marker.ok === false ? marker.error || '本机更新失败' : null);
+  catch { marker = null; }
+  if (marker?.rolloutId) {
+    const markerKey = `${marker.rolloutId || ''}:${marker.ok}:${marker.error || ''}`;
+    if (markerKey !== lastLocalUpdateMarker) {
+      for (const network of service.listNetworks()) {
+        const nodeId = localNodeId(network.id);
+        if (nodeId) {
+          service.recordUpdateApplied(
+            nodeId,
+            marker.rolloutId,
+            marker.ok === false ? marker.error || '本机更新失败' : null,
+          );
+        }
+      }
+      lastLocalUpdateMarker = markerKey;
+    }
   }
-  lastLocalUpdateMarker = markerKey;
+  // 协调节点最后更新时，若已暂存但 systemd PathExists 未拉起，周期性补触发。
+  if (existsSync(join(dataDir, 'update-request.json'))) triggerLocalUpdateApply();
 }
 
 function electionFor(networkId) {
