@@ -1,7 +1,13 @@
 import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
 import { containsIPv4, parseCIDR, parseIPv4, usableHost } from '../core/ipv4.js';
 import { enumerateSimplePaths } from '../core/paths.js';
-import { remoteEndpointForSource, resolveLinkEndpoints } from '../core/link-endpoints.js';
+import {
+  remoteEndpointForSource,
+  resolveLinkEndpoints,
+  selectLinkBenchmarkDirection,
+  validationInternalProbePlan,
+  validationProbeRequestedFlags,
+} from '../core/link-endpoints.js';
 import { validateAndCompileTopology } from '../core/topology.js';
 
 const now = () => new Date().toISOString();
@@ -847,12 +853,16 @@ export class ControlService {
 
   listLinks(networkId, activeOnly = false) {
     const condition = activeOnly ? " AND validation_status = 'active'" : '';
+    const nodesById = new Map(this.listNodes(networkId).map((node) => [node.id, node]));
     return this.db.all(`SELECT * FROM topology_links WHERE network_id = ?${condition} ORDER BY priority, created_at`, networkId)
       .map((row) => {
         const upstreamProbe = Number(row.validation_probed_upstream ?? 0);
         const downstreamProbe = Number(row.validation_probed_downstream ?? 0);
-        const upstreamRequested = Boolean(row.downstream_endpoint) || upstreamProbe !== 0;
-        const downstreamRequested = Boolean(row.upstream_endpoint) || downstreamProbe !== 0;
+        const { upstreamRequested, downstreamRequested } = validationProbeRequestedFlags(
+          row,
+          nodesById.get(row.upstream_id),
+          nodesById.get(row.downstream_id),
+        );
         const directionStatus = (value, requested) => !requested ? 'not-requested' : value > 0 ? 'reachable' : value < 0 ? 'unreachable' : 'unknown';
         return ({
         id: row.id,
@@ -1377,7 +1387,7 @@ export class ControlService {
 
     const upstreamAddress = String(input.nodeAAddress ?? '').trim();
     const downstreamAddress = String(input.nodeBAddress ?? '').trim();
-    // 拓扑后续建链：NAT/IX 都可以主动拨号公网节点；两个非公网节点（NAT/IX）之间仍禁止直连。
+    // 上层策略：后续手动建链时 NAT/IX 只能连公网节点；WireGuard 拨号方向由 link-endpoints 单独推导。
     if (upstream.reachabilityType !== 'public' && downstream.reachabilityType !== 'public') {
       throw new Error('NAT 与 IX 只能和有公网入口的节点建立后续直连；两个非公网节点之间不能直连');
     }
@@ -2009,8 +2019,9 @@ export class ControlService {
     for (const linkId of linkIds) {
       const link = activeById.get(linkId);
       if (!link) continue;
-      const sourceId = link.downstreamEndpoint ? link.upstreamId : link.upstreamEndpoint ? link.downstreamId : link.upstreamId;
-      const targetId = sourceId === link.upstreamId ? link.downstreamId : link.upstreamId;
+      const upstream = this.getNode(link.upstreamId);
+      const downstream = this.getNode(link.downstreamId);
+      const { sourceId, targetId } = selectLinkBenchmarkDirection(link, upstream, downstream);
       const source = this.getNode(sourceId);
       const target = this.getNode(targetId);
       const online = (node) => node.isCoordinator || node.status === 'online';
@@ -2555,24 +2566,16 @@ export class ControlService {
         this.db.run("UPDATE topology_links SET validation_status = 'probing' WHERE id = ?", link.id);
         const upstream = this.getNode(updated.upstream_id);
         const downstream = this.getNode(updated.downstream_id);
-        if (updated.downstream_endpoint) {
-          this.enqueueCommand(updated.upstream_id, 'execute-link-probe', {
+        const plan = validationInternalProbePlan(updated, upstream, downstream);
+        for (const direction of plan.probes) {
+          const target = direction.targetId === upstream.id ? upstream : downstream;
+          this.enqueueCommand(direction.sourceId, 'execute-link-probe', {
             validationId: link.id,
             probeId: randomUUID(),
             maxHops: 16,
             token: updated.validation_token,
-            remoteUrl: probeUrl(downstream),
-            expectedNodeId: updated.downstream_id,
-          });
-        }
-        if (updated.upstream_endpoint) {
-          this.enqueueCommand(updated.downstream_id, 'execute-link-probe', {
-            validationId: link.id,
-            probeId: randomUUID(),
-            maxHops: 16,
-            token: updated.validation_token,
-            remoteUrl: probeUrl(upstream),
-            expectedNodeId: updated.upstream_id,
+            remoteUrl: probeUrl(target),
+            expectedNodeId: direction.targetId,
           });
         }
       }
@@ -2587,9 +2590,11 @@ export class ControlService {
       probeValue, result.ok ? null : (result.error || '该方向不可达'), link.id,
     );
     const updated = this.db.get('SELECT * FROM topology_links WHERE id = ?', link.id);
+    const upstream = this.getNode(updated.upstream_id);
+    const downstream = this.getNode(updated.downstream_id);
+    const { requested } = validationInternalProbePlan(updated, upstream, downstream);
     const successes = Number(updated.validation_probed_upstream > 0) + Number(updated.validation_probed_downstream > 0);
     const completed = Number(updated.validation_probed_upstream !== 0) + Number(updated.validation_probed_downstream !== 0);
-    const requested = Number(Boolean(updated.downstream_endpoint)) + Number(Boolean(updated.upstream_endpoint));
     if (link.validation_status === 'active') {
       return;
     }
