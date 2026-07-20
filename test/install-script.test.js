@@ -2,11 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-const installer = readFileSync(new URL('../scripts/install.sh', import.meta.url), 'utf8');
-const updater = readFileSync(new URL('../scripts/update.sh', import.meta.url), 'utf8');
-const uninstaller = readFileSync(new URL('../scripts/uninstall.sh', import.meta.url), 'utf8');
-const bundleSource = readFileSync(new URL('../src/center/center-bundle.js', import.meta.url), 'utf8');
-const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+const readText = (relativePath) => readFileSync(new URL(relativePath, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+const installer = readText('../scripts/install.sh');
+const updater = readText('../scripts/update.sh');
+const uninstaller = readText('../scripts/uninstall.sh');
+const bundleSource = readText('../src/center/center-bundle.js');
+const readme = readText('../README.md');
 
 test('安装脚本无条件构建并启用 PathWeaver 私有 WireGuard 运行时', () => {
   assert.match(installer, /install_private_wireguard_runtime/);
@@ -40,7 +41,13 @@ test('统一对等节点安装不再要求选择中心或边缘，并为每台�
   assert.match(installer, /pathweaver-node\.service/);
 });
 
-test('安装器写入 node.env 时使用不含 $ 的 scrypt 哈希，避免 systemd 截断面板密码', () => {
+test('主动加入上级时安装器强制纯 NAT，不再询问拨入类型', () => {
+  assert.match(installer, /elif \[\[ -n "\$JOIN_TOKEN" \|\| -n "\$UPSTREAM" \]\]; then/);
+  assert.match(installer, /reachability="nat"/);
+  assert.match(installer, /本节点通过主动连接加入上级，按纯 NAT 安装/);
+});
+
+test('安装器写入 node.env 时使用不含 \$ 的 scrypt 哈希，避免 systemd 截断面板密码', () => {
   assert.match(installer, /write_bootstrap_node_env/);
   assert.match(installer, /write_peer_node_env/);
   assert.match(installer, /scrypt-v1\.\$\{salt/);

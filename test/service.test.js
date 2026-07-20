@@ -14,6 +14,44 @@ function fixture() {
   return { database, service, network, center: service.listNodes(network.id)[0] };
 }
 
+function registerPublicEdge(service, network, parent, input = {}) {
+  const token = service.createJoinToken(network.id, {
+    parentId: parent.id,
+    mode: 'passive',
+    ...(input.tokenOptions ?? {}),
+  });
+  return service.registerAgent({
+    token: token.token,
+    passive: true,
+    name: input.name ?? '公网边缘',
+    wgDataPublicKey: input.wgDataPublicKey ?? 'a'.repeat(44),
+    dataEndpoint: input.dataEndpoint ?? '192.168.1.10:51820',
+    controlEndpoint: input.controlEndpoint,
+    controlListenPort: input.controlListenPort,
+    dataListenPort: input.dataListenPort,
+    reachabilityType: input.reachabilityType ?? 'public',
+    hasPublicEndpoint: input.hasPublicEndpoint ?? true,
+    canRelay: input.canRelay,
+  });
+}
+
+function registerActiveJoinNode(service, network, parent, input = {}) {
+  const token = service.createJoinToken(network.id, {
+    parentId: parent.id,
+    ...(input.tokenOptions ?? {}),
+  });
+  return service.registerAgent({
+    token: token.token,
+    name: input.name ?? '主动加入节点',
+    wgDataPublicKey: input.wgDataPublicKey ?? 'n'.repeat(44),
+    dataListenPort: input.dataListenPort,
+    controlListenPort: input.controlListenPort,
+    reachabilityType: input.reachabilityType,
+    dataEndpoint: input.dataEndpoint,
+    controlEndpoint: input.controlEndpoint,
+  });
+}
+
 test('创建网络时生成初始协调节点与首个 active 配置', () => {
   const { database, service, network, center } = fixture();
   try {
@@ -225,19 +263,27 @@ test('被动认领固定从指定 GitHub 仓库安装，命令不要求目标访
   } finally { database.close(); }
 });
 
-test('选择边缘父节点时强制携带新设备可达的中继地址', () => {
+test('主动加入的边缘节点不能通过修改配置变成下级接入父节点', () => {
   const { database, service, network, center } = fixture();
   try {
-    const first = service.createJoinToken(network.id, { parentId: center.id });
-    const edge = service.registerAgent({ token: first.token, name: '一级边缘', wgDataPublicKey: 'f'.repeat(44) }).node;
+    const edge = registerActiveJoinNode(service, network, center, {
+      name: '一级边缘',
+      wgDataPublicKey: 'f'.repeat(44),
+    }).node;
     assert.throws(() => service.createJoinToken(network.id, { parentId: edge.id }), /纯 NAT 节点|没有公网拨入能力/);
-    service.updateNode(edge.id, {
+    assert.throws(() => service.updateNode(edge.id, {
       hasPublicEndpoint: true,
       canRelay: true,
       controlEndpoint: 'http://192.168.8.20:8790',
       dataEndpoint: '192.168.8.20:51820',
-    });
-    const second = service.createJoinToken(network.id, { parentId: edge.id });
+    }), /主动加入的节点只能保持 NAT/);
+    const publicEdge = registerPublicEdge(service, network, center, {
+      name: '公网边缘',
+      wgDataPublicKey: 'g'.repeat(44),
+      controlEndpoint: 'http://192.168.8.20:8790',
+      dataEndpoint: '192.168.8.20:51820',
+    }).node;
+    const second = service.createJoinToken(network.id, { parentId: publicEdge.id });
     assert.match(second.command, /curl -fsSL 'http:\/\/192\.168\.8\.20:8790\/install\.sh'/);
     assert.match(second.command, /--source 'http:\/\/192\.168\.8\.20:8790'/);
     assert.match(second.command, /--upstream 'http:\/\/192\.168\.8\.20:8790'/);
@@ -247,9 +293,7 @@ test('选择边缘父节点时强制携带新设备可达的中继地址', () =>
 test('公网子节点通过边缘父节点主动加入时，父节点仍动态学习子节点 Endpoint', () => {
   const { database, service, network, center } = fixture();
   try {
-    const edgeToken = service.createJoinToken(network.id, { parentId: center.id });
-    const edge = service.registerAgent({
-      token: edgeToken.token,
+    const edge = registerPublicEdge(service, network, center, {
       name: '边缘 A',
       wgDataPublicKey: 'a'.repeat(44),
       dataEndpoint: '192.168.8.20:51820',
@@ -269,7 +313,9 @@ test('公网子节点通过边缘父节点主动加入时，父节点仍动态�
       dataEndpoint: '203.0.113.50:51820',
     });
     assert.equal(child.node.parentId, edge.id);
-    assert.equal(child.node.reachabilityType, 'public');
+    assert.equal(child.node.reachabilityType, 'nat');
+    assert.equal(child.node.joinMode, 'active');
+    assert.equal(child.node.dataEndpoint, null);
     const joinLink = service.listLinks(network.id).find((link) =>
       link.upstreamId === edge.id && link.downstreamId === child.node.id);
     assert.equal(joinLink.downstreamEndpoint, '');
@@ -309,13 +355,11 @@ test('公网子节点通过边缘父节点主动加入时，父节点仍动态�
 test('可视化新增连接必须经两个节点准备和双向探测后激活', () => {
   const { database, service, network, center } = fixture();
   try {
-    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeA = service.registerAgent({
-      token: tokenA.token, name: '节点 A', wgDataPublicKey: 'a'.repeat(44), dataEndpoint: '192.168.1.10:51820',
+    const nodeA = registerPublicEdge(service, network, center, {
+      name: '节点 A', wgDataPublicKey: 'a'.repeat(44), dataEndpoint: '192.168.1.10:51820',
     }).node;
-    const tokenB = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeB = service.registerAgent({
-      token: tokenB.token, name: '节点 B', wgDataPublicKey: 'b'.repeat(44), dataEndpoint: '10.10.0.20:51820',
+    const nodeB = registerPublicEdge(service, network, center, {
+      name: '节点 B', wgDataPublicKey: 'b'.repeat(44), dataEndpoint: '10.10.0.20:51820',
     }).node;
 
     const candidate = service.createLinkValidation(network.id, {
@@ -354,18 +398,14 @@ test('可视化新增连接必须经两个节点准备和双向探测后激活',
 test('双向探测只要一个方向成功即可建链，并使用数据库中的控制端口', () => {
   const { database, service, network, center } = fixture();
   try {
-    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeA = service.registerAgent({
-      token: tokenA.token,
+    const nodeA = registerPublicEdge(service, network, center, {
       name: '单向节点 A',
       controlListenPort: 19001,
       dataListenPort: 21001,
       wgDataPublicKey: 'a'.repeat(44),
       dataEndpoint: '192.168.50.10:21001',
     }).node;
-    const tokenB = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeB = service.registerAgent({
-      token: tokenB.token,
+    const nodeB = registerPublicEdge(service, network, center, {
       name: '单向节点 B',
       controlListenPort: 19002,
       dataListenPort: 21002,
@@ -414,18 +454,14 @@ test('双向探测只要一个方向成功即可建链，并使用数据库中�
 test('只填写一个可达地址时仅探测该方向，成功后建立单向发起链路', () => {
   const { database, service, network, center } = fixture();
   try {
-    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeA = service.registerAgent({
-      token: tokenA.token,
+    const nodeA = registerPublicEdge(service, network, center, {
       name: '单地址节点 A',
       controlListenPort: 19101,
       dataListenPort: 21101,
       wgDataPublicKey: 'a'.repeat(44),
       dataEndpoint: '192.168.60.10:21101',
     }).node;
-    const tokenB = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeB = service.registerAgent({
-      token: tokenB.token,
+    const nodeB = registerPublicEdge(service, network, center, {
       name: '单地址节点 B',
       controlListenPort: 19102,
       dataListenPort: 21102,
@@ -480,18 +516,13 @@ test('只填写一个可达地址时仅探测该方向，成功后建立单向�
 test('单向 NAT 直连握手失败时基础拓扑自动回退，恢复后重新启用直连', () => {
   const { database, service, network, center } = fixture();
   try {
-    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
-    const ix = service.registerAgent({
-      token: tokenA.token,
+    const ix = registerActiveJoinNode(service, network, center, {
       name: '上海 IX',
       controlListenPort: 19201,
       dataListenPort: 21201,
       wgDataPublicKey: 'a'.repeat(44),
-      hasPublicEndpoint: false,
     }).node;
-    const tokenB = service.createJoinToken(network.id, { parentId: center.id });
-    const london = service.registerAgent({
-      token: tokenB.token,
+    const london = registerPublicEdge(service, network, center, {
       name: '伦敦节点',
       controlListenPort: 19202,
       dataListenPort: 21202,
@@ -553,20 +584,15 @@ test('单向 NAT 直连握手失败时基础拓扑自动回退，恢复后重新
 test('新节点端口由本机安装决定，注册后保存并用于配置和手动连接', () => {
   const { database, service, network, center } = fixture();
   try {
-    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
-    assert.doesNotMatch(tokenA.command, /--data-port/);
-    const nodeA = service.registerAgent({
-      token: tokenA.token,
+    const joinToken = service.createJoinToken(network.id, { parentId: center.id });
+    assert.doesNotMatch(joinToken.command, /--data-port/);
+    const nodeA = registerActiveJoinNode(service, network, center, {
       name: '端口节点 A',
       controlListenPort: 18991,
       dataListenPort: 19991,
       wgDataPublicKey: 'a'.repeat(44),
-      dataEndpoint: '192.168.20.10:19991',
     }).node;
-    const tokenB = service.createJoinToken(network.id, { parentId: center.id });
-    assert.doesNotMatch(tokenB.command, /--data-port/);
-    const nodeB = service.registerAgent({
-      token: tokenB.token,
+    const nodeB = registerPublicEdge(service, network, center, {
       name: '端口节点 B',
       dataListenPort: 19992,
       wgDataPublicKey: 'b'.repeat(44),
@@ -582,15 +608,13 @@ test('新节点端口由本机安装决定，注册后保存并用于配置和�
     assert.equal(JSON.parse(configRow.config_json).data.listenPort, 19991);
 
     const candidate = service.createLinkValidation(network.id, {
-      nodeAId: nodeA.id,
-      nodeBId: nodeB.id,
-      nodeAAddress: '192.168.20.10',
-      nodeBAddress: '192.168.20.11',
-      nodeAPort: 21001,
-      nodeBPort: 21002,
+      nodeAId: nodeB.id,
+      nodeBId: nodeA.id,
+      nodeAAddress: '192.168.20.11',
+      nodeAPort: 21002,
     });
-    assert.equal(candidate.upstreamEndpoint, '192.168.20.10:21001');
-    assert.equal(candidate.downstreamEndpoint, '192.168.20.11:21002');
+    assert.equal(candidate.upstreamEndpoint, '192.168.20.11:21002');
+    assert.equal(candidate.downstreamEndpoint, null);
   } finally { database.close(); }
 });
 
@@ -689,13 +713,11 @@ test('离线节点不再永久阻塞业务网段切换，并在恢复后追赶 a
 test('新增连接拒绝非法互访地址和重复节点对', () => {
   const { database, service, network, center } = fixture();
   try {
-    const token = service.createJoinToken(network.id, { parentId: center.id });
-    const edge = service.registerAgent({
-      token: token.token, name: '边缘', wgDataPublicKey: 'c'.repeat(44), dataEndpoint: '192.168.1.20:19801',
+    const edge = registerPublicEdge(service, network, center, {
+      name: '边缘', wgDataPublicKey: 'c'.repeat(44), dataEndpoint: '192.168.1.20:19801',
     }).node;
-    const token2 = service.createJoinToken(network.id, { parentId: center.id });
-    const edge2 = service.registerAgent({
-      token: token2.token, name: '边缘 2', wgDataPublicKey: 'd'.repeat(44), dataEndpoint: '192.168.1.21:19801',
+    const edge2 = registerPublicEdge(service, network, center, {
+      name: '边缘 2', wgDataPublicKey: 'd'.repeat(44), dataEndpoint: '192.168.1.21:19801',
     }).node;
     assert.throws(() => service.createLinkValidation(network.id, {
       nodeAId: edge.id, nodeBId: edge2.id,
@@ -712,23 +734,22 @@ test('新增连接拒绝非法互访地址和重复节点对', () => {
 test('无公网节点只主动拨号公网节点，两个无公网节点禁止直连', () => {
   const { database, service, network, center } = fixture();
   try {
-    const privateTokenA = service.createJoinToken(network.id, { parentId: center.id });
-    const privateA = service.registerAgent({
-      token: privateTokenA.token, name: 'NAT A', hasPublicEndpoint: false, wgDataPublicKey: 'a'.repeat(44),
+    const privateA = registerActiveJoinNode(service, network, center, {
+      name: 'NAT A', wgDataPublicKey: 'a'.repeat(44),
     }).node;
-    const privateTokenB = service.createJoinToken(network.id, { parentId: center.id });
-    const privateB = service.registerAgent({
-      token: privateTokenB.token, name: 'NAT B', hasPublicEndpoint: false, wgDataPublicKey: 'b'.repeat(44),
+    const privateB = registerActiveJoinNode(service, network, center, {
+      name: 'NAT B', wgDataPublicKey: 'b'.repeat(44),
     }).node;
     assert.equal(privateA.dataEndpoint, null);
     assert.throws(() => service.createLinkValidation(network.id, {
       nodeAId: privateA.id, nodeBId: privateB.id, nodeAAddress: '192.0.2.10',
     }), /只能和有公网入口的节点建立后续直连|两个都没有公网入口/);
 
-    const publicToken = service.createJoinToken(network.id, { parentId: center.id });
-    const publicNode = service.registerAgent({
-      token: publicToken.token, name: '公网节点', hasPublicEndpoint: true,
-      dataEndpoint: '198.51.100.8:21980', dataListenPort: 21980, wgDataPublicKey: 'c'.repeat(44),
+    const publicNode = registerPublicEdge(service, network, center, {
+      name: '公网节点',
+      dataEndpoint: '198.51.100.8:21980',
+      dataListenPort: 21980,
+      wgDataPublicKey: 'c'.repeat(44),
     }).node;
     const candidate = service.createLinkValidation(network.id, {
       nodeAId: privateA.id, nodeBId: publicNode.id, nodeAAddress: '192.0.2.10',
@@ -742,20 +763,19 @@ test('无公网节点只主动拨号公网节点，两个无公网节点禁止�
 test('IX 节点可作主动加入父节点与主动认领，后续可连公网但不能连 NAT', () => {
   const { database, service, network, center } = fixture();
   try {
-    const join = service.createJoinToken(network.id, { parentId: center.id });
-    const ix = service.registerAgent({
-      token: join.token,
+    const ix = registerPublicEdge(service, network, center, {
       name: '上海 IX',
-      reachabilityType: 'ix',
       controlEndpoint: 'http://10.20.0.8:8790',
       dataEndpoint: '10.20.0.8:19801',
       dataListenPort: 19801,
       wgDataPublicKey: 'i'.repeat(44),
     }).node;
-    assert.equal(ix.reachabilityType, 'ix');
-    assert.equal(ix.hasPublicEndpoint, true);
-    assert.equal(ix.canRelay, true);
-    assert.equal(ix.dataEndpoint, '10.20.0.8:19801');
+    service.updateNode(ix.id, { reachabilityType: 'ix', canRelay: true });
+    const promoted = service.getNode(ix.id);
+    assert.equal(promoted.reachabilityType, 'ix');
+    assert.equal(promoted.hasPublicEndpoint, true);
+    assert.equal(promoted.canRelay, true);
+    assert.equal(promoted.dataEndpoint, '10.20.0.8:19801');
 
     const childToken = service.createJoinToken(network.id, {
       parentId: ix.id,
@@ -771,10 +791,11 @@ test('IX 节点可作主动加入父节点与主动认领，后续可连公网�
     assert.equal(passive.mode, 'passive');
     assert.match(passive.command, /--claim-token/);
 
-    const publicToken = service.createJoinToken(network.id, { parentId: center.id });
-    const publicNode = service.registerAgent({
-      token: publicToken.token, name: '公网对照', hasPublicEndpoint: true,
-      dataEndpoint: '198.51.100.20:19801', dataListenPort: 19801, wgDataPublicKey: 'p'.repeat(44),
+    const publicNode = registerPublicEdge(service, network, center, {
+      name: '公网对照',
+      dataEndpoint: '198.51.100.20:19801',
+      dataListenPort: 19801,
+      wgDataPublicKey: 'p'.repeat(44),
     }).node;
     const ixToPublic = service.createLinkValidation(network.id, {
       nodeAId: ix.id, nodeBId: publicNode.id, nodeBAddress: '198.51.100.20',
@@ -782,9 +803,8 @@ test('IX 节点可作主动加入父节点与主动认领，后续可连公网�
     assert.equal(ixToPublic.upstreamEndpoint, null);
     assert.equal(ixToPublic.downstreamEndpoint, '198.51.100.20:19801');
 
-    const natToken = service.createJoinToken(network.id, { parentId: center.id });
-    const nat = service.registerAgent({
-      token: natToken.token, name: '纯 NAT', hasPublicEndpoint: false, wgDataPublicKey: 'n'.repeat(44),
+    const nat = registerActiveJoinNode(service, network, center, {
+      name: '纯 NAT', wgDataPublicKey: 'n'.repeat(44),
     }).node;
     assert.throws(() => service.createLinkValidation(network.id, {
       nodeAId: ix.id, nodeBId: nat.id, nodeAAddress: '10.20.0.8',
@@ -792,7 +812,7 @@ test('IX 节点可作主动加入父节点与主动认领，后续可连公网�
 
     assert.ok(!service.clusterVoterIds(network.id).includes(ix.id), 'IX 上行按 NAT，不得进入协调选民');
     const runtime = service.getClusterRuntime(network.id, center.id);
-    assert.equal(runtime.control.forwarders[ix.id], undefined, '上游不得用 IX 自报入口做控制回拨');
+    assert.equal(runtime.control.forwarders[ix.id], 'http://10.20.0.8:8790', '被动认领的 IX 节点可经内网入口被上游回拨');
   } finally { database.close(); }
 });
 
@@ -969,13 +989,11 @@ test('Agent 在领取命令后重启时，过期运行租约会自动回队而�
 test('连接验证超过有效期后自动失败并取消节点命令', () => {
   const { database, service, network, center } = fixture();
   try {
-    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeA = service.registerAgent({
-      token: tokenA.token, name: '超时节点 A', wgDataPublicKey: 'a'.repeat(44), dataEndpoint: '192.168.1.20:19801',
+    const nodeA = registerPublicEdge(service, network, center, {
+      name: '超时节点 A', wgDataPublicKey: 'a'.repeat(44), dataEndpoint: '192.168.1.20:19801',
     }).node;
-    const tokenB = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeB = service.registerAgent({
-      token: tokenB.token, name: '超时节点 B', wgDataPublicKey: 'b'.repeat(44), dataEndpoint: '192.168.1.21:19801',
+    const nodeB = registerPublicEdge(service, network, center, {
+      name: '超时节点 B', wgDataPublicKey: 'b'.repeat(44), dataEndpoint: '192.168.1.21:19801',
     }).node;
     const candidate = service.createLinkValidation(network.id, {
       nodeAId: nodeA.id, nodeBId: nodeB.id,
@@ -1017,13 +1035,11 @@ test('边缘节点心跳超时后离线并可通过新心跳恢复', () => {
 test('保存两节点多路径权重并写入版本化节点配置', () => {
   const { database, service, network, center } = fixture();
   try {
-    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeA = service.registerAgent({
-      token: tokenA.token, name: '多路径 A', wgDataPublicKey: 'a'.repeat(44), dataEndpoint: '192.168.10.10:19801',
+    const nodeA = registerPublicEdge(service, network, center, {
+      name: '多路径 A', wgDataPublicKey: 'a'.repeat(44), dataEndpoint: '192.168.10.10:19801',
     }).node;
-    const tokenB = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeB = service.registerAgent({
-      token: tokenB.token, name: '多路径 B', wgDataPublicKey: 'b'.repeat(44), dataEndpoint: '192.168.10.11:19801',
+    const nodeB = registerPublicEdge(service, network, center, {
+      name: '多路径 B', wgDataPublicKey: 'b'.repeat(44), dataEndpoint: '192.168.10.11:19801',
     }).node;
     const direct = service.createLinkValidation(network.id, {
       nodeAId: nodeA.id, nodeBId: nodeB.id,
@@ -1164,9 +1180,7 @@ test('保存两节点多路径权重并写入版本化节点配置', () => {
 test('删除节点前模拟剩余拓扑，失联时阻止删除，有替代链路时允许删除', () => {
   const { database, service, network, center } = fixture();
   try {
-    const tokenA = service.createJoinToken(network.id, { parentId: center.id });
-    const nodeA = service.registerAgent({
-      token: tokenA.token,
+    const nodeA = registerPublicEdge(service, network, center, {
       name: '中继 A',
       controlEndpoint: 'http://192.168.60.10:18901',
       controlListenPort: 18901,
@@ -1174,13 +1188,9 @@ test('删除节点前模拟剩余拓扑，失联时阻止删除，有替代链�
       dataListenPort: 20901,
       wgDataPublicKey: 'a'.repeat(44),
     }).node;
-    const tokenB = service.createJoinToken(network.id, { parentId: nodeA.id });
-    const nodeB = service.registerAgent({
-      token: tokenB.token,
+    const nodeB = registerActiveJoinNode(service, network, nodeA, {
       name: '下游 B',
-      controlEndpoint: 'http://192.168.60.11:18902',
       controlListenPort: 18902,
-      dataEndpoint: '192.168.60.11:20902',
       dataListenPort: 20902,
       wgDataPublicKey: 'b'.repeat(44),
     }).node;
@@ -1194,16 +1204,15 @@ test('删除节点前模拟剩余拓扑，失联时阻止删除，有替代链�
       nodeAId: center.id,
       nodeBId: nodeB.id,
       nodeAAddress: '203.0.113.1',
-      nodeBAddress: '192.168.60.11',
     });
     for (const node of [center, nodeB]) {
       const prepare = service.claimCommand(node.id);
-      service.completeCommand(node.id, prepare.id, { ok: true });
+      if (prepare) service.completeCommand(node.id, prepare.id, { ok: true });
     }
-    for (const node of [center, nodeB]) {
-      const probe = service.claimCommand(node.id);
-      service.completeCommand(node.id, probe.id, { ok: true });
-    }
+    const probeB = service.claimCommand(nodeB.id);
+    assert.ok(probeB);
+    service.completeCommand(nodeB.id, probeB.id, { ok: true, remoteNodeId: center.id });
+    assert.equal(service.claimCommand(center.id), null);
     assert.equal(service.listLinks(network.id).find((link) => link.id === replacement.id).validationStatus, 'active');
     const routeVersion = service.listConfigurations(network.id)[0];
     const routeRow = database.get(

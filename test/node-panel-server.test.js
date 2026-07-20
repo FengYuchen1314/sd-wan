@@ -130,17 +130,28 @@ test('初始协调节点会执行自己的连接验证命令，不再让双公�
     });
     networkId = network.id;
     const center = seeded.listNodes(network.id)[0];
-    const tokenA = seeded.createJoinToken(network.id, { parentId: center.id });
+    const parentClaim = seeded.createJoinToken(network.id, { parentId: center.id, mode: 'passive' });
+    const parentUrl = `http://127.0.0.1:32001`;
     const nodeA = seeded.registerAgent({
-      token: tokenA.token, name: '公网 A', hasPublicEndpoint: true,
-      controlEndpoint: 'http://127.0.0.1:32001', controlListenPort: 32001,
-      dataEndpoint: '127.0.0.1:33001', dataListenPort: 33001, wgDataPublicKey: 'b'.repeat(44),
+      token: parentClaim.token,
+      passive: true,
+      name: '公网 A',
+      controlEndpoint: parentUrl,
+      controlListenPort: 32001,
+      dataEndpoint: '127.0.0.1:33001',
+      dataListenPort: 33001,
+      wgDataPublicKey: 'b'.repeat(44),
     }).node;
-    const tokenB = seeded.createJoinToken(network.id, { parentId: nodeA.id });
+    const childClaim = seeded.createJoinToken(network.id, { parentId: nodeA.id, mode: 'passive' });
     const nodeB = seeded.registerAgent({
-      token: tokenB.token, name: '公网 B', hasPublicEndpoint: true,
-      controlEndpoint: 'http://127.0.0.1:32002', controlListenPort: 32002,
-      dataEndpoint: '127.0.0.1:33002', dataListenPort: 33002, wgDataPublicKey: 'c'.repeat(44),
+      token: childClaim.token,
+      passive: true,
+      name: '公网 B',
+      controlEndpoint: 'http://127.0.0.1:32002',
+      controlListenPort: 32002,
+      dataEndpoint: '127.0.0.1:33002',
+      dataListenPort: 33002,
+      wgDataPublicKey: 'c'.repeat(44),
     }).node;
     validationId = seeded.createLinkValidation(network.id, {
       nodeAId: center.id, nodeBId: nodeB.id,

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createSocket } from 'node:dgram';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -295,25 +295,58 @@ test('普通边缘父节点可代理严格单向子节点的注册、心跳和�
 
     const parentRelayPort = await availableTcpPort();
     const parentDataPort = await availableUdpPort();
-    const parentToken = service.createJoinToken(network.id, { parentId: center.id });
+    const parentUrl = `http://127.0.0.1:${parentRelayPort}`;
+    const parentClaim = service.createJoinToken(network.id, { parentId: center.id, mode: 'passive' });
+    const parentKeys = {
+      control: { privateKey: `${'a'.repeat(43)}=`, publicKey: `${'A'.repeat(43)}=` },
+      data: { privateKey: `${'b'.repeat(43)}=`, publicKey: `${'B'.repeat(43)}=` },
+    };
+    const parentRegistered = service.registerAgent({
+      token: parentClaim.token,
+      passive: true,
+      name: '代理边缘节点',
+      controlEndpoint: parentUrl,
+      controlListenPort: parentRelayPort,
+      dataEndpoint: `127.0.0.1:${parentDataPort}`,
+      dataListenPort: parentDataPort,
+      wgControlPublicKey: parentKeys.control.publicKey,
+      wgDataPublicKey: parentKeys.data.publicKey,
+    });
+    const parent = parentRegistered.node;
+    mkdirSync(parentDirectory, { recursive: true });
+    writeFileSync(join(parentDirectory, 'state.json'), JSON.stringify({
+      schemaVersion: 1,
+      name: '代理边缘节点',
+      nodeId: parent.id,
+      networkId: network.id,
+      credential: parentRegistered.credential,
+      upstream: apiRuntime.url,
+      controlListenPort: parentRelayPort,
+      dataListenPort: parentDataPort,
+      controlEndpoint: parentUrl,
+      dataEndpoint: `127.0.0.1:${parentDataPort}`,
+      reachabilityType: 'public',
+      hasPublicEndpoint: true,
+      controlKeys: parentKeys.control,
+      dataKeys: parentKeys.data,
+      currentVersion: 0,
+      preparedVersion: 0,
+      managedChildren: {},
+    }));
     processes.push(spawn(process.execPath, [
       resolve('src/agent/agent.js'),
       '--name', '代理边缘节点',
       '--upstream', apiRuntime.url,
-      '--join-token', parentToken.token,
       '--relay-port', String(parentRelayPort),
       '--data-port', String(parentDataPort),
-      '--control-endpoint', `http://127.0.0.1:${parentRelayPort}`,
+      '--control-endpoint', parentUrl,
       '--data-endpoint', `127.0.0.1:${parentDataPort}`,
     ], {
       cwd: resolve('.'),
       env: { ...process.env, SDWAN_AGENT_DATA_DIR: parentDirectory, SDWAN_POLL_INTERVAL: '100' },
       stdio: 'ignore',
     }));
-    const parent = await waitFor(
-      () => service.listNodes(network.id).find((node) => node.name === '代理边缘节点'),
-      '父节点注册',
-    );
+    await waitForHealth(parentUrl);
 
     const targetRelayPort = await availableTcpPort();
     const targetDataPort = await availableUdpPort();

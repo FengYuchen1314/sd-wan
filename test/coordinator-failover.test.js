@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { once } from 'node:events';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -55,6 +55,68 @@ function readState(directory) {
   return existsSync(filename) ? JSON.parse(readFileSync(filename, 'utf8')) : null;
 }
 
+function seedAgentState(directory, input) {
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, 'state.json'), JSON.stringify({
+    schemaVersion: 1,
+    name: input.name,
+    nodeId: input.nodeId,
+    networkId: input.networkId,
+    credential: input.credential,
+    upstream: input.upstream,
+    controlListenPort: input.relayPort,
+    dataListenPort: input.dataPort,
+    controlEndpoint: `http://127.0.0.1:${input.relayPort}`,
+    dataEndpoint: `127.0.0.1:${input.dataPort}`,
+    reachabilityType: 'public',
+    hasPublicEndpoint: true,
+    controlKeys: input.keys.control,
+    dataKeys: input.keys.data,
+    currentVersion: 0,
+    preparedVersion: 0,
+    managedChildren: {},
+  }));
+}
+
+async function registerPublicEdge({
+  centerUrl, networkId, parentId, name, relayPort, dataPort, directory, upstreamUrl, keys,
+}) {
+  const token = await requestJson(`${centerUrl}/api/v1/networks/${networkId}/join-tokens`, {
+    method: 'POST',
+    body: JSON.stringify({ parentId, mode: 'passive' }),
+  });
+  const registered = await fetch(`${centerUrl}/agent/v1/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      token: token.token,
+      passive: true,
+      name,
+      controlEndpoint: `http://127.0.0.1:${relayPort}`,
+      controlListenPort: relayPort,
+      dataEndpoint: `127.0.0.1:${dataPort}`,
+      dataListenPort: dataPort,
+      wgControlPublicKey: keys.control.publicKey,
+      wgDataPublicKey: keys.data.publicKey,
+    }),
+  }).then(async (response) => {
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    return body;
+  });
+  seedAgentState(directory, {
+    name,
+    nodeId: registered.node.id,
+    networkId,
+    credential: registered.credential,
+    upstream: upstreamUrl,
+    relayPort,
+    dataPort,
+    keys,
+  });
+  return registered.node;
+}
+
 test('三节点在初始协调节点失联后由最新副本多数派自动接管', { timeout: 30_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pathweaver-election-'));
   const centerDirectory = join(root, 'center');
@@ -86,6 +148,7 @@ test('三节点在初始协调节点失联后由最新副本多数派自动接�
         SDWAN_PORT: String(centerPort),
         SDWAN_PUBLIC_URL: centerUrl,
         SDWAN_DATA_DIR: centerDirectory,
+        SDWAN_ADMIN_TOKEN: 'dev-admin-token',
       },
     });
     processes.push(center);
@@ -95,19 +158,31 @@ test('三节点在初始协调节点失联后由最新副本多数派自动接�
     let topology = await requestJson(`${centerUrl}/api/v1/networks/${networkId}/topology`);
     const initialId = topology.nodes[0].id;
 
-    const tokenB = await waitFor(() => requestJson(`${centerUrl}/api/v1/networks/${networkId}/join-tokens`, {
-      method: 'POST', body: JSON.stringify({ parentId: initialId }),
-    }), '第二节点加入令牌');
+    const keysB = {
+      control: { privateKey: `${'a'.repeat(43)}=`, publicKey: `${'A'.repeat(43)}=` },
+      data: { privateKey: `${'b'.repeat(43)}=`, publicKey: `${'B'.repeat(43)}=` },
+    };
+    const nodeB = await registerPublicEdge({
+      centerUrl,
+      networkId,
+      parentId: initialId,
+      name: '选民-B',
+      relayPort: edgeBPort,
+      dataPort: edgeBDataPort,
+      directory: edgeBDirectory,
+      upstreamUrl: centerUrl,
+      keys: keysB,
+    });
     const edgeB = spawn(process.execPath, [resolve('src/agent/agent.js'),
-      '--name', '选民-B', '--upstream', centerUrl, '--join-token', tokenB.token,
+      '--name', '选民-B', '--upstream', centerUrl,
       '--relay-port', String(edgeBPort), '--data-port', String(edgeBDataPort),
       '--control-endpoint', `http://127.0.0.1:${edgeBPort}`,
       '--data-endpoint', `127.0.0.1:${edgeBDataPort}`,
     ], { cwd: resolve('.'), stdio: 'ignore', env: { ...commonEnvironment, SDWAN_AGENT_DATA_DIR: edgeBDirectory } });
     processes.push(edgeB);
-    const nodeB = await waitFor(async () => {
+    await waitFor(async () => {
       topology = await requestJson(`${centerUrl}/api/v1/networks/${networkId}/topology`);
-      return topology.nodes.find((node) => node.name === '选民-B');
+      return topology.nodes.find((node) => node.id === nodeB.id);
     }, '第二节点注册');
     await waitFor(async () => {
       const result = await requestJson(`${centerUrl}/api/v1/networks/${networkId}/configurations`);
@@ -122,11 +197,23 @@ test('三节点在初始协调节点失联后由最新副本多数派自动接�
     const relayedInstaller = await relayedInstallerResponse.text();
     assert.ok(relayedInstaller.includes(`SOURCE="${edgeBUrl}"`));
 
-    const tokenC = await waitFor(() => requestJson(`${centerUrl}/api/v1/networks/${networkId}/join-tokens`, {
-      method: 'POST', body: JSON.stringify({ parentId: nodeB.id }),
-    }), '第三节点加入令牌');
+    const keysC = {
+      control: { privateKey: `${'c'.repeat(43)}=`, publicKey: `${'C'.repeat(43)}=` },
+      data: { privateKey: `${'d'.repeat(43)}=`, publicKey: `${'D'.repeat(43)}=` },
+    };
+    const nodeC = await registerPublicEdge({
+      centerUrl,
+      networkId,
+      parentId: nodeB.id,
+      name: '选民-C',
+      relayPort: edgeCPort,
+      dataPort: edgeCDataPort,
+      directory: edgeCDirectory,
+      upstreamUrl: edgeBUrl,
+      keys: keysC,
+    });
     const edgeC = spawn(process.execPath, [resolve('src/agent/agent.js'),
-      '--name', '选民-C', '--upstream', `http://127.0.0.1:${edgeBPort}`, '--join-token', tokenC.token,
+      '--name', '选民-C', '--upstream', edgeBUrl,
       '--relay-port', String(edgeCPort), '--data-port', String(edgeCDataPort),
       '--control-endpoint', `http://127.0.0.1:${edgeCPort}`,
       '--data-endpoint', `127.0.0.1:${edgeCDataPort}`,
@@ -134,7 +221,7 @@ test('三节点在初始协调节点失联后由最新副本多数派自动接�
     processes.push(edgeC);
     await waitFor(async () => {
       topology = await requestJson(`${centerUrl}/api/v1/networks/${networkId}/topology`);
-      return topology.nodes.find((node) => node.name === '选民-C');
+      return topology.nodes.find((node) => node.id === nodeC.id);
     }, '第三节点经父节点注册');
     await waitFor(async () => {
       const result = await requestJson(`${centerUrl}/api/v1/networks/${networkId}/configurations`);

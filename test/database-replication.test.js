@@ -14,9 +14,10 @@ function populatedDatabase() {
     mtu: 1380,
   });
   const center = service.listNodes(network.id)[0];
-  const token = service.createJoinToken(network.id, { parentId: center.id });
+  const token = service.createJoinToken(network.id, { parentId: center.id, mode: 'passive' });
   const edge = service.registerAgent({
     token: token.token,
+    passive: true,
     name: '候选协调节点',
     controlEndpoint: 'http://edge.example:8790',
     dataEndpoint: 'edge.example:19801',

@@ -11,8 +11,14 @@ export function isParentChildLink(upstreamNode, downstreamNode) {
   return downstreamNode?.parentId === upstreamNode?.id;
 }
 
+/** 主动加入或纯 NAT 节点只主动拨出，对端应动态学习其 Endpoint。 */
+export function isDialOutOnlyNode(node) {
+  return node?.joinMode === 'active' || node?.reachabilityType === 'nat';
+}
+
 export function isActiveJoinLink(link, upstreamNode, downstreamNode) {
   if (!isParentChildLink(upstreamNode, downstreamNode)) return false;
+  if (downstreamNode?.joinMode === 'active') return true;
   const rawDownstream = normalizeEndpoint(link.downstreamEndpoint);
   const rawUpstream = link.upstreamEndpoint;
   // 被动认领：父节点保存子节点 Endpoint，upstream 为空
@@ -35,6 +41,12 @@ export function resolveLinkEndpoints(link, upstreamNode, downstreamNode) {
 
   if (isActiveJoinLink(link, upstreamNode, downstreamNode)) {
     downstreamEndpoint = null;
+  }
+  if (isDialOutOnlyNode(downstreamNode)) {
+    downstreamEndpoint = null;
+  }
+  if (isDialOutOnlyNode(upstreamNode)) {
+    upstreamEndpoint = null;
   }
 
   return { upstreamEndpoint, downstreamEndpoint };

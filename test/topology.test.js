@@ -79,15 +79,15 @@ test('拒绝孤立节点、自连接和重复 IP', () => {
   assert.ok(Object.values(dynamicOnly.configs).every((config) => config.data.peers[0].endpointMode === 'dynamic-learn'));
 });
 
-function childNode(id, offset, parentId) {
+function childNode(id, offset, parentId, { joinMode = 'active', reachabilityType = 'nat' } = {}) {
   return {
     id, name: id.toUpperCase(), parentId, dataIp: `10.77.0.${offset}`, controlIp: `10.254.0.${offset}`,
-    wgDataPublicKey: `${id}`.padEnd(44, '='), dataEndpoint: `${id}.example:51820`,
-    reachabilityType: 'public', hasPublicEndpoint: true,
+    wgDataPublicKey: `${id}`.padEnd(44, '='), dataEndpoint: reachabilityType === 'public' ? `${id}.example:51820` : null,
+    reachabilityType, joinMode, hasPublicEndpoint: reachabilityType === 'public',
   };
 }
 
-test('主动加入的父子链路强制父节点动态学习，即使子节点声明公网', () => {
+test('主动加入的父子链路强制父节点动态学习，即使子节点误带 Endpoint', () => {
   const nodes = [node('a', 1), childNode('b', 2, 'a')];
   const result = validateAndCompileTopology({
     network,

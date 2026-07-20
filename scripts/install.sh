@@ -590,6 +590,8 @@ install_node() {
   PANEL_PORT="$(choose_port "本机管理面板 TCP 端口" tcp 19773 "$PANEL_PORT")"
   if [[ "$bootstrap" -eq 1 || -n "$CLAIM_TOKEN" ]]; then
     reachability="public"
+  elif [[ -n "$JOIN_TOKEN" || -n "$UPSTREAM" ]]; then
+    reachability="nat"
   else
     reachability="$(choose_reachability "${REACHABILITY:-$PUBLIC_ENDPOINT}")"
   fi
@@ -610,7 +612,11 @@ install_node() {
   else
     DATA_PORT="${DATA_PORT:-$(find_available_port udp 19801)}"
     REACHABLE_HOST="$(detect_reachable_host)"
-    echo "本节点按纯 NAT 模式安装：WireGuard 本地端口已自动选择，不会发布给其他节点。"
+    if [[ -n "$JOIN_TOKEN" || -n "$UPSTREAM" ]]; then
+      echo "本节点通过主动连接加入上级，按纯 NAT 安装：仅主动拨出，对端将动态学习 Endpoint。"
+    else
+      echo "本节点按纯 NAT 模式安装：WireGuard 本地端口已自动选择，不会发布给其他节点。"
+    fi
   fi
   endpoint_host="$(format_endpoint_host "$REACHABLE_HOST")"
   choose_panel_password

@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   status TEXT NOT NULL,
   is_center INTEGER NOT NULL DEFAULT 0,
   reachability_type TEXT NOT NULL DEFAULT 'nat',
+  join_mode TEXT NOT NULL DEFAULT 'active',
   has_public_endpoint INTEGER NOT NULL DEFAULT 0,
   can_relay INTEGER NOT NULL DEFAULT 1,
   parent_id TEXT REFERENCES nodes(id),
@@ -363,6 +364,40 @@ export class Database {
       this.handle.exec("ALTER TABLE nodes ADD COLUMN reachability_type TEXT NOT NULL DEFAULT 'nat'");
       this.handle.exec("UPDATE nodes SET reachability_type = CASE WHEN has_public_endpoint = 1 THEN 'public' ELSE 'nat' END");
     }
+    if (!nodeColumns.has('join_mode')) {
+      this.handle.exec("ALTER TABLE nodes ADD COLUMN join_mode TEXT NOT NULL DEFAULT 'active'");
+      this.handle.exec("UPDATE nodes SET join_mode = 'center' WHERE is_center = 1");
+      this.handle.exec(`
+        UPDATE nodes
+        SET join_mode = 'passive'
+        WHERE parent_id IS NOT NULL
+          AND id IN (
+            SELECT tl.downstream_id
+            FROM topology_links tl
+            WHERE tl.downstream_id = nodes.id
+              AND tl.upstream_id = nodes.parent_id
+              AND COALESCE(tl.upstream_endpoint, '') = ''
+              AND COALESCE(tl.downstream_endpoint, '') != ''
+          )
+      `);
+      this.handle.exec(`
+        UPDATE nodes
+        SET join_mode = 'active'
+        WHERE is_center = 0
+          AND parent_id IS NOT NULL
+          AND join_mode != 'passive'
+      `);
+      this.handle.exec(`
+        UPDATE nodes
+        SET reachability_type = 'nat',
+            has_public_endpoint = 0,
+            can_relay = 0,
+            control_endpoint = NULL,
+            data_endpoint = NULL
+        WHERE join_mode = 'active'
+          AND is_center = 0
+      `);
+    }
     const proxyColumns = new Set(this.handle.prepare('PRAGMA table_info(managed_node_proxies)').all().map((column) => column.name));
     if (!proxyColumns.has('relay_path_json')) {
       this.handle.exec("ALTER TABLE managed_node_proxies ADD COLUMN relay_path_json TEXT NOT NULL DEFAULT '[]'");
@@ -475,6 +510,12 @@ export class Database {
           }
           if (table === 'nodes' && !Object.hasOwn(row, 'reachability_type')) {
             row = { ...row, reachability_type: row.has_public_endpoint ? 'public' : 'nat' };
+          }
+          if (table === 'nodes' && !Object.hasOwn(row, 'join_mode')) {
+            row = {
+              ...row,
+              join_mode: row.is_center ? 'center' : (row.has_public_endpoint ? 'passive' : 'active'),
+            };
           }
           const keys = Object.keys(row);
           if (!keys.length || keys.some((key) => !allowed.has(key))) throw new Error(`协调快照中的 ${table} 字段无效`);
