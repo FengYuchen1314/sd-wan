@@ -347,6 +347,35 @@ export class Database {
       AND downstream_endpoint IS NOT NULL
       AND downstream_endpoint != ''
     `);
+    this.handle.exec(`
+      UPDATE topology_links
+      SET upstream_endpoint = COALESCE(
+            NULLIF(upstream_endpoint, ''),
+            (SELECT COALESCE(NULLIF(parent.data_endpoint, ''), '')
+             FROM nodes parent
+             WHERE parent.id = topology_links.upstream_id)
+          ),
+          downstream_endpoint = '',
+          endpoint_semantics_version = 2
+      WHERE endpoint_semantics_version < 2
+        AND EXISTS (
+          SELECT 1 FROM nodes child
+          WHERE child.id = topology_links.downstream_id
+            AND child.parent_id = topology_links.upstream_id
+        )
+        AND COALESCE(upstream_endpoint, '') = ''
+        AND COALESCE(downstream_endpoint, '') != ''
+    `);
+    this.handle.exec(`
+      UPDATE topology_links
+      SET endpoint_semantics_version = 2
+      WHERE endpoint_semantics_version < 2
+        AND EXISTS (
+          SELECT 1 FROM nodes child
+          WHERE child.id = topology_links.downstream_id
+            AND child.parent_id = topology_links.upstream_id
+        )
+    `);
 
     const nodeColumns = new Set(this.handle.prepare('PRAGMA table_info(nodes)').all().map((column) => column.name));
     if (!nodeColumns.has('control_listen_port')) {

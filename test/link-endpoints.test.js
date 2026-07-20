@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   isChildInitiatedJoinLink,
   isDialOutOnlyNode,
+  isInitializationJoinLink,
   isManualBidirectionalPublicLink,
   resolveLinkEndpoints,
   selectLinkBenchmarkDirection,
@@ -29,6 +30,7 @@ test('主动加入的公网子节点在父子链路上仍由父节点动态学�
   );
   assert.equal(resolved.upstreamEndpoint, '203.0.113.1:51820');
   assert.equal(resolved.downstreamEndpoint, null);
+  assert.equal(isInitializationJoinLink(upstream, downstream), true);
   assert.equal(isChildInitiatedJoinLink({}, upstream, downstream), true);
   const direction = selectLinkDialDirection({}, upstream, downstream);
   assert.equal(direction.dialerId, 'child');

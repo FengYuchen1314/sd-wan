@@ -42,7 +42,7 @@ test('逻辑快照完整复制协调状态并在导入前校验外键', () => {
     const migratedLink = replica.get('SELECT upstream_endpoint, downstream_endpoint, endpoint_semantics_version FROM topology_links');
     assert.equal(migratedLink.upstream_endpoint, 'coordinator.example:19801');
     assert.equal(migratedLink.downstream_endpoint, '');
-    assert.equal(migratedLink.endpoint_semantics_version, 1);
+    assert.equal(migratedLink.endpoint_semantics_version, 2);
     assert.deepEqual(
       replica.all('SELECT id, name FROM nodes ORDER BY created_at'),
       source.database.all('SELECT id, name FROM nodes ORDER BY created_at'),

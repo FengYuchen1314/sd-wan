@@ -2,6 +2,7 @@ import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:c
 import { containsIPv4, parseCIDR, parseIPv4, usableHost } from '../core/ipv4.js';
 import { enumerateSimplePaths } from '../core/paths.js';
 import {
+  isManualBidirectionalPublicLink,
   remoteEndpointForSource,
   resolveLinkEndpoints,
   selectLinkBenchmarkDirection,
@@ -1500,25 +1501,18 @@ export class ControlService {
         input.agentVersion ?? '0.1.0', timestamp, timestamp, timestamp,
       );
       if (token.mode === 'passive') {
-        if (!input.dataEndpoint) throw new Error('被动认领节点必须提供父节点可访问的 WireGuard 地址');
-        this.db.run(
-          `INSERT INTO topology_links(
-            id, network_id, upstream_id, downstream_id, priority, upstream_endpoint, downstream_endpoint, created_at
-          ) VALUES (?, ?, ?, ?, 100, '', ?, ?)`,
-          randomUUID(), network.id, parent.id, nodeId, input.dataEndpoint, timestamp,
-        );
-      } else {
-        const parentControlHost = endpointDetails(parent.controlEndpoint)?.host || null;
-        const parentEndpoint = token.parent_data_endpoint || parent.dataEndpoint || (parentControlHost
-          ? `${parentControlHost}:${parent.dataListenPort || network.listenPort || DEFAULT_DATA_PORT}`
-          : null);
-        this.db.run(
-          `INSERT INTO topology_links(
-            id, network_id, upstream_id, downstream_id, priority, upstream_endpoint, downstream_endpoint, created_at
-          ) VALUES (?, ?, ?, ?, 100, ?, '', ?)`,
-          randomUUID(), network.id, parent.id, nodeId, parentEndpoint, timestamp,
-        );
+        if (!input.dataEndpoint) throw new Error('被动认领节点必须提供 WireGuard 监听地址');
       }
+      const parentControlHost = endpointDetails(parent.controlEndpoint)?.host || null;
+      const parentEndpoint = token.parent_data_endpoint || parent.dataEndpoint || (parentControlHost
+        ? `${parentControlHost}:${parent.dataListenPort || network.listenPort || DEFAULT_DATA_PORT}`
+        : null);
+      this.db.run(
+        `INSERT INTO topology_links(
+          id, network_id, upstream_id, downstream_id, priority, upstream_endpoint, downstream_endpoint, created_at
+        ) VALUES (?, ?, ?, ?, 100, ?, '', ?)`,
+        randomUUID(), network.id, parent.id, nodeId, parentEndpoint ?? '', timestamp,
+      );
       this.db.run('UPDATE join_tokens SET used_count = used_count + 1 WHERE id = ?', token.id);
       const versionId = this.createVersionInTransaction(network.id, `节点 ${name} 加入`);
       this.audit('agent.register', 'node', nodeId, { parentId: parent.id, versionId }, `node:${nodeId}`);
@@ -2593,12 +2587,35 @@ export class ControlService {
     const upstream = this.getNode(updated.upstream_id);
     const downstream = this.getNode(updated.downstream_id);
     const { requested } = validationInternalProbePlan(updated, upstream, downstream);
+    const bidirectional = isManualBidirectionalPublicLink(
+      upstream,
+      downstream,
+      updated.upstream_endpoint,
+      updated.downstream_endpoint,
+    );
     const successes = Number(updated.validation_probed_upstream > 0) + Number(updated.validation_probed_downstream > 0);
     const completed = Number(updated.validation_probed_upstream !== 0) + Number(updated.validation_probed_downstream !== 0);
     if (link.validation_status === 'active') {
       return;
     }
     if (completed < requested) return;
+    if (bidirectional) {
+      if (successes === 2) {
+        this.db.transaction(() => {
+          this.activateValidatedLinkInTransaction(link, now(), '新增已验证的数据通路', 'topology-link.active');
+        });
+        return;
+      }
+      if (completed === requested) {
+        const errors = [updated.validation_probe_error_upstream, updated.validation_probe_error_downstream].filter(Boolean);
+        this.db.run(
+          `UPDATE topology_links SET validation_status = 'failed', validation_error = ?, validation_token = NULL WHERE id = ?`,
+          errors.join('；') || '双公网连接需要两个方向都探测成功', link.id,
+        );
+        this.audit('topology-link.failed', 'topology-link', link.id, { errors }, `node:${nodeId}`);
+      }
+      return;
+    }
     if (successes > 0) {
       this.db.transaction(() => {
         this.activateValidatedLinkInTransaction(link, now(), '新增已验证的数据通路', 'topology-link.active');

@@ -225,13 +225,14 @@ test('严格单向认领由中心主动连接目标并代理配置，目标不�
     });
 
     const link = service.listLinks(network.id, true).find((item) => item.downstreamId === adopted.node.id);
-    assert.equal(link.upstreamEndpoint, '');
-    assert.equal(link.downstreamEndpoint, `127.0.0.1:${dataPort}`);
+    assert.equal(link.downstreamEndpoint, '');
+    assert.ok(link.upstreamEndpoint);
     const childConfig = database.get(
       'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', adopted.versionId, adopted.node.id,
     );
-    assert.equal(JSON.parse(childConfig.config_json).data.peers[0].endpoint, null);
-    assert.equal(JSON.parse(childConfig.config_json).data.peers[0].endpointMode, 'dynamic-learn');
+    const childPeer = JSON.parse(childConfig.config_json).data.peers.find((peer) => peer.nodeId === center.id);
+    assert.ok(childPeer.endpoint);
+    assert.equal(childPeer.endpointMode, 'static-dial');
 
     const descendantDirectory = join(directory, 'descendant-agent');
     const descendantRelayPort = await availableTcpPort();

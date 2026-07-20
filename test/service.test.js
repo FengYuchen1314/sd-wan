@@ -396,18 +396,18 @@ test('可视化新增连接必须经两个节点准备和双向探测后激活',
   } finally { database.close(); }
 });
 
-test('双向探测只要一个方向成功即可建链，并使用数据库中的控制端口', () => {
+test('面板手动双公网建链必须两个方向都探测成功才激活', () => {
   const { database, service, network, center } = fixture();
   try {
     const nodeA = registerPublicEdge(service, network, center, {
-      name: '单向节点 A',
+      name: '双向节点 A',
       controlListenPort: 19001,
       dataListenPort: 21001,
       wgDataPublicKey: 'a'.repeat(44),
       dataEndpoint: '192.168.50.10:21001',
     }).node;
     const nodeB = registerPublicEdge(service, network, center, {
-      name: '单向节点 B',
+      name: '双向节点 B',
       controlListenPort: 19002,
       dataListenPort: 21002,
       wgDataPublicKey: 'b'.repeat(44),
@@ -425,30 +425,50 @@ test('双向探测只要一个方向成功即可建链，并使用数据库中�
     }
     const probeA = service.claimCommand(nodeA.id);
     const probeB = service.claimCommand(nodeB.id);
-    assert.equal(probeA.payload.remoteUrl, internalControlUrl(nodeB));
-    assert.equal(probeB.payload.remoteUrl, internalControlUrl(nodeA));
     service.completeCommand(nodeA.id, probeA.id, { ok: false, error: 'A 无法主动访问 B' });
-    assert.equal(service.listLinks(network.id).find((link) => link.id === candidate.id).validationStatus, 'probing');
     service.completeCommand(nodeB.id, probeB.id, { ok: true, remoteNodeId: nodeA.id });
+    const failed = service.listLinks(network.id).find((link) => link.id === candidate.id);
+    assert.equal(failed.validationStatus, 'failed');
+    assert.equal(failed.validationProgress.requested, 2);
+    assert.equal(failed.validationProgress.successful, 1);
+  } finally { database.close(); }
+});
+
+test('单向手动建链只要一个方向成功即可激活', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const privateNode = registerActiveJoinNode(service, network, center, {
+      name: 'NAT 边缘',
+      wgDataPublicKey: 'n'.repeat(44),
+    }).node;
+    const publicNode = registerPublicEdge(service, network, center, {
+      name: '公网节点',
+      controlListenPort: 19002,
+      dataListenPort: 21002,
+      wgDataPublicKey: 'b'.repeat(44),
+      dataEndpoint: '10.20.30.40:21002',
+    }).node;
+    const candidate = service.createLinkValidation(network.id, {
+      nodeAId: privateNode.id,
+      nodeBId: publicNode.id,
+      nodeBAddress: '10.20.30.40',
+    });
+    for (const node of [privateNode, publicNode]) {
+      const command = service.claimCommand(node.id);
+      service.completeCommand(node.id, command.id, { ok: true });
+    }
+    const probe = service.claimCommand(privateNode.id);
+    assert.equal(probe.payload.remoteUrl, internalControlUrl(publicNode));
+    service.completeCommand(privateNode.id, probe.id, { ok: true, remoteNodeId: publicNode.id });
     const active = service.listLinks(network.id).find((link) => link.id === candidate.id);
     assert.equal(active.validationStatus, 'active');
-    assert.equal(active.validationProgress.successful, 1);
-    assert.equal(active.validationProgress.failed, 1);
-    assert.equal(active.probeDirections.upstreamToDownstream.status, 'unreachable');
-    assert.equal(active.probeDirections.downstreamToUpstream.status, 'reachable');
-    assert.equal(active.upstreamEndpoint, '192.168.50.10:21001');
-    assert.equal(active.downstreamEndpoint, '');
+    assert.equal(active.downstreamEndpoint, '10.20.30.40:21002');
+    assert.equal(active.upstreamEndpoint, '');
     const version = service.listConfigurations(network.id)[0];
-    const configA = JSON.parse(database.get(
-      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, nodeA.id,
+    const natConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, privateNode.id,
     ).config_json);
-    const configB = JSON.parse(database.get(
-      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', version.id, nodeB.id,
-    ).config_json);
-    assert.equal(configA.data.peers.find((peer) => peer.nodeId === nodeB.id).endpoint, null);
-    assert.equal(configA.data.peers.find((peer) => peer.nodeId === nodeB.id).endpointMode, 'dynamic-learn');
-    assert.equal(configB.data.peers.find((peer) => peer.nodeId === nodeA.id).endpoint, '192.168.50.10:21001');
-    assert.equal(configB.data.peers.find((peer) => peer.nodeId === nodeA.id).endpointMode, 'static-dial');
+    assert.equal(natConfig.data.peers.find((peer) => peer.nodeId === publicNode.id).endpointMode, 'static-dial');
   } finally { database.close(); }
 });
 
