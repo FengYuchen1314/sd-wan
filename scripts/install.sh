@@ -82,12 +82,15 @@ process.exit(major > 22 || (major === 22 && minor >= 5) ? 0 : 1);
 }
 
 ensure_node_runtime() {
-  local current_node="" node_arch="" work_dir="" checksums="" archive_name="" expected_sha="" release_dir=""
-  current_node="$(command -v node 2>/dev/null || true)"
-  if [[ -n "$current_node" ]] && node_runtime_supported "$current_node"; then
-    echo "使用兼容的 Node.js：$($current_node --version) ($current_node)"
+  if [[ -x "$NODE_RUNTIME_LINK/bin/node" ]] && node_runtime_supported "$NODE_RUNTIME_LINK/bin/node"; then
+    echo "使用 PathWeaver 私有 Node.js：$($NODE_RUNTIME_LINK/bin/node --version) ($NODE_RUNTIME_LINK)"
+    export PATH="$NODE_RUNTIME_LINK/bin:$PATH"
+    hash -r
     return
   fi
+
+  local current_node="" node_arch="" work_dir="" checksums="" archive_name="" expected_sha="" release_dir=""
+  current_node="$(command -v node 2>/dev/null || true)"
 
   case "$(uname -m)" in
     x86_64|amd64) node_arch="x64" ;;
@@ -363,7 +366,12 @@ choose_panel_password() {
 }
 
 hash_panel_password() {
-  printf '%s' "$PANEL_PASSWORD" | node -e '
+  local node_bin="$1"
+  if [[ -z "$node_bin" || ! -x "$node_bin" ]]; then
+    echo "未找到可用的 Node.js 运行时用于生成面板密码哈希。" >&2
+    exit 1
+  fi
+  printf '%s' "$PANEL_PASSWORD" | "$node_bin" -e '
 const { randomBytes, scryptSync } = require("node:crypto");
 const chunks = [];
 process.stdin.on("data", chunk => chunks.push(chunk));
@@ -373,6 +381,26 @@ process.stdin.on("end", () => {
   const digest = scryptSync(password, salt, 32);
   process.stdout.write(`scrypt-v1.${salt.toString("base64url")}.${digest.toString("base64url")}`);
 });'
+}
+
+verify_panel_password_env() {
+  local env_file="$1" node_bin="$2" password="$3"
+  PANEL_PASSWORD="$password" PANEL_ENV_FILE="$env_file" "$node_bin" --input-type=module -e "
+import { readFileSync } from 'node:fs';
+import { verifyPanelPassword } from '/opt/pathweaver/current/src/core/password.js';
+const match = readFileSync(process.env.PANEL_ENV_FILE, 'utf8').match(/^SDWAN_PANEL_PASSWORD_HASH=(.+)\$/m);
+if (!match?.[1] || !verifyPanelPassword(process.env.PANEL_PASSWORD, match[1])) process.exit(1);
+"
+}
+
+wait_for_panel_health() {
+  local port="$1" attempt
+  for attempt in $(seq 1 30); do
+    if curl -fsS "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  echo "面板服务未在 TCP ${port} 上响应。请检查：sudo systemctl status pathweaver-node；sudo journalctl -u pathweaver-node -n 50" >&2
+  return 1
 }
 
 write_bootstrap_node_env() {
@@ -395,22 +423,13 @@ write_peer_node_env() {
 }
 
 resolve_node_executable() {
+  ensure_node_runtime
   if [[ -x "$NODE_RUNTIME_LINK/bin/node" ]] && node_runtime_supported "$NODE_RUNTIME_LINK/bin/node"; then
     printf '%s\n' "$NODE_RUNTIME_LINK/bin/node"
     return
   fi
-  local candidate=""
-  candidate="$(command -v node 2>/dev/null || true)"
-  if [[ -n "$candidate" ]] && node_runtime_supported "$candidate"; then
-    case "$candidate" in
-      /opt/pathweaver/runtime/*|/usr/bin/*|/usr/local/bin/*|/bin/*)
-        printf '%s\n' "$candidate"
-        return
-        ;;
-    esac
-  fi
-  ensure_node_runtime
-  printf '%s\n' "$NODE_RUNTIME_LINK/bin/node"
+  echo "PathWeaver 私有 Node.js 运行时不可用。" >&2
+  exit 1
 }
 
 install_node_bundle() {
@@ -588,8 +607,8 @@ install_node() {
   fi
   endpoint_host="$(format_endpoint_host "$REACHABLE_HOST")"
   choose_panel_password
-  panel_password_hash="$(hash_panel_password)"
   node_executable="$(resolve_node_executable)"
+  panel_password_hash="$(hash_panel_password "$node_executable")"
 
   install_private_wireguard_runtime
   install_node_bundle
@@ -620,6 +639,10 @@ EOF
 
   if [[ "$bootstrap" -eq 1 ]]; then
     write_bootstrap_node_env "$node_env" "$panel_password_hash" "$endpoint_host" "$PANEL_PORT" "$DATA_PORT"
+    if ! verify_panel_password_env "$node_env" "$node_executable" "$PANEL_PASSWORD"; then
+      echo "面板密码写入校验失败，请重新运行安装。" >&2
+      exit 1
+    fi
     cat >/etc/systemd/system/pathweaver-node.service <<EOF
 [Unit]
 Description=PathWeaver Peer Node and Panel
@@ -654,6 +677,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now pathweaver-node
+    wait_for_panel_health "$PANEL_PORT" || exit 1
   else
     panel_proxy_token="$("$node_executable" -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))")"
     control_endpoint=""
@@ -663,6 +687,10 @@ EOF
       data_endpoint="$endpoint_host:$DATA_PORT"
     fi
     write_peer_node_env "$node_env" "$panel_password_hash" "$panel_proxy_token"
+    if ! verify_panel_password_env "$node_env" "$node_executable" "$PANEL_PASSWORD"; then
+      echo "面板密码写入校验失败，请重新运行安装。" >&2
+      exit 1
+    fi
     ARGS=(--relay-port "$RELAY_PORT" --data-port "$DATA_PORT" --reachability "$reachability" --panel-proxy-token "$panel_proxy_token")
     if [[ -n "$control_endpoint" ]]; then ARGS+=(--control-endpoint "$control_endpoint"); fi
     if [[ -n "$data_endpoint" ]]; then ARGS+=(--data-endpoint "$data_endpoint"); fi
@@ -721,6 +749,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now pathweaver-agent pathweaver-node
+    wait_for_panel_health "$PANEL_PORT" || exit 1
   fi
 
   if [[ "$reachability" == "public" ]]; then

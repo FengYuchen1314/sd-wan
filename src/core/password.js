@@ -22,6 +22,10 @@ function parsePasswordRecord(record) {
   return null;
 }
 
+export function isPanelPasswordHashRecord(record) {
+  return parsePasswordRecord(record) !== null;
+}
+
 export function hashPanelPassword(password, salt = randomBytes(16)) {
   const value = String(password ?? '');
   if (value.length < 8) throw new Error('面板密码至少需要 8 个字符');

@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { readFileSync, statSync } from 'node:fs';
 import { extname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { verifyPanelPassword } from '../core/password.js';
+import { verifyPanelPassword, isPanelPasswordHashRecord } from '../core/password.js';
 
 const rootDir = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const publicDir = join(rootDir, 'public');
@@ -14,6 +14,9 @@ const proxyToken = process.env.SDWAN_PANEL_PROXY_TOKEN || '';
 const developmentToken = process.env.NODE_ENV === 'production' ? '' : 'dev-admin-token';
 
 if (!panelPasswordHash && !developmentToken) throw new Error('生产环境必须设置面板密码哈希');
+if (panelPasswordHash && !isPanelPasswordHashRecord(panelPasswordHash)) {
+  throw new Error('面板密码哈希无效或已损坏，请在本机运行：sudo pathweaver-set-panel-password');
+}
 if (!proxyToken) throw new Error('缺少本机面板代理凭据');
 
 const mimeTypes = {

@@ -12,7 +12,7 @@ import { CenterManagedNodes } from './managed-nodes.js';
 import { ControlService } from './service.js';
 import { WireGuardArtifactStore, wireGuardRuntimeManifest } from './wireguard-artifacts.js';
 import { CoordinatorElection } from '../core/coordinator.js';
-import { verifyPanelPassword } from '../core/password.js';
+import { verifyPanelPassword, isPanelPasswordHashRecord } from '../core/password.js';
 import { acceptProbeEnvelope } from '../agent/runtime.js';
 import { executeBenchmark, handleBenchmarkRequest, prepareBenchmark } from '../core/benchmark.js';
 
@@ -39,6 +39,9 @@ const coordinatorHeartbeatIntervalMs = Math.max(250, Number(process.env.SDWAN_CO
 
 if (!adminToken && !adminPasswordHash) {
   throw new Error('生产环境必须设置面板密码哈希');
+}
+if (adminPasswordHash && !isPanelPasswordHashRecord(adminPasswordHash)) {
+  throw new Error('面板密码哈希无效或已损坏，请在本机运行：sudo pathweaver-set-panel-password');
 }
 
 const database = new Database(join(dataDir, 'pathweaver.db'));

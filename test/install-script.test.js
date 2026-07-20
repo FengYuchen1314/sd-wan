@@ -54,10 +54,18 @@ test('安装器提供本机面板密码重置命令', () => {
   assert.match(bundleSource, /scripts\/set-panel-password\.sh/);
 });
 
-test('安装器为 systemd 选择 pathweaver 用户可执行的 Node 运行时', () => {
+test('安装器为 systemd 选择 PathWeaver 私有 Node 运行时', () => {
   assert.match(installer, /resolve_node_executable/);
   assert.match(installer, /ExecStart=\$node_executable/);
+  assert.match(installer, /ensure_node_runtime/);
+  assert.match(installer, /使用 PathWeaver 私有 Node\.js/);
+  assert.doesNotMatch(installer, /使用兼容的 Node\.js/);
   assert.doesNotMatch(installer, /ExecStart=\$\(command -v node\)/);
+});
+
+test('安装完成后会校验面板密码并等待 healthz 就绪', () => {
+  assert.match(installer, /verify_panel_password_env/);
+  assert.match(installer, /wait_for_panel_health/);
 });
 
 test('初始节点一键命令使用固定 GitHub 源，安装器自动补齐 Node.js 运行时', () => {

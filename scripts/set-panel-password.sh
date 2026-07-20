@@ -72,6 +72,19 @@ printf 'SDWAN_PANEL_PASSWORD_HASH=%s\n' "$HASH" >>"$temp"
 install -m 0600 "$temp" "$NODE_ENV_FILE"
 rm -f -- "$temp"
 
+if ! (
+  cd "$ROOT"
+  PANEL_PASSWORD="$first" PANEL_ENV_FILE="$NODE_ENV_FILE" "$NODE_BINARY" --input-type=module -e "
+import { readFileSync } from 'node:fs';
+import { verifyPanelPassword } from './src/core/password.js';
+const match = readFileSync(process.env.PANEL_ENV_FILE, 'utf8').match(/^SDWAN_PANEL_PASSWORD_HASH=(.+)\$/m);
+if (!match?.[1] || !verifyPanelPassword(process.env.PANEL_PASSWORD, match[1])) process.exit(1);
+"
+); then
+  echo "面板密码更新后校验失败。" >&2
+  exit 1
+fi
+
 services=()
 for service in pathweaver-node.service pathweaver-agent.service; do
   if [[ -f "/etc/systemd/system/$service" ]]; then services+=("${service%.service}"); fi
@@ -79,6 +92,15 @@ done
 systemctl daemon-reload
 if ((${#services[@]})); then
   systemctl restart "${services[@]}"
+fi
+
+panel_port=19773
+if [[ -f /etc/systemd/system/pathweaver-node.service ]]; then
+  panel_port="$(grep -E '^Environment=SDWAN_(PORT|PANEL_PORT)=' /etc/systemd/system/pathweaver-node.service | tail -n 1 | sed -E 's/^Environment=SDWAN_(PORT|PANEL_PORT)=//')"
+fi
+if ! curl -fsS "http://127.0.0.1:${panel_port}/healthz" >/dev/null 2>&1; then
+  echo "面板服务尚未恢复，请检查：sudo systemctl status pathweaver-node；sudo journalctl -u pathweaver-node -n 50" >&2
+  exit 1
 fi
 
 echo "面板密码已更新，请使用新密码重新登录面板。"

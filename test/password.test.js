@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes, scryptSync } from 'node:crypto';
-import { hashPanelPassword, verifyPanelPassword } from '../src/core/password.js';
+import { hashPanelPassword, verifyPanelPassword, isPanelPasswordHashRecord } from '../src/core/password.js';
 
 test('面板密码使用带随机盐的 scrypt 摘要保存和验证', () => {
   const first = hashPanelPassword('correct-horse-battery-staple');
@@ -22,4 +22,6 @@ test('面板密码验证兼容旧版 $ 分隔哈希', () => {
   const legacy = `scrypt-v1$${salt.toString('base64url')}$${digest.toString('base64url')}`;
   assert.equal(verifyPanelPassword(password, legacy), true);
   assert.equal(verifyPanelPassword('wrong-password', legacy), false);
+  assert.equal(isPanelPasswordHashRecord(legacy), true);
+  assert.equal(isPanelPasswordHashRecord('scrypt-v1.only-one-part'), false);
 });
