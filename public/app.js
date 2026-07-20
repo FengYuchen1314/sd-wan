@@ -255,7 +255,7 @@ function renderOverview() {
         ${nodeTable(nodes.slice(0, 6), false)}
       </article>
       <article class="card">
-        <div class="card-head"><div><h2>链路延迟概览</h2><p>5 次往返采样，展示典型值与波动区间</p></div><a class="button ghost small" href="#topology">打开拓扑</a></div>
+        <div class="card-head"><div><h2>链路延迟概览</h2><p>10 次 RTT 采样，展示典型值与波动区间</p></div><a class="button ghost small" href="#topology">打开拓扑</a></div>
         <div class="card-body section-stack">
           ${renderLatencyOverview(latencySummary, links)}
           <div class="metric metric-compact"><label>待推进配置</label><strong>${totals.preparing}</strong><small>${totals.pendingCommands} 条节点命令等待完成</small></div>
@@ -287,7 +287,7 @@ function renderLatencyOverview(summary, links) {
     const stale = isLatencyStale(link.benchmark.measuredAt);
     return `<div class="latency-overview-row ${stale ? 'stale' : ''}"><span>${escapeHtml(label)}</span><strong class="latency-${latencyQuality(link.benchmark.latencyMs)}">${escapeHtml(latencyDisplay(link.benchmark))}</strong><small>${escapeHtml(latencyAgeLabel(link.benchmark.measuredAt))}</small></div>`;
   }).join('') : '<div class="muted">尚未完成任何相邻链路探测。</div>';
-  return `<div class="notice"><strong>相邻链路平均 ${average}</strong><span>${parts}。每条链路独立采样 5 次 RTT，界面优先展示典型延迟与最小–最大波动区间。</span></div><div class="latency-overview-list">${rows}</div>`;
+  return `<div class="notice"><strong>相邻链路平均 ${average}</strong><span>${parts}。每条链路独立采样 10 次 RTT（含 2 次预热），界面展示截尾平均与波动区间。</span></div><div class="latency-overview-list">${rows}</div>`;
 }
 
 function nodeTable(nodes, editable = true) {
@@ -596,14 +596,14 @@ function renderTopology() {
       : `${selected[0].name} ↔ ${selected[1].name}`;
   const canProbe = links.some((link) => link.validationStatus === 'active') && !latencyRunning;
   return `<article class="card">
-    <div class="card-head"><div><h2>可视化拓扑编辑</h2><p>布局随连接关系自动收敛；每条链路独立进行 5 次 RTT 采样</p></div><span class="status ${valid ? 'active' : 'failed'}">${valid ? '全网可达' : '需要修复'}</span></div>
+    <div class="card-head"><div><h2>可视化拓扑编辑</h2><p>布局随连接关系自动收敛；每条链路独立进行 10 次 RTT 采样</p></div><span class="status ${valid ? 'active' : 'failed'}">${valid ? '全网可达' : '需要修复'}</span></div>
     <div class="graph-toolbar">
       <div class="graph-toolbar-main"><span class="selection-count">${selected.length}/2</span><span class="selection-copy"><strong>${escapeHtml(selectionText)}</strong><small>${validationText}</small></span></div>
       <div class="graph-actions"><button class="button ghost" id="benchmark-adjacent" ${canProbe ? '' : 'disabled'}>${latencyRunning ? '探测进行中' : '探测全部相邻链路'}</button><button class="button ghost" id="clear-node-selection" ${selected.length ? '' : 'disabled'}>取消选择</button><button class="button ghost" id="connect-selected" ${selected.length === 2 ? '' : 'disabled'}>建立连接</button><button class="button primary" id="detail-selected" ${selected.length === 2 ? '' : 'disabled'}>详细配置</button></div>
     </div>
     ${renderTopologyGraph()}
     <div class="graph-legend"><span>已验证通路</span><span class="waiting">等待 Agent</span><span class="probing">按填写方向探测 · 任一成功可用</span><span class="failed">所填方向均失败</span><span class="latency-excellent">≤ 30 ms</span><span class="latency-good">31–80 ms</span><span class="latency-fair">81–150 ms</span><span class="latency-poor">&gt; 150 ms</span><span class="graph-legend-hint">点击节点进行选择</span></div>
-    <div class="latency-panel"><div class="latency-panel-head"><div><strong>相邻链路延迟</strong><small>${latencySummary.completed}/${latencySummary.total || 0} 已探测${latencySummary.average == null ? '' : ` · 平均 ${formatLatency(latencySummary.average)}`}</small></div><small class="muted">典型值为 5 次采样均值，括号内为最小–最大波动</small></div>${renderLatencyLinkTable(links, state.topology.nodes)}</div>
+    <div class="latency-panel"><div class="latency-panel-head"><div><strong>相邻链路延迟</strong><small>${latencySummary.completed}/${latencySummary.total || 0} 已探测${latencySummary.average == null ? '' : ` · 平均 ${formatLatency(latencySummary.average)}`}</small></div><small class="muted">典型值为截尾平均，括号内为最小–最大波动</small></div>${renderLatencyLinkTable(links, state.topology.nodes)}</div>
   </article>`;
 }
 
@@ -1105,7 +1105,7 @@ async function startLinkBenchmarks(scope = {}) {
       toast('已开始探测这些通路涉及的每一段链路；端到端延迟会自动汇总');
     } else {
       await load();
-      toast('已开始探测全部相邻链路；每条链路独立采样 5 次 RTT');
+      toast('已开始探测全部相邻链路；每条链路独立采样 10 次 RTT');
     }
   } catch (error) {
     if (button) button.disabled = false;

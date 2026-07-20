@@ -2,14 +2,28 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { executeBenchmark, handleBenchmarkRequest, prepareBenchmark } from '../src/core/benchmark.js';
+import {
+  executeBenchmark,
+  handleBenchmarkRequest,
+  LATENCY_TOTAL_SAMPLES,
+  prepareBenchmark,
+  summarizeLatencySamples,
+} from '../src/core/benchmark.js';
 
-test('链路测速通过一次性凭据测量五次往返延迟和受控上传带宽', async () => {
+test('summarizeLatencySamples 丢弃预热样本并对剩余采样做截尾平均', () => {
+  const result = summarizeLatencySamples([40, 35, 20, 21, 22, 23, 24, 25, 26, 27]);
+  assert.equal(result.sampleCount, 8);
+  assert.equal(result.latencyMinMs, 20);
+  assert.equal(result.latencyP95Ms, 27);
+  assert.ok(result.latencyMs >= 21 && result.latencyMs <= 25);
+});
+
+test('相邻链路延迟探测通过一次性凭据测量多次往返 RTT', async () => {
   const store = {};
   const itemId = 'benchmark-link-1';
   const token = 'benchmark-secret';
   prepareBenchmark(store, {
-    itemId, token, bytes: 128 * 1024,
+    itemId, token,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   });
   const server = createServer(async (req, res) => {
@@ -26,15 +40,15 @@ test('链路测速通过一次性凭据测量五次往返延迟和受控上传�
   await once(server, 'listening');
   try {
     const result = await executeBenchmark({
-      itemId, token, bytes: 128 * 1024,
+      itemId, token,
       remoteUrl: `http://127.0.0.1:${server.address().port}`,
       expectedNodeId: 'target-node',
     });
     assert.equal(result.ok, true);
-    assert.equal(result.bytes, 128 * 1024);
+    assert.equal(result.sampleCount, LATENCY_TOTAL_SAMPLES - 2);
     assert.ok(result.latencyMs >= 0);
     assert.ok(result.latencyP95Ms >= result.latencyMinMs);
-    assert.ok(result.bandwidthMbps > 0);
+    assert.equal(result.bandwidthMbps, undefined);
   } finally {
     server.close();
     await once(server, 'close');

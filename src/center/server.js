@@ -642,6 +642,14 @@ function match(pathname, pattern) {
   return Object.fromEntries(names.map((name, index) => [name, decodeURIComponent(result[index + 1])]));
 }
 
+function staticCacheControl(filename) {
+  const ext = extname(filename);
+  if (['.html', '.css', '.js'].includes(ext)) {
+    return 'no-store, max-age=0, must-revalidate';
+  }
+  return 'public, max-age=300';
+}
+
 function serveStatic(pathname, res) {
   const requested = pathname === '/' ? 'index.html' : pathname.replace(/^\//, '');
   const filename = resolve(publicDir, normalize(requested));
@@ -652,7 +660,8 @@ function serveStatic(pathname, res) {
     const content = readFileSync(filename);
     send(res, 200, content, {
       'Content-Type': mimeTypes[extname(filename)] || 'application/octet-stream',
-      'Cache-Control': ['.html', '.css', '.js'].includes(extname(filename)) ? 'no-cache' : 'public, max-age=300',
+      'Cache-Control': staticCacheControl(filename),
+      ...(['.html', '.css', '.js'].includes(extname(filename)) ? { Pragma: 'no-cache' } : {}),
     });
     return true;
   } catch {
@@ -1076,13 +1085,13 @@ const server = createServer(async (req, res) => {
       const itemId = decodeURIComponent(pathname.slice('/agent/v1/benchmark/'.length));
       if (!localPendingBenchmarks[itemId]) {
         const row = database.get(
-          `SELECT l.network_id, l.benchmark_target_id, l.benchmark_token_hash, l.benchmark_expires_at, l.benchmark_bytes
+          `SELECT l.network_id, l.benchmark_target_id, l.benchmark_token_hash, l.benchmark_expires_at
            FROM topology_links l WHERE l.id = ?`, itemId,
         );
         if (row && row.benchmark_target_id === localNodeId(row.network_id)) {
           localPendingBenchmarks[itemId] = {
             nodeId: row.benchmark_target_id, tokenHash: row.benchmark_token_hash,
-            expiresAt: row.benchmark_expires_at, bytes: Number(row.benchmark_bytes || 2 * 1024 * 1024),
+            expiresAt: row.benchmark_expires_at,
           };
         }
       }

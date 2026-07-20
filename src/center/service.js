@@ -2,7 +2,6 @@ import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:c
 import { containsIPv4, parseCIDR, parseIPv4, usableHost } from '../core/ipv4.js';
 import { enumerateSimplePaths } from '../core/paths.js';
 import { validateAndCompileTopology } from '../core/topology.js';
-import { DEFAULT_BENCHMARK_BYTES } from '../core/benchmark.js';
 
 const now = () => new Date().toISOString();
 const hashSecret = (value) => createHash('sha256').update(String(value)).digest('hex');
@@ -443,7 +442,7 @@ export class ControlService {
           this.db.run(
             `UPDATE topology_links SET benchmark_status = 'failed', benchmark_error = ?, benchmark_measured_at = ?,
              benchmark_token_hash = NULL, benchmark_expires_at = NULL WHERE id = ?`,
-            '测速超时：节点未在有效期内完成任务', timestamp, benchmark.id,
+            '延迟探测超时：节点未在有效期内完成任务', timestamp, benchmark.id,
           );
         }
 
@@ -459,7 +458,7 @@ export class ControlService {
           if (!expiredLinkIds.has(payload.validationId) && !expiredBenchmarkIds.has(payload.itemId)) continue;
           this.db.run(
             `UPDATE commands SET status = 'failed', result_json = ?, completed_at = ? WHERE id = ?`,
-            json({ ok: false, error: '连接验证或测速已超时，命令已取消' }), timestamp, command.id,
+            json({ ok: false, error: '连接验证或延迟探测已超时，命令已取消' }), timestamp, command.id,
           );
           cancelledCommands += 1;
         }
@@ -886,9 +885,6 @@ export class ControlService {
           latencyMs: row.benchmark_latency_ms == null ? null : Number(row.benchmark_latency_ms),
           latencyMinMs: row.benchmark_latency_min_ms == null ? null : Number(row.benchmark_latency_min_ms),
           latencyP95Ms: row.benchmark_latency_p95_ms == null ? null : Number(row.benchmark_latency_p95_ms),
-          bandwidthMbps: row.benchmark_bandwidth_mbps == null ? null : Number(row.benchmark_bandwidth_mbps),
-          bytes: row.benchmark_bytes == null ? null : Number(row.benchmark_bytes),
-          durationMs: row.benchmark_duration_ms == null ? null : Number(row.benchmark_duration_ms),
           measuredAt: row.benchmark_measured_at ?? null,
         } : null,
         validationExpiresAt: row.validation_expires_at,
@@ -972,9 +968,6 @@ export class ControlService {
             status: benchmarkStatus,
             latencyMs: benchmarkStatus === 'completed'
               ? Number(completedBenchmarks.reduce((total, benchmark) => total + benchmark.latencyMs, 0).toFixed(2))
-              : null,
-            bandwidthMbps: benchmarkStatus === 'completed'
-              ? Math.min(...completedBenchmarks.map((benchmark) => benchmark.bandwidthMbps))
               : null,
             measuredAt: benchmarkStatus === 'completed'
               ? completedBenchmarks.map((benchmark) => benchmark.measuredAt).filter(Boolean).sort().at(0) || null
@@ -1990,15 +1983,14 @@ export class ControlService {
     if (input.sourceId && input.targetId) {
       const details = this.getPathOptions(networkId, input.sourceId, input.targetId);
       linkIds = [...new Set(details.paths.flatMap((path) => path.linkIds))];
-      if (!linkIds.length) throw new Error('所选节点之间没有可测速的已验证通路');
+      if (!linkIds.length) throw new Error('所选节点之间没有可探测延迟的已验证通路');
     } else {
       linkIds = activeLinks.map((link) => link.id);
-      if (!linkIds.length) throw new Error('当前拓扑没有可测速的相邻链路');
+      if (!linkIds.length) throw new Error('当前拓扑没有可探测延迟的相邻链路');
     }
     const activeById = new Map(activeLinks.map((link) => [link.id, link]));
     const timestamp = now();
     const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
-    const bytes = Math.max(64 * 1024, Math.min(4 * 1024 * 1024, Number(input.bytes) || DEFAULT_BENCHMARK_BYTES));
     for (const linkId of linkIds) {
       const link = activeById.get(linkId);
       if (!link) continue;
@@ -2020,15 +2012,15 @@ export class ControlService {
         `UPDATE topology_links SET benchmark_status = 'preparing', benchmark_error = NULL,
          benchmark_source_id = ?, benchmark_target_id = ?, benchmark_token_hash = ?, benchmark_expires_at = ?,
          benchmark_latency_ms = NULL, benchmark_latency_min_ms = NULL, benchmark_latency_p95_ms = NULL,
-         benchmark_bandwidth_mbps = NULL, benchmark_bytes = ?, benchmark_duration_ms = NULL,
+         benchmark_bandwidth_mbps = NULL, benchmark_bytes = NULL, benchmark_duration_ms = NULL,
          benchmark_measured_at = NULL WHERE id = ?`,
-        sourceId, targetId, hashSecret(token), expiresAt, bytes, link.id,
+        sourceId, targetId, hashSecret(token), expiresAt, link.id,
       );
       this.enqueueCommand(targetId, 'prepare-link-benchmark', {
-        itemId: link.id, token, expiresAt, bytes,
+        itemId: link.id, token, expiresAt,
       });
     }
-    this.audit('topology.benchmark', 'network', networkId, { linkIds, sourceId: input.sourceId, targetId: input.targetId, bytes });
+    this.audit('topology.benchmark', 'network', networkId, { linkIds, sourceId: input.sourceId, targetId: input.targetId });
     return this.getBenchmarkSummary(networkId, linkIds);
   }
 
@@ -2055,7 +2047,7 @@ export class ControlService {
       if (!result.ok) {
         this.db.run(
           "UPDATE topology_links SET benchmark_status = 'failed', benchmark_error = ?, benchmark_measured_at = ? WHERE id = ?",
-          result.error || '目标节点无法准备测速', now(), row.id,
+          result.error || '目标节点无法准备延迟探测', now(), row.id,
         );
         return;
       }
@@ -2063,7 +2055,6 @@ export class ControlService {
       const command = this.enqueueCommand(row.benchmark_source_id, 'execute-link-benchmark', {
         itemId: row.id,
         token: payload.token,
-        bytes: payload.bytes,
         remoteUrl: `http://${target.dataIp}:${target.controlListenPort || 8790}`,
         expectedNodeId: target.id,
       });
@@ -2077,26 +2068,26 @@ export class ControlService {
     if (!result.ok) {
       this.db.run(
         "UPDATE topology_links SET benchmark_status = 'failed', benchmark_error = ?, benchmark_measured_at = ? WHERE id = ?",
-        result.error || '链路测速失败', now(), row.id,
+        result.error || '链路延迟探测失败', now(), row.id,
       );
       return;
     }
     const latencyMs = Number(result.latencyMs);
-    const bandwidthMbps = Number(result.bandwidthMbps);
-    if (!Number.isFinite(latencyMs) || latencyMs < 0 || !Number.isFinite(bandwidthMbps) || bandwidthMbps <= 0) {
+    const latencyMinMs = Number(result.latencyMinMs);
+    const latencyP95Ms = Number(result.latencyP95Ms);
+    if (!Number.isFinite(latencyMs) || latencyMs < 0 || !Number.isFinite(latencyMinMs) || !Number.isFinite(latencyP95Ms)) {
       this.db.run(
         "UPDATE topology_links SET benchmark_status = 'failed', benchmark_error = ?, benchmark_measured_at = ? WHERE id = ?",
-        '节点返回的测速结果无效', now(), row.id,
+        '节点返回的延迟探测结果无效', now(), row.id,
       );
       return;
     }
     this.db.run(
       `UPDATE topology_links SET benchmark_status = 'completed', benchmark_error = NULL,
        benchmark_latency_ms = ?, benchmark_latency_min_ms = ?, benchmark_latency_p95_ms = ?,
-       benchmark_bandwidth_mbps = ?, benchmark_bytes = ?, benchmark_duration_ms = ?,
+       benchmark_bandwidth_mbps = NULL, benchmark_bytes = NULL, benchmark_duration_ms = NULL,
        benchmark_measured_at = ?, benchmark_token_hash = NULL, benchmark_expires_at = NULL WHERE id = ?`,
-      latencyMs, Number(result.latencyMinMs), Number(result.latencyP95Ms), bandwidthMbps,
-      Number(result.bytes), Number(result.durationMs), result.measuredAt || now(), row.id,
+      latencyMs, latencyMinMs, latencyP95Ms, result.measuredAt || now(), row.id,
     );
   }
 

@@ -63,6 +63,14 @@ async function readBody(req) {
   return Buffer.concat(chunks);
 }
 
+function staticCacheControl(filename) {
+  const ext = extname(filename);
+  if (['.html', '.css', '.js'].includes(ext)) {
+    return 'no-store, max-age=0, must-revalidate';
+  }
+  return 'public, max-age=300';
+}
+
 function serveStatic(pathname, res) {
   const requested = pathname === '/' ? 'index.html' : pathname.replace(/^\//, '');
   const filename = resolve(publicDir, normalize(requested));
@@ -73,7 +81,8 @@ function serveStatic(pathname, res) {
     const content = readFileSync(filename);
     send(res, 200, content, {
       'Content-Type': mimeTypes[extname(filename)] || 'application/octet-stream',
-      'Cache-Control': ['.html', '.css', '.js'].includes(extname(filename)) ? 'no-cache' : 'public, max-age=300',
+      'Cache-Control': staticCacheControl(filename),
+      ...(['.html', '.css', '.js'].includes(extname(filename)) ? { Pragma: 'no-cache' } : {}),
     });
     return true;
   } catch {

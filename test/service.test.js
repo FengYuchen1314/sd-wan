@@ -783,12 +783,12 @@ test('全网更新选择首个可访问 GitHub 的节点并把同一摘要制品
   } finally { database.close(); }
 });
 
-test('相邻链路测速按目标准备、源节点执行，并汇总到端到端通路', () => {
+test('相邻链路延迟探测按目标准备、源节点执行，并汇总到端到端通路', () => {
   const { database, service, network, center } = fixture();
   try {
     const token = service.createJoinToken(network.id, { parentId: center.id });
     const edge = service.registerAgent({
-      token: token.token, name: '测速边缘', hasPublicEndpoint: false, wgDataPublicKey: 'm'.repeat(44),
+      token: token.token, name: '延迟边缘', hasPublicEndpoint: false, wgDataPublicKey: 'm'.repeat(44),
     }).node;
     const started = service.createLinkBenchmarks(network.id);
     assert.deepEqual(started.summary, { total: 1, completed: 0, running: 1, failed: 0 });
@@ -800,17 +800,16 @@ test('相邻链路测速按目标准备、源节点执行，并汇总到端到�
     assert.equal(execute.payload.expectedNodeId, center.id);
     service.completeCommand(edge.id, execute.id, {
       ok: true, latencyMs: 18.25, latencyMinMs: 15.1, latencyP95Ms: 24.2,
-      bandwidthMbps: 96.5, bytes: 2 * 1024 * 1024, durationMs: 173.8,
       measuredAt: '2026-07-20T08:00:00.000Z',
     });
     const summary = service.getBenchmarkSummary(network.id);
     assert.deepEqual(summary.summary, { total: 1, completed: 1, running: 0, failed: 0 });
     assert.equal(summary.links[0].benchmark.latencyMs, 18.25);
-    assert.equal(summary.links[0].benchmark.bandwidthMbps, 96.5);
+    assert.equal(summary.links[0].benchmark.bandwidthMbps, undefined);
     const paths = service.getPathOptions(network.id, center.id, edge.id);
     assert.equal(paths.paths[0].benchmark.status, 'completed');
     assert.equal(paths.paths[0].benchmark.latencyMs, 18.25);
-    assert.equal(paths.paths[0].benchmark.bandwidthMbps, 96.5);
+    assert.equal(paths.paths[0].benchmark.bandwidthMbps, undefined);
   } finally { database.close(); }
 });
 
