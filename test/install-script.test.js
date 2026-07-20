@@ -40,12 +40,18 @@ test('统一对等节点安装不再要求选择中心或边缘，并为每台�
   assert.match(installer, /pathweaver-node\.service/);
 });
 
-test('安装器写入 node.env 时会转义 scrypt 哈希中的 $，避免 systemd 截断面板密码', () => {
-  assert.match(installer, /escape_systemd_env_value/);
-  assert.match(installer, /sed 's\/\\$\//);
+test('安装器写入 node.env 时使用不含 $ 的 scrypt 哈希，避免 systemd 截断面板密码', () => {
   assert.match(installer, /write_bootstrap_node_env/);
   assert.match(installer, /write_peer_node_env/);
+  assert.match(installer, /scrypt-v1\.\$\{salt/);
+  assert.match(installer, /printf 'SDWAN_PANEL_PASSWORD_HASH=%s\\n' "\$password_hash"/);
   assert.doesNotMatch(installer, /SDWAN_PANEL_PASSWORD_HASH=\$panel_password_hash/);
+});
+
+test('安装器提供本机面板密码重置命令', () => {
+  assert.match(installer, /set-panel-password\.sh/);
+  assert.match(installer, /pathweaver-set-panel-password/);
+  assert.match(bundleSource, /scripts\/set-panel-password\.sh/);
 });
 
 test('安装器为 systemd 选择 pathweaver 用户可执行的 Node 运行时', () => {

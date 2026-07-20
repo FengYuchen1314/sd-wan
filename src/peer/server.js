@@ -9,7 +9,7 @@ const publicDir = join(rootDir, 'public');
 const port = Number(process.env.SDWAN_PANEL_PORT || 19773);
 const host = process.env.SDWAN_PANEL_HOST || '0.0.0.0';
 const relayUrl = new URL(process.env.SDWAN_AGENT_RELAY_URL || 'http://127.0.0.1:8790');
-const panelPasswordHash = process.env.SDWAN_PANEL_PASSWORD_HASH || '';
+const panelPasswordHash = (process.env.SDWAN_PANEL_PASSWORD_HASH || '').trim();
 const proxyToken = process.env.SDWAN_PANEL_PROXY_TOKEN || '';
 const developmentToken = process.env.NODE_ENV === 'production' ? '' : 'dev-admin-token';
 

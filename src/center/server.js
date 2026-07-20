@@ -23,7 +23,7 @@ const port = Number(process.env.SDWAN_PORT || 19773);
 const host = process.env.SDWAN_HOST || '0.0.0.0';
 const publicUrl = process.env.SDWAN_PUBLIC_URL || `http://127.0.0.1:${port}`;
 const defaultDataPort = Number(process.env.SDWAN_DEFAULT_DATA_PORT || 19801);
-const adminPasswordHash = process.env.SDWAN_PANEL_PASSWORD_HASH || '';
+const adminPasswordHash = (process.env.SDWAN_PANEL_PASSWORD_HASH || '').trim();
 const adminToken = process.env.SDWAN_ADMIN_TOKEN || (process.env.NODE_ENV === 'production' ? '' : 'dev-admin-token');
 const nodeOfflineAfterMs = Number(process.env.SDWAN_NODE_OFFLINE_AFTER_MS || 20_000);
 const configuredSweepIntervalMs = Number(process.env.SDWAN_RUNTIME_SWEEP_INTERVAL_MS || 5_000);

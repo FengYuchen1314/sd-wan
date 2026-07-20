@@ -371,18 +371,14 @@ process.stdin.on("end", () => {
   const password = Buffer.concat(chunks).toString("utf8");
   const salt = randomBytes(16);
   const digest = scryptSync(password, salt, 32);
-  process.stdout.write(`scrypt-v1$${salt.toString("base64url")}$${digest.toString("base64url")}`);
+  process.stdout.write(`scrypt-v1.${salt.toString("base64url")}.${digest.toString("base64url")}`);
 });'
-}
-
-escape_systemd_env_value() {
-  printf '%s' "$1" | sed 's/\$/$$/g'
 }
 
 write_bootstrap_node_env() {
   local env_file="$1" password_hash="$2" endpoint="$3" panel_port="$4" data_port="$5"
   {
-    printf 'SDWAN_PANEL_PASSWORD_HASH=%s\n' "$(escape_systemd_env_value "$password_hash")"
+    printf 'SDWAN_PANEL_PASSWORD_HASH=%s\n' "$password_hash"
     printf 'SDWAN_PUBLIC_URL=http://%s:%s\n' "$endpoint" "$panel_port"
     printf 'SDWAN_DEFAULT_DATA_PORT=%s\n' "$data_port"
   } >"$env_file"
@@ -392,7 +388,7 @@ write_bootstrap_node_env() {
 write_peer_node_env() {
   local env_file="$1" password_hash="$2" proxy_token="$3"
   {
-    printf 'SDWAN_PANEL_PASSWORD_HASH=%s\n' "$(escape_systemd_env_value "$password_hash")"
+    printf 'SDWAN_PANEL_PASSWORD_HASH=%s\n' "$password_hash"
     printf 'SDWAN_PANEL_PROXY_TOKEN=%s\n' "$proxy_token"
   } >"$env_file"
   chmod 0600 "$env_file"
@@ -523,6 +519,7 @@ update_node() {
   fi
   install -m 0755 "$new_release/scripts/uninstall.sh" /usr/local/sbin/pathweaver-uninstall
   install -m 0755 "$new_release/scripts/update.sh" /usr/local/sbin/pathweaver-update
+  install -m 0755 "$new_release/scripts/set-panel-password.sh" /usr/local/sbin/pathweaver-set-panel-password
   install_update_dispatcher
   if [[ -x "$WIREGUARD_RUNTIME_LINK/bin/wg-quick" ]]; then
     if ! patch_private_wireguard_runtime; then
@@ -598,6 +595,7 @@ install_node() {
   install_node_bundle
   install -m 0755 /opt/pathweaver/current/scripts/uninstall.sh /usr/local/sbin/pathweaver-uninstall
   install -m 0755 /opt/pathweaver/current/scripts/update.sh /usr/local/sbin/pathweaver-update
+  install -m 0755 /opt/pathweaver/current/scripts/set-panel-password.sh /usr/local/sbin/pathweaver-set-panel-password
   if ! id pathweaver >/dev/null 2>&1; then useradd --system --home /var/lib/pathweaver --shell /usr/sbin/nologin pathweaver; fi
   install -d -o pathweaver -g pathweaver -m 0750 /var/lib/pathweaver
   install -d -m 0700 /var/lib/pathweaver-agent

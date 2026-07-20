@@ -13,6 +13,7 @@ export function createCenterBundle(rootDir) {
       'scripts/update.sh',
       'scripts/apply-update-request.sh',
       'scripts/uninstall.sh',
+      'scripts/set-panel-password.sh',
     ], { cwd: rootDir, maxBuffer: 32 * 1024 * 1024 });
   }
   return cachedBundle;
