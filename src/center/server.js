@@ -25,7 +25,8 @@ const host = process.env.SDWAN_HOST || '0.0.0.0';
 const publicUrl = process.env.SDWAN_PUBLIC_URL || `http://127.0.0.1:${port}`;
 const defaultDataPort = Number(process.env.SDWAN_DEFAULT_DATA_PORT || 19801);
 const adminPasswordHash = (process.env.SDWAN_PANEL_PASSWORD_HASH || '').trim();
-const adminToken = process.env.SDWAN_ADMIN_TOKEN || (process.env.NODE_ENV === 'production' ? '' : 'dev-admin-token');
+const adminToken = (process.env.SDWAN_ADMIN_TOKEN || '').trim() || (process.env.NODE_ENV === 'production' ? '' : 'dev-admin-token');
+const testMode = process.env.SDWAN_TEST_MODE === '1' || adminToken === 'dev-admin-token';
 const nodeOfflineAfterMs = Number(process.env.SDWAN_NODE_OFFLINE_AFTER_MS || 20_000);
 const configuredSweepIntervalMs = Number(process.env.SDWAN_RUNTIME_SWEEP_INTERVAL_MS || 5_000);
 const runtimeSweepIntervalMs = Number.isFinite(configuredSweepIntervalMs) && configuredSweepIntervalMs > 0
@@ -703,6 +704,7 @@ async function handleAdmin(req, res, pathname, url, authenticated = false) {
       writable: writeStatus.writable,
       syncMode: 'quorum-replicated-control-state',
       panelPort: port,
+      testMode,
       message: writeStatus.writable
         ? '面板通过无环控制路径读写当前协调节点；成功写入已同步到选民多数派'
         : writeStatus.reason,
@@ -1019,6 +1021,7 @@ const server = createServer(async (req, res) => {
     if (pathname === '/healthz') return send(res, 200, {
       status: 'ok',
       time: new Date().toISOString(),
+      testMode,
       centerDataPlane: centerDataPlane.runtimeInfo(),
     });
     if (pathname === '/install.sh') {
@@ -1119,7 +1122,7 @@ const server = createServer(async (req, res) => {
 
 server.listen(port, host, () => {
   console.log(`PathWeaver node panel listening at ${publicUrl}`);
-  if (adminToken === 'dev-admin-token') console.log('Development admin token: dev-admin-token');
+  if (adminToken === 'dev-admin-token') console.log('Test mode: panel auth disabled (dev-admin-token).');
 });
 
 function shutdown() {

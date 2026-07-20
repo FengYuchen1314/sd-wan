@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-GITHUB_SOURCE="${PATHWEAVER_UPDATE_GITHUB_SOURCE:-https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main}"
-GITHUB_BUNDLE_URL="${PATHWEAVER_UPDATE_GITHUB_BUNDLE_URL:-https://github.com/FengYuchen1314/sd-wan/archive/refs/heads/main.tar.gz}"
+GITHUB_SOURCE="${PATHWEAVER_UPDATE_GITHUB_SOURCE:-https://raw.githubusercontent.com/FengYuchen1314/sd-wan/test}"
+GITHUB_BUNDLE_URL="${PATHWEAVER_UPDATE_GITHUB_BUNDLE_URL:-https://github.com/FengYuchen1314/sd-wan/archive/refs/heads/test.tar.gz}"
 EXPLICIT_SOURCE=""
 NODE_BINARY=""
 declare -a UPDATE_SOURCES=()

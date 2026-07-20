@@ -26,6 +26,7 @@ const state = {
   joinResult: null,
   joinMode: 'active',
   joinParentId: null,
+  testMode: false,
   cidrPreview: null,
   runtimeRefreshInFlight: false,
 };
@@ -945,12 +946,12 @@ function renderJoin() {
           return `<option value="${node.id}" data-host="${escapeHtml(connection.host)}" data-port="${connection.port}" data-protocol="${connection.protocol}" data-data-host="${escapeHtml(dataConnection.host)}" data-data-port="${dataConnection.port}" ${node.id === selectedParent?.id ? 'selected' : ''}>${escapeHtml(node.name)} · ${escapeHtml(node.controlIp)}</option>`;
         }).join('')}</select></label>
         ${mode === 'active' ? `<div class="form-grid">
-          <label>接入协议<select name="parentProtocol"><option value="http" ${parentConnection.protocol === 'http' ? 'selected' : ''}>HTTP</option><option value="https" ${parentConnection.protocol === 'https' ? 'selected' : ''}>HTTPS</option></select></label>
-          <label>父节点控制端口<input name="parentPort" type="number" min="1" max="65535" required value="${parentConnection.port || ''}"></label>
+          <label class="test-mode-hidden">接入协议<select name="parentProtocol"><option value="http" ${parentConnection.protocol === 'http' ? 'selected' : ''}>HTTP</option><option value="https" ${parentConnection.protocol === 'https' ? 'selected' : ''}>HTTPS</option></select></label>
+          <label class="test-mode-hidden">父节点控制端口<input name="parentPort" type="number" min="1" max="65535" required value="${parentConnection.port || 8790}"></label>
           <label class="span-2">新设备能访问的父节点 IP 或域名<input name="parentHost" required value="${escapeHtml(parentConnection.host)}" placeholder="选择父节点后自动填充，也可覆盖"></label>
           <label>父节点 WireGuard IP 或域名<input name="parentDataHost" required value="${escapeHtml(parentDataConnection.host)}" placeholder="默认跟随父节点入口，也可覆盖"></label>
-          <label>父节点 WireGuard UDP 端口<input name="parentDataPort" type="number" min="1" max="65535" required value="${parentDataConnection.port || ''}"></label>
-        </div>` : '<div class="notice"><strong>固定 GitHub 安装源</strong><span><a href="https://github.com/FengYuchen1314/sd-wan" target="_blank" rel="noreferrer">FengYuchen1314/sd-wan</a> · main。目标设备下载与其他设备完全相同的节点服务、面板和 Agent。</span></div>'}
+          <label class="test-mode-hidden">父节点 WireGuard UDP 端口<input name="parentDataPort" type="number" min="1" max="65535" required value="${parentDataConnection.port || 19801}"></label>
+        </div>` : '<div class="notice"><strong>固定 GitHub 测试源</strong><span><a href="https://github.com/FengYuchen1314/sd-wan/tree/test" target="_blank" rel="noreferrer">FengYuchen1314/sd-wan</a> · test。生成的命令会附带 <code>--test</code>，默认端口且无需面板密码。</span></div>'}
         <label>令牌有效时间（分钟）<input name="ttlMinutes" type="number" min="5" max="1440" value="30"></label>
         <button class="button primary" type="submit" ${nodes.length ? '' : 'disabled'}>${mode === 'passive' ? '生成 GitHub 节点安装命令' : '生成一次性命令'}</button>
       </form>
@@ -960,7 +961,7 @@ function renderJoin() {
         <div class="command-box">${result ? `<code>${escapeHtml(result.command)}</code><div class="command-meta"><span>入口：${escapeHtml(result.parent.name)}</span>${result.parentDataConnection ? `<span>WireGuard：${escapeHtml(result.parentDataConnection.endpoint)}</span>` : ''}<span>有效至 ${formatDate(result.expiresAt)}</span></div>` : '<div class="empty"><strong>等待生成</strong>命令将绑定节点组、父节点和短时效认证令牌。</div>'}</div>
         <div class="notice"><strong>${mode === 'passive' ? '单向被动认领' : '传递式安装'}</strong><span>${mode === 'passive' ? '目标节点不需要反向访问接入节点；认领方会持续代理控制通信，目标本机仍提供完整面板。' : '任意已入网节点都能传递同一份安装包；新设备加入后立即拥有本机面板，所有操作实时写入全网版本化配置。'}</span></div>
         ${result?.mode === 'passive' ? `<form id="adopt-form" class="form-stack">
-          <div class="form-grid"><label>待认领节点 IP 或域名<input name="targetHost" required placeholder="安装脚本最后显示的地址"></label><label>待认领节点控制端口<input name="targetPort" type="number" min="1" max="65535" required placeholder="由目标节点安装时选择"></label></div>
+          <div class="form-grid"><label>待认领节点 IP 或域名<input name="targetHost" required placeholder="安装脚本最后显示的地址"></label><label class="test-mode-hidden">待认领节点控制端口<input name="targetPort" type="number" min="1" max="65535" value="8790" placeholder="默认 8790"></label></div>
           <button class="button primary" type="submit">命令 ${escapeHtml(result.parent.name)} 主动连接</button>
           <p class="muted flush">认领指令会沿控制树送到 ${escapeHtml(result.parent.name)}，由它连接目标并成为控制父节点。</p>
         </form>` : ''}
@@ -1324,6 +1325,39 @@ async function enqueueAdoption(event) {
   } catch (error) { toast(error.message, 'error'); }
 }
 
+function applyTestModeUi(enabled) {
+  state.testMode = Boolean(enabled);
+  document.body.classList.toggle('test-mode', state.testMode);
+  const hint = document.querySelector('#login-hint');
+  const passwordField = document.querySelector('#login-password-field');
+  const adminToken = document.querySelector('#admin-token');
+  if (hint) {
+    hint.textContent = state.testMode
+      ? '当前为测试版安装，面板无需密码，可直接进入。'
+      : '输入安装本节点时设置的面板密码。密码只用于本机验证。';
+  }
+  if (passwordField) passwordField.hidden = state.testMode;
+  if (adminToken) adminToken.required = !state.testMode;
+}
+
+async function bootstrapPanelAccess() {
+  try {
+    const health = await fetch('/healthz').then((response) => response.ok ? response.json() : null);
+    applyTestModeUi(Boolean(health?.testMode));
+    if (health?.testMode) {
+      await authenticate('dev-admin-token');
+      return;
+    }
+  } catch {}
+  if (state.token) {
+    try {
+      await authenticate(state.token);
+      return;
+    } catch {}
+  }
+  document.querySelector('#login-dialog').showModal();
+}
+
 async function authenticate(token) {
   state.token = token;
   await load();
@@ -1479,5 +1513,5 @@ setInterval(async () => {
   finally { state.runtimeRefreshInFlight = false; }
 }, 5000);
 
-if (state.token) authenticate(state.token).catch(() => document.querySelector('#login-dialog').showModal());
-else document.querySelector('#login-dialog').showModal();
+if (state.token) authenticate(state.token).catch(() => bootstrapPanelAccess());
+else bootstrapPanelAccess();

@@ -43,7 +43,7 @@ rm -f -- "$REQUEST_FILE"
 sleep 4
 ERROR_FILE="$(mktemp)"
 if bash "$INSTALLER_FILE" \
-  --source 'https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main' \
+  --source 'https://raw.githubusercontent.com/FengYuchen1314/sd-wan/test' \
   --bundle-file "$BUNDLE_FILE" --update 2> >(tee "$ERROR_FILE" >&2); then
   "$NODE_BINARY" - "$MARKER_FILE" "$ROLLOUT_ID" <<'NODE'
 const { mkdirSync, renameSync, writeFileSync } = require('node:fs');

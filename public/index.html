@@ -63,8 +63,8 @@
       <div class="modal-badge">PW</div>
       <p class="eyebrow">CONTROL PLANE ACCESS</p>
       <h2>进入节点面板</h2>
-      <p class="muted">输入安装本节点时设置的面板密码。密码只用于本机验证。</p>
-      <label>面板密码<input id="admin-token" type="password" autocomplete="current-password" required placeholder="安装时输入的密码"></label>
+      <p class="muted" id="login-hint">输入安装本节点时设置的面板密码。密码只用于本机验证。</p>
+      <label id="login-password-field">面板密码<input id="admin-token" type="password" autocomplete="current-password" placeholder="安装时输入的密码"></label>
       <p class="form-error" id="login-error"></p>
       <button class="button primary wide" value="default">验证并进入</button>
     </form>
@@ -101,8 +101,8 @@
           </select>
         </label>
         <label>接入中继地址<input name="controlEndpoint" placeholder="http://公网或内网IP:8790"></label>
-        <label>控制中继 TCP 端口<input name="controlListenPort" type="number" min="1" max="65535" required></label>
-        <label>WireGuard 监听端口<input name="dataListenPort" type="number" min="1" max="65535" required></label>
+        <label class="test-mode-hidden">控制中继 TCP 端口<input name="controlListenPort" type="number" min="1" max="65535" value="8790"></label>
+        <label class="test-mode-hidden">WireGuard 监听端口<input name="dataListenPort" type="number" min="1" max="65535" value="19801"></label>
         <label>供其他节点拨入的 WireGuard 固定端点<input name="dataEndpoint" placeholder="公网IP:19801 或 IX 内网IP:19801"></label>
         <label class="toggle-line span-2"><input name="canRelay" type="checkbox"><span>允许作为下级节点的接入和控制中继</span></label>
       </div>
@@ -120,9 +120,9 @@
       <div class="connection-pair" id="connection-pair"></div>
       <div class="form-grid">
         <label><span id="node-a-address-label">节点 A 的可达 IP 或域名（可留空）</span><input name="nodeAAddress" placeholder="例如 192.168.1.10"></label>
-        <label><span id="node-a-port-label">节点 A 固定入口端口</span><input name="nodeAPort" type="number" min="1" max="65535" required></label>
+        <label class="test-mode-hidden"><span id="node-a-port-label">节点 A 固定入口端口</span><input name="nodeAPort" type="number" min="1" max="65535" value="19801"></label>
         <label><span id="node-b-address-label">节点 B 的可达 IP 或域名（可留空）</span><input name="nodeBAddress" placeholder="例如 10.10.0.23"></label>
-        <label><span id="node-b-port-label">节点 B 固定入口端口</span><input name="nodeBPort" type="number" min="1" max="65535" required></label>
+        <label class="test-mode-hidden"><span id="node-b-port-label">节点 B 固定入口端口</span><input name="nodeBPort" type="number" min="1" max="65535" value="19801"></label>
         <label class="span-2">路径优先级<input name="priority" type="number" min="0" value="10"><small>数字越小越优先；新直连通常会成为两节点之间的首选路径。</small></label>
       </div>
       <div class="notice" id="connection-capability-note"><strong>按拨入类型确定拨号方向</strong><span>NAT 与 IX 都可以主动拨号有公网的节点；两个非公网节点之间不能直连。</span></div>

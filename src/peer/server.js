@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { readFileSync, statSync } from 'node:fs';
+import { timingSafeEqual } from 'node:crypto';
 import { extname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { verifyPanelPassword, isPanelPasswordHashRecord } from '../core/password.js';
@@ -10,10 +11,11 @@ const port = Number(process.env.SDWAN_PANEL_PORT || 19773);
 const host = process.env.SDWAN_PANEL_HOST || '0.0.0.0';
 const relayUrl = new URL(process.env.SDWAN_AGENT_RELAY_URL || 'http://127.0.0.1:8790');
 const panelPasswordHash = (process.env.SDWAN_PANEL_PASSWORD_HASH || '').trim();
+const adminToken = (process.env.SDWAN_ADMIN_TOKEN || '').trim() || (process.env.NODE_ENV === 'production' ? '' : 'dev-admin-token');
+const testMode = process.env.SDWAN_TEST_MODE === '1' || adminToken === 'dev-admin-token';
 const proxyToken = process.env.SDWAN_PANEL_PROXY_TOKEN || '';
-const developmentToken = process.env.NODE_ENV === 'production' ? '' : 'dev-admin-token';
 
-if (!panelPasswordHash && !developmentToken) throw new Error('生产环境必须设置面板密码哈希');
+if (!adminToken && !panelPasswordHash) throw new Error('生产环境必须设置面板密码哈希');
 if (panelPasswordHash && !isPanelPasswordHashRecord(panelPasswordHash)) {
   throw new Error('面板密码哈希无效或已损坏，请在本机运行：sudo pathweaver-set-panel-password');
 }
@@ -47,9 +49,16 @@ function bearer(req) {
   return authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
 }
 
+function secretMatches(left, right) {
+  const a = Buffer.from(String(left));
+  const b = Buffer.from(String(right));
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 function requireAdmin(req) {
-  const password = bearer(req);
-  if ((developmentToken && password === developmentToken) || verifyPanelPassword(password, panelPasswordHash)) return;
+  const credential = bearer(req);
+  if (adminToken && secretMatches(credential, adminToken)) return;
+  if (verifyPanelPassword(credential, panelPasswordHash)) return;
   const error = new Error('面板密码无效');
   error.statusCode = 401;
   throw error;
@@ -118,7 +127,12 @@ async function proxyAdmin(req, res) {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${port}`);
   try {
-    if (url.pathname === '/healthz') return send(res, 200, { status: 'ok', panelPort: port, syncMode: 'live-control-proxy' });
+    if (url.pathname === '/healthz') return send(res, 200, {
+      status: 'ok',
+      panelPort: port,
+      syncMode: 'live-control-proxy',
+      testMode,
+    });
     if (url.pathname === '/api/v1/panel-status') {
       requireAdmin(req);
       return send(res, 200, {

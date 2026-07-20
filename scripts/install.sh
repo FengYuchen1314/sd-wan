@@ -12,6 +12,8 @@ REACHABLE_HOST=""
 PUBLIC_ENDPOINT=""
 REACHABILITY=""
 PANEL_PASSWORD=""
+TEST_MODE=0
+PATHWEAVER_GITHUB_BRANCH="test"
 UPDATE_ONLY=0
 BUNDLE_FILE=""
 WIREGUARD_TOOLS_VERSION="1.0.20260223"
@@ -40,6 +42,7 @@ while [[ $# -gt 0 ]]; do
     --bundle-file) BUNDLE_FILE="$2"; shift 2 ;;
     --panel-password) PANEL_PASSWORD="$2"; shift 2 ;;
     --admin-token) PANEL_PASSWORD="$2"; shift 2 ;;
+    --test) TEST_MODE=1; shift ;;
     --update) UPDATE_ONLY=1; shift ;;
     --listen) shift ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
@@ -423,7 +426,12 @@ wait_for_panel_health() {
 write_bootstrap_node_env() {
   local env_file="$1" password_hash="$2" endpoint="$3" panel_port="$4" data_port="$5"
   {
-    printf 'SDWAN_PANEL_PASSWORD_HASH=%s\n' "$password_hash"
+    if [[ "$TEST_MODE" -eq 1 ]]; then
+      printf 'SDWAN_ADMIN_TOKEN=dev-admin-token\n'
+      printf 'SDWAN_TEST_MODE=1\n'
+    else
+      printf 'SDWAN_PANEL_PASSWORD_HASH=%s\n' "$password_hash"
+    fi
     printf 'SDWAN_PUBLIC_URL=http://%s:%s\n' "$endpoint" "$panel_port"
     printf 'SDWAN_DEFAULT_DATA_PORT=%s\n' "$data_port"
   } >"$env_file"
@@ -433,10 +441,26 @@ write_bootstrap_node_env() {
 write_peer_node_env() {
   local env_file="$1" password_hash="$2" proxy_token="$3"
   {
-    printf 'SDWAN_PANEL_PASSWORD_HASH=%s\n' "$password_hash"
+    if [[ "$TEST_MODE" -eq 1 ]]; then
+      printf 'SDWAN_ADMIN_TOKEN=dev-admin-token\n'
+      printf 'SDWAN_TEST_MODE=1\n'
+    else
+      printf 'SDWAN_PANEL_PASSWORD_HASH=%s\n' "$password_hash"
+    fi
     printf 'SDWAN_PANEL_PROXY_TOKEN=%s\n' "$proxy_token"
   } >"$env_file"
   chmod 0600 "$env_file"
+}
+
+resolve_distinct_relay_port() {
+  local panel_port="$1" supplied="$2" start="${3:-8790}"
+  local selected="$supplied"
+  if [[ -z "$selected" ]]; then selected="$(find_available_port tcp "$start")"; fi
+  while [[ "$selected" == "$panel_port" ]]; do
+    selected=$((selected + 1))
+    selected="$(find_available_port tcp "$selected")"
+  done
+  printf '%s\n' "$selected"
 }
 
 install_node_bundle() {
@@ -463,7 +487,7 @@ install_node_bundle() {
   else
     rm -f -- "$bundle"
     bundle="$(mktemp)"
-    curl -fsSL "https://github.com/FengYuchen1314/sd-wan/archive/refs/heads/main.tar.gz?cache=$(date +%s)" -o "$bundle"
+    curl -fsSL "https://github.com/FengYuchen1314/sd-wan/archive/refs/heads/${PATHWEAVER_GITHUB_BRANCH}.tar.gz?cache=$(date +%s)" -o "$bundle"
     archive_root="$(tar -tzf "$bundle" | awk -F/ 'NR == 1 { root = $1 } END { print root }')"
     tar -xzf "$bundle" -C "$release" --strip-components=1 "$archive_root"
   fi
@@ -587,25 +611,43 @@ install_node() {
     exit 2
   fi
 
-  PANEL_PORT="$(choose_port "本机管理面板 TCP 端口" tcp 19773 "$PANEL_PORT")"
+  if [[ "$TEST_MODE" -eq 1 ]]; then
+    PANEL_PORT="${PANEL_PORT:-$(find_available_port tcp 19773)}"
+  else
+    PANEL_PORT="$(choose_port "本机管理面板 TCP 端口" tcp 19773 "$PANEL_PORT")"
+  fi
   if [[ "$bootstrap" -eq 1 || -n "$CLAIM_TOKEN" ]]; then
     reachability="public"
+  elif [[ "$TEST_MODE" -eq 1 && -z "$REACHABILITY" && -z "$PUBLIC_ENDPOINT" ]]; then
+    reachability="nat"
   else
     reachability="$(choose_reachability "${REACHABILITY:-$PUBLIC_ENDPOINT}")"
   fi
   if [[ "$bootstrap" -eq 0 ]]; then
     if [[ "$reachability" == "nat" ]]; then
       RELAY_PORT="${RELAY_PORT:-$(find_available_port tcp 8790)}"
+    elif [[ "$TEST_MODE" -eq 1 ]]; then
+      RELAY_PORT="$(resolve_distinct_relay_port "$PANEL_PORT" "$RELAY_PORT")"
     else
       RELAY_PORT="$(choose_distinct_tcp_port "节点控制中继 TCP 端口" 8790 "$RELAY_PORT" "$PANEL_PORT")"
     fi
   fi
   if [[ "$reachability" == "public" ]]; then
-    DATA_PORT="$(choose_port "WireGuard UDP 公网监听端口" udp 19801 "$DATA_PORT")"
-    REACHABLE_HOST="${REACHABLE_HOST:-$(ask "其他节点可访问本节点的公网 IP 或域名" "$(detect_reachable_host)")}"
+    if [[ "$TEST_MODE" -eq 1 ]]; then
+      DATA_PORT="${DATA_PORT:-$(find_available_port udp 19801)}"
+      REACHABLE_HOST="${REACHABLE_HOST:-$(detect_reachable_host)}"
+    else
+      DATA_PORT="$(choose_port "WireGuard UDP 公网监听端口" udp 19801 "$DATA_PORT")"
+      REACHABLE_HOST="${REACHABLE_HOST:-$(ask "其他节点可访问本节点的公网 IP 或域名" "$(detect_reachable_host)")}"
+    fi
   elif [[ "$reachability" == "ix" ]]; then
-    DATA_PORT="$(choose_port "WireGuard UDP 内网监听端口" udp 19801 "$DATA_PORT")"
-    REACHABLE_HOST="${REACHABLE_HOST:-$(ask "同 IX/内网其他节点可访问本节点的内网 IP" "$(detect_reachable_host)")}"
+    if [[ "$TEST_MODE" -eq 1 ]]; then
+      DATA_PORT="${DATA_PORT:-$(find_available_port udp 19801)}"
+      REACHABLE_HOST="${REACHABLE_HOST:-$(detect_reachable_host)}"
+    else
+      DATA_PORT="$(choose_port "WireGuard UDP 内网监听端口" udp 19801 "$DATA_PORT")"
+      REACHABLE_HOST="${REACHABLE_HOST:-$(ask "同 IX/内网其他节点可访问本节点的内网 IP" "$(detect_reachable_host)")}"
+    fi
     echo "本节点按 IX 模式安装：将发布内网入口供新节点主动加入或认领；上行按 NAT，后续可主动连接有公网的节点。"
   else
     DATA_PORT="${DATA_PORT:-$(find_available_port udp 19801)}"
@@ -613,10 +655,16 @@ install_node() {
     echo "本节点按纯 NAT 模式安装：WireGuard 本地端口已自动选择，不会发布给其他节点。"
   fi
   endpoint_host="$(format_endpoint_host "$REACHABLE_HOST")"
-  choose_panel_password
+  if [[ "$TEST_MODE" -eq 1 ]]; then
+    panel_password_hash=""
+  else
+    choose_panel_password
+    require_pathweaver_node || exit 1
+    node_executable="$PATHWEAVER_NODE_BIN"
+    panel_password_hash="$(hash_panel_password)" || exit 1
+  fi
   require_pathweaver_node || exit 1
   node_executable="$PATHWEAVER_NODE_BIN"
-  panel_password_hash="$(hash_panel_password)" || exit 1
 
   install_private_wireguard_runtime
   install_node_bundle
@@ -647,9 +695,11 @@ EOF
 
   if [[ "$bootstrap" -eq 1 ]]; then
     write_bootstrap_node_env "$node_env" "$panel_password_hash" "$endpoint_host" "$PANEL_PORT" "$DATA_PORT"
-    if ! verify_panel_password_env "$node_env" "$node_executable" "$PANEL_PASSWORD"; then
-      echo "面板密码写入校验失败，请重新运行安装。" >&2
-      exit 1
+    if [[ "$TEST_MODE" -ne 1 ]]; then
+      if ! verify_panel_password_env "$node_env" "$node_executable" "$PANEL_PASSWORD"; then
+        echo "面板密码写入校验失败，请重新运行安装。" >&2
+        exit 1
+      fi
     fi
     cat >/etc/systemd/system/pathweaver-node.service <<EOF
 [Unit]
@@ -695,9 +745,11 @@ EOF
       data_endpoint="$endpoint_host:$DATA_PORT"
     fi
     write_peer_node_env "$node_env" "$panel_password_hash" "$panel_proxy_token"
-    if ! verify_panel_password_env "$node_env" "$node_executable" "$PANEL_PASSWORD"; then
-      echo "面板密码写入校验失败，请重新运行安装。" >&2
-      exit 1
+    if [[ "$TEST_MODE" -ne 1 ]]; then
+      if ! verify_panel_password_env "$node_env" "$node_executable" "$PANEL_PASSWORD"; then
+        echo "面板密码写入校验失败，请重新运行安装。" >&2
+        exit 1
+      fi
     fi
     ARGS=(--relay-port "$RELAY_PORT" --data-port "$DATA_PORT" --reachability "$reachability" --panel-proxy-token "$panel_proxy_token")
     if [[ -n "$control_endpoint" ]]; then ARGS+=(--control-endpoint "$control_endpoint"); fi
@@ -767,7 +819,11 @@ EOF
   else
     echo "PathWeaver 节点已启动：面板 http://$endpoint_host:$PANEL_PORT；数据面仅主动拨出，不公开 WireGuard 端口。"
   fi
-  echo "每台设备都使用自己的安装密码登录面板，配置通过现有无环控制路径实时保持一致。"
+  if [[ "$TEST_MODE" -eq 1 ]]; then
+    echo "当前为测试版安装：面板默认端口 $PANEL_PORT / 控制中继 $RELAY_PORT / WireGuard $DATA_PORT，无需密码，直接打开面板即可。"
+  else
+    echo "每台设备都使用自己的安装密码登录面板，配置通过现有无环控制路径实时保持一致。"
+  fi
   if [[ -n "$CLAIM_TOKEN" ]]; then
     echo "待认领节点 IP 或域名：$REACHABLE_HOST"
     echo "待认领节点控制端口：$RELAY_PORT"

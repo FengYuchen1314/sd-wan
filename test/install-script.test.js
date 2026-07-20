@@ -72,9 +72,10 @@ test('安装完成后会校验面板密码并等待 healthz 就绪', () => {
 });
 
 test('初始节点一键命令使用固定 GitHub 源，安装器自动补齐 Node.js 运行时', () => {
-  assert.match(readme, /curl -fsSL "https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main\/scripts\/install\.sh\?cache=\$\(date \+%s\)" \| sudo bash -s -- --source https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main/);
+  assert.match(readme, /curl -fsSL "https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/test\/scripts\/install\.sh\?cache=\$\(date \+%s\)" \| sudo bash -s -- --source https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/test --test/);
   assert.match(installer, /ensure_node_runtime/);
-  assert.match(installer, /archive\/refs\/heads\/main\.tar\.gz\?cache=\$\(date \+%s\)/);
+  assert.match(installer, /archive\/refs\/heads\/\$\{PATHWEAVER_GITHUB_BRANCH\}\.tar\.gz\?cache=\$\(date \+%s\)/);
+  assert.match(installer, /--test\) TEST_MODE=1/);
   assert.match(installer, /https:\/\/nodejs\.org\/dist\/latest-v22\.x/);
   assert.match(installer, /node_runtime_supported/);
   assert.match(installer, /major === 22 && minor >= 5/);
@@ -118,7 +119,7 @@ test('已安装节点支持无交互原地更新，并在服务异常时自动�
   assert.match(installer, /PATHWEAVER_WG_QUICK_NO_AUTO_SU/);
   assert.match(installer, /\^\[\[:space:\]\]\*auto_su\[\[:space:\]\]\*\$/);
   assert.match(installer, /s\/auto_su\/\[\[ "\$\{PATHWEAVER_WG_QUICK_NO_AUTO_SU:-0\}" == "1" \]\] \|\| auto_su/);
-  assert.match(updater, /GITHUB_SOURCE=.*https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main/);
+  assert.match(updater, /GITHUB_SOURCE=.*https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/test/);
   assert.match(updater, /state\.controlForwarders/);
   assert.match(updater, /FROM nodes/);
   assert.match(updater, /\/artifacts\/center\/pathweaver-center\.tar\.gz/);

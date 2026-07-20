@@ -16,9 +16,11 @@ const now = () => new Date().toISOString();
 const hashSecret = (value) => createHash('sha256').update(String(value)).digest('hex');
 const json = (value) => JSON.stringify(value ?? {});
 const DEFAULT_DATA_PORT = 19801;
-const PASSIVE_GITHUB_SOURCE = 'https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main';
+const PATHWEAVER_GITHUB_BRANCH = process.env.PATHWEAVER_GITHUB_BRANCH || 'test';
+const PASSIVE_GITHUB_SOURCE = `https://raw.githubusercontent.com/FengYuchen1314/sd-wan/${PATHWEAVER_GITHUB_BRANCH}`;
+const PATHWEAVER_INSTALL_TEST_FLAGS = process.env.PATHWEAVER_INSTALL_TEST_MODE === '0' ? '' : ' --test';
 const UPDATE_INSTALLER_URL = `${PASSIVE_GITHUB_SOURCE}/scripts/install.sh`;
-const UPDATE_BUNDLE_URL = 'https://github.com/FengYuchen1314/sd-wan/archive/refs/heads/main.tar.gz';
+const UPDATE_BUNDLE_URL = `https://github.com/FengYuchen1314/sd-wan/archive/refs/heads/${PATHWEAVER_GITHUB_BRANCH}.tar.gz`;
 const COMMAND_LEASE_MS = 90_000;
 const UPDATE_SCHEDULED_TIMEOUT_MS = 15 * 60_000;
 const UPDATE_INSTALLING_STALE_MS = 10 * 60_000;
@@ -376,6 +378,47 @@ function routeCidrsThrough(compiled, nodeById, sourceId, waypointId) {
   return [...new Set(destinations)].sort();
 }
 
+function peerDialSnapshot(config) {
+  const peers = new Map();
+  for (const peer of config?.data?.peers ?? []) {
+    peers.set(peer.nodeId, {
+      endpoint: peer.endpoint ?? null,
+      endpointMode: peer.endpointMode ?? null,
+    });
+  }
+  return peers;
+}
+
+function controlPlanSnapshot(config) {
+  const forwarders = Object.fromEntries(
+    Object.entries(config?.control?.forwarders ?? {}).sort(([left], [right]) => left.localeCompare(right)),
+  );
+  const routesByTarget = Object.fromEntries(
+    Object.entries(config?.control?.routesByTarget ?? {})
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([targetId, routes]) => [targetId, (routes ?? []).map((route) => route.id).sort()]),
+  );
+  return JSON.stringify({ forwarders, routesByTarget });
+}
+
+function storedConfigsDriftFromCompiled(storedByNodeId, compiled, nodeIds) {
+  for (const nodeId of nodeIds) {
+    const stored = storedByNodeId.get(nodeId);
+    const fresh = compiled.configs[nodeId];
+    if (!stored || !fresh) return true;
+    const storedPeers = peerDialSnapshot(stored);
+    const freshPeers = peerDialSnapshot(fresh);
+    if (storedPeers.size !== freshPeers.size) return true;
+    for (const [peerId, freshPeer] of freshPeers) {
+      const storedPeer = storedPeers.get(peerId);
+      if (!storedPeer) return true;
+      if (storedPeer.endpoint !== freshPeer.endpoint || storedPeer.endpointMode !== freshPeer.endpointMode) return true;
+    }
+    if (controlPlanSnapshot(stored) !== controlPlanSnapshot(fresh)) return true;
+  }
+  return false;
+}
+
 export class ControlService {
   constructor(database, options = {}) {
     this.db = database;
@@ -491,31 +534,84 @@ export class ControlService {
     );
   }
 
+  backfillJoinLinkEndpoints(networkId) {
+    const nodes = this.listNodes(networkId);
+    const nodeById = new Map(nodes.map((node) => [node.id, node]));
+    let updated = 0;
+    for (const row of this.db.all(
+      `SELECT tl.* FROM topology_links tl
+       JOIN nodes child ON child.id = tl.downstream_id AND child.parent_id = tl.upstream_id
+       WHERE tl.network_id = ?`,
+      networkId,
+    )) {
+      const upstream = nodeById.get(row.upstream_id);
+      const downstream = nodeById.get(row.downstream_id);
+      if (!upstream || !downstream) continue;
+      const expected = resolveInitializationJoinUpstreamEndpoint(
+        { upstreamEndpoint: row.upstream_endpoint, upstream_endpoint: row.upstream_endpoint },
+        upstream,
+      );
+      if (!expected) continue;
+      const currentUpstream = row.upstream_endpoint ?? '';
+      const currentDownstream = row.downstream_endpoint ?? '';
+      if (currentUpstream === expected && currentDownstream === '') continue;
+      this.db.run(
+        `UPDATE topology_links
+         SET upstream_endpoint = ?, downstream_endpoint = '',
+             endpoint_semantics_version = CASE
+               WHEN COALESCE(endpoint_semantics_version, 0) < 2 THEN 2
+               ELSE endpoint_semantics_version
+             END
+         WHERE id = ?`,
+        expected, row.id,
+      );
+      updated += 1;
+    }
+    return updated;
+  }
+
   ensureEndpointSemanticConfigurations() {
     const created = [];
     const errors = [];
     for (const network of this.db.all('SELECT id FROM networks ORDER BY created_at')) {
+      const backfilledLinks = this.backfillJoinLinkEndpoints(network.id);
       const latest = this.db.get(
         'SELECT id FROM config_versions WHERE network_id = ? ORDER BY version DESC LIMIT 1',
         network.id,
       );
       if (!latest) continue;
-      const configs = this.db.all('SELECT config_json FROM node_configs WHERE version_id = ?', latest.id);
-      const needsMigration = configs.some((row) => {
+      const nodeIds = this.listNodes(network.id).map((node) => node.id).sort();
+      const rows = this.db.all(
+        'SELECT node_id, config_json FROM node_configs WHERE version_id = ?', latest.id,
+      );
+      const storedByNodeId = new Map(rows.map((row) => [row.node_id, JSON.parse(row.config_json)]));
+      const missingEndpointMode = [...storedByNodeId.values()].some((config) =>
+        (config?.data?.peers ?? []).some((peer) => !peer.endpointMode));
+      let needsRepublication = backfilledLinks > 0 || missingEndpointMode;
+      if (!needsRepublication) {
         try {
-          return (JSON.parse(row.config_json)?.data?.peers ?? []).some((peer) => !peer.endpointMode);
-        } catch {
-          return true;
+          const compiled = validateAndCompileTopology(this.loadState(network.id));
+          needsRepublication = storedConfigsDriftFromCompiled(storedByNodeId, compiled, nodeIds);
+        } catch (error) {
+          errors.push({ networkId: network.id, error: error.message });
+          continue;
         }
-      });
-      if (!needsMigration) continue;
+      }
+      if (!needsRepublication) continue;
+      const reason = backfilledLinks > 0
+        ? '回填初始化 join 链路 WireGuard 端点并同步节点配置'
+        : missingEndpointMode
+          ? '迁移 WireGuard NAT 拨号方向'
+          : '同步 overlay 控制路由与 WireGuard 拨号配置';
       try {
         let versionId;
         this.db.transaction(() => {
-          versionId = this.createVersionInTransaction(network.id, '迁移 WireGuard NAT 拨号方向');
-          this.audit('topology-link.endpoint-semantics', 'network', network.id, { versionId });
+          versionId = this.createVersionInTransaction(network.id, reason);
+          this.audit('topology-link.endpoint-semantics', 'network', network.id, {
+            versionId, backfilledLinks, missingEndpointMode,
+          });
         });
-        created.push({ networkId: network.id, versionId });
+        created.push({ networkId: network.id, versionId, backfilledLinks });
       } catch (error) {
         errors.push({ networkId: network.id, error: error.message });
       }
@@ -1320,7 +1416,7 @@ export class ControlService {
     if (mode === 'passive') {
       publicSourceUrl = PASSIVE_GITHUB_SOURCE;
       const installerUrl = `${publicSourceUrl}/scripts/install.sh?cache=${Date.now()}`;
-      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${publicSourceUrl}' --claim-token '${token}'`;
+      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${publicSourceUrl}' --claim-token '${token}'${PATHWEAVER_INSTALL_TEST_FLAGS}`;
       parentDataEndpoint = resolveInitializationJoinUpstreamEndpoint(null, parent);
     } else {
       const requestedEndpoint = endpointDetails(input.sourceUrl) || endpointDetails(parent.controlEndpoint);
@@ -1351,7 +1447,7 @@ export class ControlService {
       }
       parentDataConnection = { host: parentDataHost, port: parentDataPort, endpoint: parentDataEndpoint };
       const installerUrl = `${sourceUrl}/install.sh`;
-      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${sourceUrl}' --join-token '${token}' --upstream '${sourceUrl}'`;
+      command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${sourceUrl}' --join-token '${token}' --upstream '${sourceUrl}'${PATHWEAVER_INSTALL_TEST_FLAGS}`;
     }
     this.db.run(
       `INSERT INTO join_tokens(

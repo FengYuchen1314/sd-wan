@@ -145,6 +145,52 @@ test('一次性令牌注册节点并自动加入所选父节点', () => {
   } finally { database.close(); }
 });
 
+test('启动时会为 join 链路回填端点并重新发布 overlay 控制配置', () => {
+  const { database, service, network, center } = fixture();
+  try {
+    const enrollment = service.createJoinToken(network.id, { parentId: center.id });
+    const child = service.registerAgent({
+      token: enrollment.token,
+      name: '边缘',
+      wgDataPublicKey: 'd'.repeat(44),
+    }).node;
+    const initialLink = service.listLinks(network.id)[0];
+    const staleVersion = service.listConfigurations(network.id)[0];
+    const staleChildConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?', staleVersion.id, child.id,
+    ).config_json);
+    staleChildConfig.data.peers = staleChildConfig.data.peers.map((peer) => (
+      peer.nodeId === center.id ? { ...peer, endpoint: null, endpointMode: 'dynamic-learn' } : peer
+    ));
+    staleChildConfig.control = {
+      ...staleChildConfig.control,
+      routesByTarget: { [center.id]: staleChildConfig.control.routesByTarget?.[center.id] ?? [] },
+    };
+    database.run(
+      'UPDATE node_configs SET config_json = ? WHERE version_id = ? AND node_id = ?',
+      JSON.stringify(staleChildConfig), staleVersion.id, child.id,
+    );
+    database.run(
+      'UPDATE topology_links SET upstream_endpoint = NULL, downstream_endpoint = ?, endpoint_semantics_version = 0 WHERE id = ?',
+      center.dataEndpoint, initialLink.id,
+    );
+    const regenerated = service.ensureEndpointSemanticConfigurations();
+    assert.equal(regenerated.errors.length, 0);
+    assert.equal(regenerated.created.length, 1);
+    assert.ok(regenerated.created[0].backfilledLinks >= 1);
+    const link = service.listLinks(network.id)[0];
+    assert.equal(link.upstreamEndpoint, center.dataEndpoint);
+    assert.equal(link.downstreamEndpoint, '');
+    const childConfig = JSON.parse(database.get(
+      'SELECT config_json FROM node_configs WHERE version_id = ? AND node_id = ?',
+      regenerated.created[0].versionId, child.id,
+    ).config_json);
+    assert.equal(childConfig.data.peers.find((peer) => peer.nodeId === center.id).endpoint, center.dataEndpoint);
+    assert.equal(childConfig.data.peers.find((peer) => peer.nodeId === center.id).endpointMode, 'static-dial');
+    assert.equal(Object.keys(childConfig.control.routesByTarget).length, service.listNodes(network.id).length);
+  } finally { database.close(); }
+});
+
 test('IX 主动加入不会因本机 NAT 端口无效而从节点列表回滚', () => {
   const { database, service, network, center } = fixture();
   try {
@@ -261,9 +307,10 @@ test('被动认领固定从指定 GitHub 仓库安装，命令不要求目标访
       mode: 'passive',
       parentHost: '',
     });
-    assert.equal(enrollment.publicSourceUrl, 'https://raw.githubusercontent.com/FengYuchen1314/sd-wan/main');
-    assert.match(enrollment.command, /raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main\/scripts\/install\.sh\?cache=\d+/);
-    assert.match(enrollment.command, /--source 'https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main'/);
+    assert.equal(enrollment.publicSourceUrl, 'https://raw.githubusercontent.com/FengYuchen1314/sd-wan/test');
+    assert.match(enrollment.command, /raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/test\/scripts\/install\.sh\?cache=\d+/);
+    assert.match(enrollment.command, /--source 'https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/test'/);
+    assert.match(enrollment.command, /--test/);
     assert.match(enrollment.command, /--claim-token/);
     assert.doesNotMatch(enrollment.command, /--data-port/);
     assert.doesNotMatch(enrollment.command, /--upstream/);
