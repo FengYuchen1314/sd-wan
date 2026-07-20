@@ -375,6 +375,48 @@ process.stdin.on("end", () => {
 });'
 }
 
+escape_systemd_env_value() {
+  printf '%s' "$1" | sed 's/\$/$$/g'
+}
+
+write_bootstrap_node_env() {
+  local env_file="$1" password_hash="$2" endpoint="$3" panel_port="$4" data_port="$5"
+  {
+    printf 'SDWAN_PANEL_PASSWORD_HASH=%s\n' "$(escape_systemd_env_value "$password_hash")"
+    printf 'SDWAN_PUBLIC_URL=http://%s:%s\n' "$endpoint" "$panel_port"
+    printf 'SDWAN_DEFAULT_DATA_PORT=%s\n' "$data_port"
+  } >"$env_file"
+  chmod 0600 "$env_file"
+}
+
+write_peer_node_env() {
+  local env_file="$1" password_hash="$2" proxy_token="$3"
+  {
+    printf 'SDWAN_PANEL_PASSWORD_HASH=%s\n' "$(escape_systemd_env_value "$password_hash")"
+    printf 'SDWAN_PANEL_PROXY_TOKEN=%s\n' "$proxy_token"
+  } >"$env_file"
+  chmod 0600 "$env_file"
+}
+
+resolve_node_executable() {
+  if [[ -x "$NODE_RUNTIME_LINK/bin/node" ]] && node_runtime_supported "$NODE_RUNTIME_LINK/bin/node"; then
+    printf '%s\n' "$NODE_RUNTIME_LINK/bin/node"
+    return
+  fi
+  local candidate=""
+  candidate="$(command -v node 2>/dev/null || true)"
+  if [[ -n "$candidate" ]] && node_runtime_supported "$candidate"; then
+    case "$candidate" in
+      /opt/pathweaver/runtime/*|/usr/bin/*|/usr/local/bin/*|/bin/*)
+        printf '%s\n' "$candidate"
+        return
+        ;;
+    esac
+  fi
+  ensure_node_runtime
+  printf '%s\n' "$NODE_RUNTIME_LINK/bin/node"
+}
+
 install_node_bundle() {
   local release bundle archive_root
   install -d -m 0755 /opt/pathweaver/releases
@@ -514,7 +556,7 @@ update_node() {
 }
 
 install_node() {
-  local endpoint_host control_endpoint data_endpoint node_env panel_password_hash panel_proxy_token bootstrap reachability
+  local endpoint_host control_endpoint data_endpoint node_env panel_password_hash panel_proxy_token bootstrap reachability node_executable
   bootstrap=0
   if [[ -z "$JOIN_TOKEN" && -z "$CLAIM_TOKEN" && -z "$UPSTREAM" ]]; then bootstrap=1; fi
   if [[ "$bootstrap" -eq 0 && -z "$JOIN_TOKEN" && -z "$CLAIM_TOKEN" ]]; then
@@ -550,6 +592,7 @@ install_node() {
   endpoint_host="$(format_endpoint_host "$REACHABLE_HOST")"
   choose_panel_password
   panel_password_hash="$(hash_panel_password)"
+  node_executable="$(resolve_node_executable)"
 
   install_private_wireguard_runtime
   install_node_bundle
@@ -578,12 +621,7 @@ EOF
   node_env=/etc/pathweaver/node.env
 
   if [[ "$bootstrap" -eq 1 ]]; then
-    cat >"$node_env" <<EOF
-SDWAN_PANEL_PASSWORD_HASH=$panel_password_hash
-SDWAN_PUBLIC_URL=http://$endpoint_host:$PANEL_PORT
-SDWAN_DEFAULT_DATA_PORT=$DATA_PORT
-EOF
-    chmod 0600 "$node_env"
+    write_bootstrap_node_env "$node_env" "$panel_password_hash" "$endpoint_host" "$PANEL_PORT" "$DATA_PORT"
     cat >/etc/systemd/system/pathweaver-node.service <<EOF
 [Unit]
 Description=PathWeaver Peer Node and Panel
@@ -595,7 +633,7 @@ Type=simple
 User=pathweaver
 Group=pathweaver
 WorkingDirectory=/opt/pathweaver/current
-ExecStart=$(command -v node) /opt/pathweaver/current/src/center/server.js
+ExecStart=$node_executable /opt/pathweaver/current/src/center/server.js
 Environment=NODE_ENV=production
 Environment=SDWAN_HOST=0.0.0.0
 Environment=SDWAN_PORT=$PANEL_PORT
@@ -619,18 +657,14 @@ EOF
     systemctl daemon-reload
     systemctl enable --now pathweaver-node
   else
-    panel_proxy_token="$(node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))")"
+    panel_proxy_token="$("$node_executable" -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))")"
     control_endpoint=""
     data_endpoint=""
     if [[ "$reachability" == "public" || "$reachability" == "ix" ]]; then
       control_endpoint="http://$endpoint_host:$RELAY_PORT"
       data_endpoint="$endpoint_host:$DATA_PORT"
     fi
-    cat >"$node_env" <<EOF
-SDWAN_PANEL_PASSWORD_HASH=$panel_password_hash
-SDWAN_PANEL_PROXY_TOKEN=$panel_proxy_token
-EOF
-    chmod 0600 "$node_env"
+    write_peer_node_env "$node_env" "$panel_password_hash" "$panel_proxy_token"
     ARGS=(--relay-port "$RELAY_PORT" --data-port "$DATA_PORT" --reachability "$reachability" --panel-proxy-token "$panel_proxy_token")
     if [[ -n "$control_endpoint" ]]; then ARGS+=(--control-endpoint "$control_endpoint"); fi
     if [[ -n "$data_endpoint" ]]; then ARGS+=(--data-endpoint "$data_endpoint"); fi
@@ -646,7 +680,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/pathweaver/current
-ExecStart=$(command -v node) /opt/pathweaver/current/src/agent/agent.js ${ARGS[*]}
+ExecStart=$node_executable /opt/pathweaver/current/src/agent/agent.js ${ARGS[*]}
 Environment=SDWAN_APPLY_NETWORK=1
 Environment=SDWAN_AGENT_DATA_DIR=/var/lib/pathweaver-agent
 Environment=SDWAN_WIREGUARD_RUNTIME_DIR=$WIREGUARD_RUNTIME_LINK
@@ -672,7 +706,7 @@ Type=simple
 User=pathweaver
 Group=pathweaver
 WorkingDirectory=/opt/pathweaver/current
-ExecStart=$(command -v node) /opt/pathweaver/current/src/peer/server.js
+ExecStart=$node_executable /opt/pathweaver/current/src/peer/server.js
 Environment=NODE_ENV=production
 Environment=SDWAN_PANEL_HOST=0.0.0.0
 Environment=SDWAN_PANEL_PORT=$PANEL_PORT

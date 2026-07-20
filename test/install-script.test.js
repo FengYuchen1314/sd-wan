@@ -40,6 +40,20 @@ test('统一对等节点安装不再要求选择中心或边缘，并为每台�
   assert.match(installer, /pathweaver-node\.service/);
 });
 
+test('安装器写入 node.env 时会转义 scrypt 哈希中的 $，避免 systemd 截断面板密码', () => {
+  assert.match(installer, /escape_systemd_env_value/);
+  assert.match(installer, /sed 's\/\\$\//);
+  assert.match(installer, /write_bootstrap_node_env/);
+  assert.match(installer, /write_peer_node_env/);
+  assert.doesNotMatch(installer, /SDWAN_PANEL_PASSWORD_HASH=\$panel_password_hash/);
+});
+
+test('安装器为 systemd 选择 pathweaver 用户可执行的 Node 运行时', () => {
+  assert.match(installer, /resolve_node_executable/);
+  assert.match(installer, /ExecStart=\$node_executable/);
+  assert.doesNotMatch(installer, /ExecStart=\$\(command -v node\)/);
+});
+
 test('初始节点一键命令使用固定 GitHub 源，安装器自动补齐 Node.js 运行时', () => {
   assert.match(readme, /curl -fsSL "https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main\/scripts\/install\.sh\?cache=\$\(date \+%s\)" \| sudo bash -s -- --source https:\/\/raw\.githubusercontent\.com\/FengYuchen1314\/sd-wan\/main/);
   assert.match(installer, /ensure_node_runtime/);
