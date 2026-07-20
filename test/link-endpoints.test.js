@@ -6,6 +6,7 @@ import {
   isInitializationJoinLink,
   isManualBidirectionalPublicLink,
   resolveLinkEndpoints,
+  resolveInitializationJoinUpstreamEndpoint,
   selectLinkBenchmarkDirection,
   selectLinkDialDirection,
   validationInternalProbePlan,
@@ -62,6 +63,22 @@ test('isDialOutOnlyNode 仅识别纯 NAT，不含主动加入的公网或 IX', (
   assert.equal(isDialOutOnlyNode({ joinMode: 'active', reachabilityType: 'public' }), false);
   assert.equal(isDialOutOnlyNode({ joinMode: 'active', reachabilityType: 'ix' }), false);
   assert.equal(isDialOutOnlyNode({ joinMode: 'passive', reachabilityType: 'nat' }), true);
+});
+
+test('初始化 join 链路在 upstream_endpoint 为空时回退父节点 WireGuard 端点', () => {
+  const upstream = {
+    id: 'ix', parentId: null, reachabilityType: 'ix', dataEndpoint: '10.20.0.8:19801', dataIp: '10.1.0.1',
+  };
+  const downstream = {
+    id: 'nat', parentId: 'ix', reachabilityType: 'nat', joinMode: 'active', dataIp: '10.1.0.2',
+  };
+  const resolved = resolveLinkEndpoints(
+    { upstreamEndpoint: '', downstreamEndpoint: '' },
+    upstream,
+    downstream,
+  );
+  assert.equal(resolved.upstreamEndpoint, '10.20.0.8:19801');
+  assert.equal(resolved.downstreamEndpoint, null);
 });
 
 test('初始化 join 链路延迟探测沿 B→A 拨号方向，与节点类型无关', () => {

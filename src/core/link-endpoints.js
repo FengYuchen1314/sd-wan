@@ -19,6 +19,33 @@ function endpointFallback(node) {
   return node?.reachabilityType === 'public' ? (node.dataEndpoint ?? null) : null;
 }
 
+function controlEndpointHost(value) {
+  if (!value) return null;
+  try {
+    return new URL(String(value)).hostname || null;
+  } catch {
+    return null;
+  }
+}
+
+/** 初始化 join 链路上父节点 WG 端点：优先链路/令牌，否则回退到父节点 dataEndpoint。 */
+export function resolveInitializationJoinUpstreamEndpoint(link, upstreamNode, parentDataEndpoint = null) {
+  const fromLink = normalizeEndpoint(link?.upstreamEndpoint ?? link?.upstream_endpoint);
+  if (fromLink) return fromLink;
+  const fromToken = normalizeEndpoint(parentDataEndpoint);
+  if (fromToken) return fromToken;
+  const fromNode = normalizeEndpoint(upstreamNode?.dataEndpoint);
+  if (fromNode) return fromNode;
+  const fromPublic = endpointFallback(upstreamNode);
+  if (fromPublic) return normalizeEndpoint(fromPublic);
+  const controlHost = controlEndpointHost(upstreamNode?.controlEndpoint);
+  const dataPort = Number(upstreamNode?.dataListenPort);
+  if (controlHost && Number.isInteger(dataPort) && dataPort > 0) {
+    return `${controlHost}:${dataPort}`;
+  }
+  return null;
+}
+
 export function isParentChildLink(upstreamNode, downstreamNode) {
   return downstreamNode?.parentId === upstreamNode?.id;
 }
@@ -62,11 +89,12 @@ export function resolveLinkEndpoints(link, upstreamNode, downstreamNode) {
 
   if (isInitializationJoinLink(upstreamNode, downstreamNode)) {
     downstreamEndpoint = null;
+    upstreamEndpoint = resolveInitializationJoinUpstreamEndpoint(link, upstreamNode);
   }
   if (isDialOutOnlyNode(downstreamNode) && !isInitializationJoinLink(upstreamNode, downstreamNode)) {
     downstreamEndpoint = null;
   }
-  if (isDialOutOnlyNode(upstreamNode)) {
+  if (isDialOutOnlyNode(upstreamNode) && !isInitializationJoinLink(upstreamNode, downstreamNode)) {
     upstreamEndpoint = null;
   }
 

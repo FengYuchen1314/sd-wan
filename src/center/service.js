@@ -5,6 +5,7 @@ import {
   isManualBidirectionalPublicLink,
   remoteEndpointForSource,
   resolveLinkEndpoints,
+  resolveInitializationJoinUpstreamEndpoint,
   selectLinkBenchmarkDirection,
   validationInternalProbePlan,
   validationProbeRequestedFlags,
@@ -198,7 +199,7 @@ function linkForPair(links, nodeAId, nodeBId) {
 function compileControlPlans(nodes, links, coordinatorId, voterIds = []) {
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const plans = {};
-  const targets = [...new Set([coordinatorId, ...voterIds].filter((id) => nodeById.has(id)))];
+  const targets = nodes.map((node) => node.id);
   if (!targets.length) return plans;
 
   for (const source of nodes) {
@@ -1320,6 +1321,7 @@ export class ControlService {
       publicSourceUrl = PASSIVE_GITHUB_SOURCE;
       const installerUrl = `${publicSourceUrl}/scripts/install.sh?cache=${Date.now()}`;
       command = `curl -fsSL '${installerUrl}' | sudo bash -s -- --source '${publicSourceUrl}' --claim-token '${token}'`;
+      parentDataEndpoint = resolveInitializationJoinUpstreamEndpoint(null, parent);
     } else {
       const requestedEndpoint = endpointDetails(input.sourceUrl) || endpointDetails(parent.controlEndpoint);
       const parentProtocol = String(input.parentProtocol || requestedEndpoint?.protocol || 'http').replace(':', '').toLowerCase();
@@ -1503,15 +1505,19 @@ export class ControlService {
       if (token.mode === 'passive') {
         if (!input.dataEndpoint) throw new Error('被动认领节点必须提供 WireGuard 监听地址');
       }
-      const parentControlHost = endpointDetails(parent.controlEndpoint)?.host || null;
-      const parentEndpoint = token.parent_data_endpoint || parent.dataEndpoint || (parentControlHost
-        ? `${parentControlHost}:${parent.dataListenPort || network.listenPort || DEFAULT_DATA_PORT}`
-        : null);
+      const parentEndpoint = resolveInitializationJoinUpstreamEndpoint(
+        null,
+        parent,
+        token.parent_data_endpoint,
+      );
+      if (!parentEndpoint) {
+        throw new Error(`父节点 ${parent.name} 缺少可供子节点拨入的 WireGuard 端点`);
+      }
       this.db.run(
         `INSERT INTO topology_links(
           id, network_id, upstream_id, downstream_id, priority, upstream_endpoint, downstream_endpoint, created_at
         ) VALUES (?, ?, ?, ?, 100, ?, '', ?)`,
-        randomUUID(), network.id, parent.id, nodeId, parentEndpoint ?? '', timestamp,
+        randomUUID(), network.id, parent.id, nodeId, parentEndpoint, timestamp,
       );
       this.db.run('UPDATE join_tokens SET used_count = used_count + 1 WHERE id = ?', token.id);
       const versionId = this.createVersionInTransaction(network.id, `节点 ${name} 加入`);
